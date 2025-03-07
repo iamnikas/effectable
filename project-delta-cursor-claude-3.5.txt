@@ -1,0 +1,280 @@
+
+
+
+
+Да, давайте создадим модульную структуру для этих компонентов:
+
+```json
+// primitives.json
+{
+  "primitiveTypes": {
+    "integer": {
+      "id": "integer",
+      "name": "Integer",
+      "default": 0,
+      "validator": "^-?\\d+$"
+    },
+    "float": {
+      "id": "float",
+      "name": "Float",
+      "default": 0.0,
+      "validator": "^-?\\d*\\.?\\d+$"
+    },
+    "string": {
+      "id": "string",
+      "name": "String",
+      "default": "",
+      "validator": ".*"
+    },
+    "boolean": {
+      "id": "boolean",
+      "name": "Boolean",
+      "default": false,
+      "values": [true, false]
+    },
+    "array": {
+      "id": "array",
+      "name": "Array",
+      "syntax": "array<elementType>",
+      "allowedElementTypes": ["integer", "float", "string", "boolean", "object"]
+    },
+    "object": {
+      "id": "object",
+      "name": "Object",
+      "keyType": "string",
+      "valueTypes": ["integer", "float", "string", "boolean", "array", "object"]
+    }
+  }
+}
+
+// operators.json
+{
+  "operators": {
+    "arithmetic": {
+      "plus": {
+        "type": "operator",
+        "symbol": "+",
+        "inputs": [
+          {
+            "name": "a",
+            "types": ["integer", "float"]
+          },
+          {
+            "name": "b",
+            "types": ["integer", "float"]
+          }
+        ],
+        "output": {
+          "type": "dynamic",
+          "rule": "maxPrecision(inputs)"
+        }
+      },
+      "minus": {
+        "type": "operator",
+        "symbol": "-",
+        "inputs": [
+          {
+            "name": "a",
+            "types": ["integer", "float"]
+          },
+          {
+            "name": "b",
+            "types": ["integer", "float"]
+          }
+        ],
+        "output": {
+          "type": "dynamic",
+          "rule": "maxPrecision(inputs)"
+        }
+      },
+      "multiply": {
+        "type": "operator",
+        "symbol": "*",
+        "inputs": [
+          {
+            "name": "a",
+            "types": ["integer", "float"]
+          },
+          {
+            "name": "b",
+            "types": ["integer", "float"]
+          }
+        ],
+        "output": {
+          "type": "dynamic",
+          "rule": "maxPrecision(inputs)"
+        }
+      },
+      "divide": {
+        "type": "operator",
+        "symbol": "/",
+        "inputs": [
+          {
+            "name": "a",
+            "types": ["integer", "float"]
+          },
+          {
+            "name": "b",
+            "types": ["integer", "float"]
+          }
+        ],
+        "output": {
+          "type": "float"
+        },
+        "validation": {
+          "b": "!= 0"
+        }
+      }
+    }
+  }
+}
+
+// special-methods/http.json
+{
+  "httpRequest": {
+    "type": "method",
+    "category": "network",
+    "inputs": {
+      "required": {
+        "url": {
+          "type": "string",
+          "validation": "^https?://.+"
+        },
+        "method": {
+          "type": "enum",
+          "values": ["GET", "POST", "PUT", "PATCH", "DELETE"]
+        }
+      },
+      "optional": {
+        "headers": {
+          "type": "object",
+          "valueType": "string"
+        },
+        "body": {
+          "type": "dynamic",
+          "allowedTypes": ["object", "string"],
+          "conditions": {
+            "method": ["POST", "PUT", "PATCH"]
+          }
+        }
+      }
+    },
+    "outputs": {
+      "success": {
+        "type": "object",
+        "structure": {
+          "status": "integer",
+          "data": "dynamic"
+        }
+      },
+      "error": {
+        "type": "object",
+        "structure": {
+          "message": "string",
+          "code": "string"
+        }
+      }
+    }
+  }
+}
+
+// special-methods/blockchain.json
+{
+  "blockchainMethods": {
+    "blockchainRequest": {
+      "type": "method",
+      "category": "blockchain",
+      "inputs": {
+        "required": {
+          "chain": {
+            "type": "enum",
+            "values": ["ETH", "BTC"]
+          },
+          "network": {
+            "type": "dynamic",
+            "dependsOn": "chain",
+            "values": {
+              "ETH": ["mainnet", "testnet"],
+              "BTC": ["mainnet"]
+            }
+          },
+          "method": {
+            "type": "dynamic",
+            "dependsOn": "chain",
+            "values": {
+              "ETH": ["getBalance", "getBlock"],
+              "BTC": ["getBalance", "getTransaction"]
+            }
+          }
+        },
+        "dynamic": {
+          "type": "object",
+          "dependsOn": ["chain", "method"],
+          "schema": "ref:blockchain-params"
+        }
+      },
+      "outputs": {
+        "type": "dynamic",
+        "dependsOn": ["chain", "method"],
+        "schema": "ref:blockchain-responses"
+      }
+    },
+    "blockchainSubscribe": {
+      "type": "method",
+      "category": "blockchain",
+      "inputs": {
+        "required": {
+          "chain": {
+            "type": "enum",
+            "values": ["ETH"]
+          },
+          "network": {
+            "type": "enum",
+            "values": ["mainnet", "testnet"]
+          },
+          "events": {
+            "type": "array<string>",
+            "allowedValues": ["newHeads", "logs", "pendingTransactions"]
+          }
+        }
+      },
+      "outputs": {
+        "subscription": {
+          "type": "stream",
+          "eventType": "dynamic",
+          "dependsOn": "events"
+        }
+      }
+    }
+  }
+}
+```
+
+Основные особенности:
+
+1. **Модульность**:
+- Разделение на логические компоненты
+- Четкая структура каждого модуля
+- Возможность независимого обновления
+
+2. **Типизация**:
+- Строгие типы для всех входов/выходов
+- Динамическая типизация где необходимо
+- Валидация значений
+
+3. **Зависимости**:
+- Четкое определение зависимостей
+- Условная логика для параметров
+- Ссылки на внешние схемы
+
+4. **Расширяемость**:
+- Легко добавлять новые операторы
+- Простое расширение методов
+- Поддержка новых типов данных
+
+Такая структура позволяет:
+- Легко поддерживать код
+- Добавлять новую функциональность
+- Валидировать конфигурацию
+- Генерировать документацию
+- Создавать типобезопасный редактор

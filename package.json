@@ -1,0 +1,13 @@
+{
+  "name": "effectable",
+  "version": "1.0.0",
+  "description": "A small reactive library for Node.js using decorators and setState calls.",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest --config jest.config.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "license": "MIT",
+  "author": ""
+}
