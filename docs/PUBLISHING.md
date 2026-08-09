@@ -7,10 +7,12 @@ Workflow: [`.github/workflows/publish.yml`](../.github/workflows/publish.yml)
 ## One-time npm setup
 
 1. Create the package once (if it does not exist yet), e.g. local first publish:
+
    ```bash
    npm login
    npm publish --access public
    ```
+
 2. On [npmjs.com](https://www.npmjs.com) → package **effectable** → **Settings** → **Trusted Publisher**:
    - Organization or user: `iamnikas`
    - Repository: `effectable`
@@ -30,6 +32,13 @@ Workflow: [`.github/workflows/publish.yml`](../.github/workflows/publish.yml)
 
 Canary versions are written only in the CI workspace; they are **not** committed back to git.
 
+## Commit messages
+
+This repo uses Conventional Commits (`commitlint` + `lefthook` on `commit-msg`).
+PR commits are also checked in CI. Preferred types: `feat`, `fix`, `docs`, `refactor`, `test`, `ci`, `chore`, `perf`.
+
+Stable version bumps in `package.json` remain **manual** for now (no semantic-release yet).
+
 ## Recommended release flow
 
 ### Canary (continuous)
@@ -43,10 +52,12 @@ Canary versions are written only in the CI workspace; they are **not** committed
 2. Merge into `main`.
 3. Publish job runs: if that version is not on npm yet → publishes to `latest`.
 4. Optionally tag for clarity:
+
    ```bash
    git tag v0.1.1
    git push origin v0.1.1
    ```
+
    Tag publish is idempotent if the version already exists (main job will skip).
 
 Do not put `-canary` / other prerelease suffixes into `package.json` on `main`.

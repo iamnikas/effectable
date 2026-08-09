@@ -1,0 +1,7 @@
+# https://lefthook.dev
+# Install hooks: npm run prepare  (or: npx lefthook install)
+
+commit-msg:
+  commands:
+    commitlint:
+      run: npx --no -- commitlint --edit {1}

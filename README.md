@@ -145,6 +145,18 @@ export const MyService = connect(store, mapStateToProps)(MyServiceRaw);
 - `effectable/connect` — connect, MapStateToProps, ConnectOptions
 - `effectable/runtime` — EventBus, CommandBus, QueryBus, HandleRegistry, BusDecorators (`wireRuntimeBuses`, **`wireRuntimeBusesAll`** — wire several handlers to the same bus set; process code usually reuses the same `commandBus` / `queryBus` / `eventBus` as `bootstrap(...).runtime`, without a second `createRuntimeBuses` / `HandleRegistry`)
 
+## Contributing
+
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (enforced by commitlint + lefthook).
+
+```text
+feat: add HandleRegistry autoRegister example
+fix: buffer setState during onMount
+docs: clarify bootstrap shutdown
+```
+
+After `npm ci`, lefthook installs a local `commit-msg` hook. CI also lint-checks PR commits.
+
 ## Publishing
 
 - **Canary** (`develop`): `npm install effectable@canary`

@@ -9,4 +9,6 @@ coverage/
 *.tsbuildinfo
 .npm/
 .idea/
+.lefthook-local.yml
+.lefthook/
 
