@@ -8,23 +8,18 @@ module.exports = {
   clearMocks: true,
   resetMocks: true,
   restoreMocks: true,
-  testTimeout: 30000,
+  testTimeout: 120000,
   roots: [
-    '<rootDir>/tests',
-    '<rootDir>/src/bootstrap',
-    '<rootDir>/src/runtime'
+    '<rootDir>/benchmarks'
   ],
   testMatch: [
-    '<rootDir>/tests/**/*.spec.ts',
-    '<rootDir>/tests/**/*.test.ts',
-    '<rootDir>/src/bootstrap/**/*.test.ts',
-    '<rootDir>/src/runtime/**/*.test.ts'
+    '<rootDir>/benchmarks/**/*.benchmark.test.ts',
+    '<rootDir>/benchmarks/**/*benchmark*.test.ts'
   ],
   testPathIgnorePatterns: [
     '/node_modules/',
     '/build/',
-    '/benchmarks/',
-    '\\.benchmark\\.test\\.ts$'
+    '/tests/'
   ],
   collectCoverage: false,
   transform: {

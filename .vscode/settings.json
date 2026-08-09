@@ -1,0 +1,62 @@
+{
+    "todohighlight.isEnable": true,
+    "todohighlight.isCaseSensitive": true,
+    "todohighlight.keywords": [
+        {
+            "text": "TODO:",
+            "color": "#000",
+            "borderRadius": "4px",
+            "backgroundColor": "#ffea00",
+        }, {
+            "text": "NOTE:",
+            "color": "#000",
+            "borderRadius": "4px",
+            "backgroundColor": "#e3e3e3",
+        }, {
+            "text": "DEBUG",
+            "color": "#000",
+            "backgroundColor": "#e3e3e3",
+            "isWholeLine": true,
+        }, {
+            "text": "HACK:",
+            "color": "#000",
+            "backgroundColor": "#ff8800",
+            "isWholeLine": true,
+        }, {
+          "text": "FUCK:",
+          "color": "#fff",
+          "backgroundColor": "#c99400",
+        }, {
+            "text": "ATTENTION:",
+            "color": "#fff",
+            "borderRadius": "4px",
+            "backgroundColor": "#a00af7",
+        }, {
+            "text": "FIXME:",
+            "color": "#000",
+            "backgroundColor": "#c40202",
+        }
+    ],
+    "todohighlight.include": [
+        "**/*.js",
+        "**/*.jsx",
+        "**/*.ts",
+        "**/*.tsx",
+        "**/*.html",
+        "**/*.php",
+        "**/*.css",
+        "**/*.scss",
+    ],
+    "compile-hero.disable-compile-files-on-did-save-code": true,
+    "eslint.experimental.useFlatConfig": true,
+    "eslint.validate": ["javascript", "typescript"],
+    "eslint.enable": true,
+    "eslint.run": "onType",
+    "eslint.lintTask.enable": true,
+    "eslint.debug": true,
+    "eslint.trace.server": "verbose",
+    "editor.codeActionsOnSave": {
+        "source.fixAll.eslint": "explicit"
+    },
+    "kiroAgent.configureMCP": "Disabled"
+}
