@@ -1,6 +1,6 @@
 {
   "name": "effectable",
-  "version": "0.1.0",
+  "version": "1.0.0-canary.1",
   "description": "Declarative reactive runtime for Node.js: bootstrap, Redux-style RxJS store, Component lifecycle, class-based connect, and GraphRuntime.",
   "license": "MIT",
   "author": {
@@ -88,6 +88,8 @@
     "bench": "jest --config ./jest.bench.config.js --runInBand",
     "prepare": "lefthook install",
     "commitlint": "commitlint --edit",
+    "semantic-release": "semantic-release",
+    "semantic-release:dry-run": "semantic-release --dry-run",
     "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "publishConfig": {
@@ -104,10 +106,14 @@
   "devDependencies": {
     "@commitlint/cli": "^21.2.1",
     "@commitlint/config-conventional": "^21.2.0",
+    "@semantic-release/changelog": "^7.0.0",
+    "@semantic-release/git": "^11.0.1",
+    "conventional-changelog-conventionalcommits": "^10.2.1",
     "@types/jest": "^29.5.14",
     "@types/node": "^22.16.0",
     "jest": "^30.1.3",
     "lefthook": "^2.1.10",
+    "semantic-release": "^25.0.9",
     "ts-jest": "^29.4.9",
     "typescript": "^6.0.3"
   }
