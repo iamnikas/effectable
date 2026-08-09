@@ -1,0 +1,1528 @@
+/**
+ * GraphRuntime — runtime engine for materialization, reconcile, and lifecycle of a component tree.
+ *
+ * Responsibilities:
+ * - Materialize a VirtualServiceNode tree into real component instances (Fiber tree).
+ * - Fiber-like reconcile: diff current vs next trees by key + type, assign effectTags.
+ * - Drive lifecycle via LifecycleEngine: startup in topological order (children before parent),
+ *   shutdown in reverse order (parent before children).
+ * - Inject contexts (@UseContext) and bind refs on mount.
+ * - Pass updated props into existing instances during reconcile.
+ *
+ * Current limitations:
+ * - Work loop is synchronous (no priority lanes — next increment).
+ * - Component.setState() and connect selector updates schedule automatic subtree reconcile
+ *   via a dirty-fiber queue with microtask coalescing; manual reconcile remains a force-update API.
+ * - ContextProvider is handled as a special case in buildScope.
+ *
+ * @module Effectable/component/GraphRuntime
+ */
+
+import type { Component } from './Component';
+import type {
+  Fiber,
+  FiberEffectTag,
+  FiberInspectNode,
+  RefObject,
+  RuntimePropsReceiver,
+  VirtualServiceNode,
+} from './types';
+import { FIBER_EFFECT_TAG, RUNTIME_PROPS_RECEIVER, SCHEDULE_UPDATE_HOOK } from './types';
+import { LifecycleEngine } from './lifecycle';
+import {
+  ContextProvider,
+  EMPTY_CONTEXT_SCOPE,
+  injectContextFields,
+  IS_CONTEXT_PROVIDER,
+} from './context';
+import type { ContextScope } from './context';
+import type {
+  RuntimeCommand,
+  RuntimeEvent,
+  RuntimeQuery,
+} from '../runtime/types';
+import type { RuntimeBusesBundle } from '../runtime/BusDecorators';
+import { wireRuntimeBusesIfDecorated } from '../runtime/BusDecorators';
+import { GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES } from './graphRuntime.constants';
+
+/**
+ * Checks whether a value is thenable (Promise-like).
+ * Key to GraphRuntime sync fast-path: `materialize`/`reconcileFiber`/`destroyFiber`
+ * return union `T | Promise<T>`; the caller routes via this helper
+ * (116x / 266x on pure sync trees).
+ *
+ * @param {unknown} value - value under test
+ * @returns {boolean}
+ */
+function isThenable<T> (value: T | PromiseLike<T>): value is PromiseLike<T> {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    typeof (value as { then?: unknown }).then === 'function'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helper types
+// ---------------------------------------------------------------------------
+
+/**
+ * Internal extended fiber with lifecycle-engine and scope.
+ */
+interface RuntimeFiber<P = unknown> extends Fiber<P> {
+  /** Lifecycle state machine for this node. */
+  engine: LifecycleEngine;
+  /** Context scope inherited from the parent and extended by ContextProvider. */
+  scope: ContextScope;
+  /**
+   * Disposer for auto-wiring {@link wireRuntimeBusesIfDecorated} for `@Use*Bus` / `@On*` decorators.
+   * Called after `runShutdown` (after `onUnmount`).
+   */
+  effectableRuntimeBusDisposer?: () => void;
+  /**
+   * `setState` during `runStartup`/`onMount` happened before the live
+   * {@link SCHEDULE_UPDATE_HOOK} was injected: after startup, {@link scheduleUpdate} must run.
+   */
+  pendingScheduleUpdate?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// GraphRuntime
+// ---------------------------------------------------------------------------
+
+/**
+ * Runtime engine for a declarative component tree.
+ *
+ * Usage:
+ * ```typescript
+ * const runtime = await GraphRuntime.mount(h(AppRoot));
+ * await runtime.reconcile(h(AppRoot, { newProp: 1 }));
+ * await runtime.unmount();
+ * ```
+ */
+export class GraphRuntime {
+  /** Current root fiber tree (current tree). */
+  private currentRoot: RuntimeFiber | null = null;
+  /** Whether unmount has completed. */
+  private unmounted = false;
+  /**
+   * Entry counter for {@link continueStableReconcileAsync} (test/debug probe).
+   * Not reset automatically — compare before/after around reconcile.
+   */
+  private stableAsyncContinueCount = 0;
+
+  /**
+   * Runtime buses for auto-wiring decorators on nodes (optional, set in {@link GraphRuntime.mount}).
+   */
+  private effectableRuntimeBuses: RuntimeBusesBundle<
+    RuntimeCommand,
+    RuntimeQuery,
+    RuntimeEvent
+  > | null = null;
+
+  /**
+   * Depth-indexed pool of Map objects for keyedCurrentMap in reconcileChildren.
+   * Index is recursion depth, which provides re-entrancy safety for nested calls.
+   * Map.clear() instead of new Map() yields 5.1x speedup.
+   */
+  private readonly keyedMapPool: Map<string, RuntimeFiber<unknown>>[] = [];
+
+  /**
+   * Current reconcileChildren recursion depth.
+   * Incremented before async work, decremented in finally.
+   */
+  private reconcileDepth = 0;
+
+  /**
+   * Set of fiber nodes whose `compose()` subtrees need rebuild.
+   * Holds only a “minimal cover”: if an ancestor is already in the set, a descendant is not added.
+   */
+  private readonly dirtyFibers: Set<RuntimeFiber<unknown>> = new Set();
+
+  /** `true` — a microtask flush is already queued. */
+  private flushScheduled = false;
+
+  /** `true` — automatic dirty-fiber flush is in progress (re-entrancy guard). */
+  private flushing = false;
+
+  /**
+   * Promise of the current/scheduled dirty-flush (microtask).
+   * Manual `reconcile` awaits it to avoid overlapping an in-flight flush.
+   */
+  private activeFlush: Promise<void> | null = null;
+
+  /**
+   * Number of consecutive dirty-flush passes in the current microtask chain.
+   * Reset when the queue is empty after a pass or on manual `reconcile`.
+   */
+  private dirtyFlushPassCount = 0;
+
+  /**
+   * Optional hook invoked when automatic reconcile (dirty-fiber flush) fails.
+   * Set via the fourth argument of {@link GraphRuntime.mount}.
+   */
+  private onAutoReconcileError: ((err: unknown) => void) | null = null;
+
+  /**
+   * Instances are created only via {@link GraphRuntime.mount}; direct `new GraphRuntime()` is unavailable externally.
+   */
+  private constructor () {}
+
+  /**
+   * Auto-wires runtime-bus decorators onto the instance before {@link LifecycleEngine.runStartup}.
+   *
+   * @template P
+   * @param {Component<unknown, P>} instance - node instance
+   * @param {RuntimeFiber<P>} fiber - node fiber (stores disposer)
+   * @returns {void}
+   */
+  private attachEffectableRuntimeBusWiring<P> (
+    instance: Component<unknown, P>,
+    fiber: RuntimeFiber<P>,
+  ): void {
+    if (this.effectableRuntimeBuses === null) {
+      return;
+    }
+
+    const disposer = wireRuntimeBusesIfDecorated(instance, this.effectableRuntimeBuses);
+    if (disposer !== null) {
+      fiber.effectableRuntimeBusDisposer = disposer;
+    }
+  }
+
+  /**
+   * Removes runtime-bus registrations created by {@link attachEffectableRuntimeBusWiring}.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - node fiber
+   * @returns {void}
+   */
+  private disposeEffectableRuntimeBusWiring (fiber: RuntimeFiber<unknown>): void {
+    const disposer = fiber.effectableRuntimeBusDisposer;
+    if (typeof disposer === 'function') {
+      disposer();
+    }
+
+    delete fiber.effectableRuntimeBusDisposer;
+  }
+
+  /**
+   * Injects the scheduler hook onto the component instance after successful startup.
+   * The hook is called from {@link Component.setState} and enqueues the fiber for automatic reconcile.
+   *
+   * If `setState` ran during startup (pre-mount buffer), schedules reconcile immediately.
+   *
+   * @param {Component<unknown, unknown>} instance - mounted instance
+   * @param {RuntimeFiber<unknown>} fiber - instance fiber (captured in the closure)
+   * @returns {void}
+   */
+  private injectUpdateHook (instance: Component<unknown, unknown>, fiber: RuntimeFiber<unknown>): void {
+    (instance as unknown as Record<symbol, unknown>)[SCHEDULE_UPDATE_HOOK] = (): void => {
+      this.scheduleUpdate(fiber);
+    };
+
+    if (fiber.pendingScheduleUpdate === true) {
+      fiber.pendingScheduleUpdate = false;
+      this.scheduleUpdate(fiber);
+    }
+  }
+
+  /**
+   * Pre-mount buffer: `setState` during `onMount` cannot yet schedule reconcile
+   * (the live hook is injected after startup). Marks the fiber; {@link injectUpdateHook}
+   * after startup will call {@link scheduleUpdate}
+   * (deferred until the mount pass completes).
+   *
+   * @param {Component<unknown, unknown>} instance - instance before/during startup
+   * @param {RuntimeFiber<unknown>} fiber - instance fiber
+   * @returns {void}
+   */
+  private injectPreMountUpdateHook (
+    instance: Component<unknown, unknown>,
+    fiber: RuntimeFiber<unknown>,
+  ): void {
+    fiber.pendingScheduleUpdate = false;
+    (instance as unknown as Record<symbol, unknown>)[SCHEDULE_UPDATE_HOOK] = (): void => {
+      fiber.pendingScheduleUpdate = true;
+    };
+  }
+
+  /**
+   * Removes the scheduler hook from the instance before unmount.
+   * After removal, `setState()` no longer triggers automatic reconcile.
+   *
+   * @param {Component<unknown, unknown>} instance - instance being unmounted
+   * @returns {void}
+   */
+  private clearUpdateHook (instance: Component<unknown, unknown>): void {
+    delete (instance as unknown as Record<symbol, unknown>)[SCHEDULE_UPDATE_HOOK];
+  }
+
+  /**
+   * Adds a fiber to the dirty queue with ancestor deduplication and schedules a microtask flush.
+   *
+   * Deduplication:
+   * - If an ancestor of the fiber is already queued → skip (ancestor covers the subtree).
+   * - If descendants of the fiber are queued → remove them (fiber covers their subtrees).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber whose subtree needs rebuild
+   * @returns {void}
+   */
+  private scheduleUpdate (fiber: RuntimeFiber<unknown>): void {
+    if (this.unmounted) {
+      return;
+    }
+
+    // If any ancestor is already queued — this fiber will be rebuilt as part of the ancestor
+    let ancestor = fiber.parentFiber as RuntimeFiber<unknown> | null;
+    while (ancestor !== null) {
+      if (this.dirtyFibers.has(ancestor)) {
+        return;
+      }
+      ancestor = ancestor.parentFiber as RuntimeFiber<unknown> | null;
+    }
+
+    // Remove descendants now covered by this fiber
+    if (this.dirtyFibers.size > 0) {
+      for (const existing of this.dirtyFibers) {
+        let p = existing.parentFiber as RuntimeFiber<unknown> | null;
+        while (p !== null) {
+          if (p === fiber) {
+            this.dirtyFibers.delete(existing);
+            break;
+          }
+          p = p.parentFiber as RuntimeFiber<unknown> | null;
+        }
+      }
+    }
+
+    // Add fiber to the dirty queue
+    this.dirtyFibers.add(fiber);
+
+    // Schedule microtask dirty-flush
+    this.scheduleDirtyFlushMicrotask();
+  }
+
+  /**
+   * Queues one dirty-flush microtask and publishes {@link activeFlush} for await from `reconcile`.
+   *
+   * @returns {void}
+   */
+  private scheduleDirtyFlushMicrotask (): void {
+    if (this.flushScheduled || this.unmounted) {
+      return;
+    }
+
+    this.flushScheduled = true;
+    const flushWork = new Promise<void>((resolve) => {
+      queueMicrotask(() => {
+        this.flushDirtyFibers()
+          .catch((err: unknown) => {
+            if (this.onAutoReconcileError !== null) {
+              this.onAutoReconcileError(err);
+            }
+          })
+          .finally(() => {
+            resolve();
+          });
+      });
+    });
+
+    const trackedFlush = flushWork.finally(() => {
+      if (this.activeFlush === trackedFlush) {
+        this.activeFlush = null;
+      }
+    });
+    this.activeFlush = trackedFlush;
+  }
+
+  /**
+   * Flushes accumulated dirty fibers.
+   * Called from the microtask queued by {@link scheduleUpdate}.
+   * Guarded by the `flushing` flag against re-entrancy.
+   * The chain of repeat passes is capped by {@link GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES}.
+   *
+   * @returns {Promise<void>}
+   */
+  private async flushDirtyFibers (): Promise<void> {
+    this.flushScheduled = false;
+
+    if (this.unmounted || this.flushing) {
+      this.dirtyFibers.clear();
+      return;
+    }
+
+    this.dirtyFlushPassCount += 1;
+    this.flushing = true;
+    const snapshot = Array.from(this.dirtyFibers);
+    this.dirtyFibers.clear();
+
+    try {
+      for (const fiber of snapshot) {
+        if (this.unmounted) {
+          break;
+        }
+        const res = this.reconcileDirtyFiber(fiber);
+        if (isThenable(res)) {
+          await res;
+        }
+      }
+    } finally {
+      this.flushing = false;
+    }
+
+    // If new dirty fibers appeared during flush — schedule the next pass
+    if (this.dirtyFibers.size > 0 && !this.unmounted) {
+      if (this.dirtyFlushPassCount >= GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES) {
+        this.dirtyFibers.clear();
+        this.dirtyFlushPassCount = 0;
+        throw new Error(
+          `GraphRuntime: dirty flush exceeded ${String(GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES)} passes (anti-loop)`
+        );
+      }
+      this.scheduleDirtyFlushMicrotask();
+    } else {
+      this.dirtyFlushPassCount = 0;
+    }
+  }
+
+  /**
+   * Rebuilds the `compose()` subtree of one dirty fiber without updating its props.
+   *
+   * Used for automatic reconcile after `setState()`: the instance already updated `state`,
+   * we only need to call `compose()` again and diff children.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber whose subtree needs rebuild
+   * @returns {void | Promise<void>}
+   */
+  private reconcileDirtyFiber (fiber: RuntimeFiber<unknown>): void | Promise<void> {
+    if (this.unmounted) {
+      return;
+    }
+
+    const instance = fiber.instance;
+    if (instance === null) {
+      return;
+    }
+
+    try {
+      const childScope = this.buildChildScope(instance, fiber.scope);
+      const nextChildVnodes = this.getChildVnodes(instance, fiber.vnode.children);
+
+      const childrenRes = this.reconcileChildren(
+        fiber.children as RuntimeFiber<unknown>[],
+        nextChildVnodes,
+        fiber,
+        childScope,
+      );
+
+      if (isThenable(childrenRes)) {
+        return childrenRes.then(
+          (nextChildren) => {
+            fiber.children = nextChildren as Fiber[];
+          },
+          (error: unknown) => {
+            const cleanupResult = this.runFiberFailedCleanup(fiber);
+            if (isThenable(cleanupResult)) {
+              return cleanupResult.then(() => {
+                throw error;
+              });
+            }
+            throw error;
+          },
+        );
+      }
+
+      fiber.children = childrenRes as Fiber[];
+    } catch (error: unknown) {
+      const cleanupResult = this.runFiberFailedCleanup(fiber);
+      if (isThenable(cleanupResult)) {
+        return cleanupResult.then(() => {
+          throw error;
+        });
+      }
+      throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Mounts a component tree and returns a running GraphRuntime.
+   * Builds the fiber tree, injects contexts, runs lifecycle in order:
+   * child nodes first, then the parent.
+   *
+   * @param {VirtualServiceNode<P>} root - root virtual node
+   * @param {ContextScope} initialScope - initial context scope (empty by default)
+   * @returns {Promise<GraphRuntime>} running runtime
+   * @throws {Error} if any node's startup failed
+   */
+  public static async mount<P = unknown>(
+    root: VirtualServiceNode<P>,
+    initialScope: ContextScope = EMPTY_CONTEXT_SCOPE,
+    runtimeBuses?: RuntimeBusesBundle<RuntimeCommand, RuntimeQuery, RuntimeEvent>,
+    onAutoReconcileError?: (err: unknown) => void,
+  ): Promise<GraphRuntime> {
+    const rt = new GraphRuntime();
+    rt.effectableRuntimeBuses = typeof runtimeBuses === 'undefined' ? null : runtimeBuses;
+    rt.onAutoReconcileError = typeof onAutoReconcileError === 'function' ? onAutoReconcileError : null;
+    const res = rt.materialize(
+      root as VirtualServiceNode<unknown>,
+      null,
+      initialScope,
+    );
+    rt.currentRoot = isThenable(res) ? await res : res;
+    return rt;
+  }
+
+  /**
+   * Reconciles against a new tree.
+   * Builds a work-in-progress tree, computes effectTags, applies changes:
+   * - PLACE: create and mount a new node
+   * - UPDATE: update props on an existing instance, call onUpdate
+   * - DELETE: unmount and destroy a node
+   *
+   * @param {VirtualServiceNode<P>} nextTree - new virtual tree
+   * @returns {Promise<void>}
+   * @throws {Error} if the runtime is already unmounted
+   */
+  public async reconcile<P = unknown>(nextTree: VirtualServiceNode<P>): Promise<void> {
+    if (this.unmounted) {
+      throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount.');
+    }
+
+    if (this.currentRoot === null) {
+      throw new Error('[Effectable] GraphRuntime: currentRoot is not initialized.');
+    }
+
+    // Await the full dirty-flush chain (including re-schedule) — otherwise manual
+    // reconcile overlaps the snapshot auto-flush.
+    while (this.activeFlush !== null) {
+      await this.activeFlush;
+    }
+
+    if (this.unmounted) {
+      throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount.');
+    }
+
+    // Manual reconcile covers the whole tree from the root: cancel pending auto-flush
+    // to avoid double-mounting components from concurrent reconcile paths.
+    this.dirtyFibers.clear();
+    this.flushScheduled = false;
+    this.dirtyFlushPassCount = 0;
+
+    const res = this.reconcileFiber(
+      this.currentRoot,
+      nextTree as VirtualServiceNode<unknown>,
+      null,
+      this.currentRoot.scope,
+    );
+
+    this.currentRoot = isThenable(res) ? await res : res;
+  }
+
+  /**
+   * Fully unmounts the component tree.
+   * Calls onUnmount for each node in reverse order (children before parent) and
+   * moves stages to destroyed via LifecycleEngine.
+   *
+   * @returns {Promise<void>}
+   */
+  public async unmount (): Promise<void> {
+    if (this.unmounted) {
+      return;
+    }
+
+    this.unmounted = true;
+
+    if (this.currentRoot !== null) {
+      const d = this.destroyFiber(this.currentRoot);
+      if (isThenable(d)) {
+        await d;
+      }
+      this.currentRoot = null;
+    }
+  }
+
+  /**
+   * Returns the root component instance (for testing and introspection).
+   *
+   * @returns {Component<unknown, unknown> | null}
+   */
+  public getRootInstance (): Component<unknown, unknown> | null {
+    if (this.currentRoot === null) {
+      return null;
+    }
+
+    return this.currentRoot.instance;
+  }
+
+  /**
+   * Whether the runtime is active (unmount has not been called).
+   *
+   * @returns {boolean}
+   */
+  public isActive (): boolean {
+    return !this.unmounted;
+  }
+
+  /**
+   * Readonly snapshot of the root fiber tree for test/debug introspection.
+   * Does not export mutable RuntimeFiber; returns null after unmount.
+   *
+   * @returns {FiberInspectNode | null} root snapshot or null
+   */
+  public inspectRootFiber (): FiberInspectNode | null {
+    if (this.currentRoot === null) {
+      return null;
+    }
+
+    return this.toFiberInspectNode(this.currentRoot);
+  }
+
+  /**
+   * Entity tests only: nulls the root fiber `instance`
+   * to exercise the UPDATE guard when `fiber.instance === null`.
+   * Do not use in the production control plane.
+   *
+   * @returns {void}
+   */
+  public nullRootInstanceForTests (): void {
+    if (this.currentRoot === null) {
+      return;
+    }
+
+    this.currentRoot.instance = null;
+  }
+
+  /**
+   * Number of {@link continueStableReconcileAsync} calls since runtime creation.
+   * Test/debug probe; not a production API.
+   *
+   * @returns {number} accumulated counter
+   */
+  public getStableAsyncContinueCount (): number {
+    return this.stableAsyncContinueCount;
+  }
+
+  /**
+   * Builds a deep readonly {@link FiberInspectNode} from a RuntimeFiber.
+   *
+   * @param {RuntimeFiber} fiber - source fiber
+   * @returns {FiberInspectNode} node snapshot
+   */
+  private toFiberInspectNode (fiber: RuntimeFiber): FiberInspectNode {
+    const children: FiberInspectNode[] = [];
+
+    for (let i = 0; i < fiber.children.length; i++) {
+      children.push(this.toFiberInspectNode(fiber.children[i] as RuntimeFiber));
+    }
+
+    const keyRaw = fiber.vnode.key;
+    const key = keyRaw === undefined ? null : keyRaw;
+
+    return {
+      effectTag: fiber.effectTag,
+      hasInstance: fiber.instance !== null,
+      key,
+      childCount: fiber.children.length,
+      children,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Materialize
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Creates a RuntimeFiber for a virtual node: instantiates the component,
+   * injects contexts, builds the child scope (for ContextProvider),
+   * recursively materializes children, binds ref, runs lifecycle.
+   *
+   * Returns {@link RuntimeFiber} synchronously if the whole subtree is sync
+   * (up to 116x speedup for a tree of 16 sync children); otherwise a Promise.
+   * `await` works correctly with either union branch.
+   *
+   * @param {VirtualServiceNode<P>} vnode - virtual node
+   * @param {RuntimeFiber | null} parentFiber - parent fiber
+   * @param {ContextScope} parentScope - parent scope
+   * @returns {RuntimeFiber<P> | Promise<RuntimeFiber<P>>}
+   */
+  private materialize<P>(
+    vnode: VirtualServiceNode<P>,
+    parentFiber: RuntimeFiber<unknown> | null,
+    parentScope: ContextScope,
+  ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    const engine = new LifecycleEngine();
+    // Constructor is stored as ComponentConstructor<unknown> for covariance,
+    // but invoked with concrete props P. The cast is safe: P extends unknown.
+    const instance = new vnode.type(vnode.props) as Component<unknown, P>;
+
+    // Cache hookFlags once for fast-exit in runStartup/runShutdown (1.15x)
+    engine.initHookFlags(instance);
+
+    // Inject @UseContext fields before startup
+    injectContextFields(instance, parentScope);
+
+    // Build scope for child nodes: ContextProvider extends the scope
+    const childScope = this.buildChildScope(instance, parentScope);
+
+    const fiber: RuntimeFiber<P> = {
+      vnode,
+      instance,
+      lifecycleStatus: 'registered',
+      children: [],
+      parentFiber: parentFiber as RuntimeFiber<unknown> | null,
+      alternate: null,
+      pendingProps: null,
+      effectTag: FIBER_EFFECT_TAG.PLACE,
+      engine,
+      scope: parentScope,
+    };
+
+    // Recursively materialize children before running the parent's lifecycle
+    const childVnodes = this.getChildVnodes(instance, vnode.children);
+    const childFibers: RuntimeFiber<unknown>[] = [];
+
+    for (let i = 0; i < childVnodes.length; i++) {
+      const childVnode = childVnodes[i] as VirtualServiceNode;
+      const childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
+
+      if (isThenable(childRes)) {
+        // Hit an async child — continue the materialization tail in the async continuation.
+        return this.continueMaterializeAsync(
+          fiber,
+          instance,
+          engine,
+          vnode,
+          childVnodes,
+          childFibers,
+          childRes,
+          i,
+        );
+      }
+
+      childFibers.push(childRes as RuntimeFiber<unknown>);
+    }
+
+    fiber.children = childFibers as Fiber[];
+
+    // Bind ref to the instance
+    if (vnode.ref !== undefined) {
+      (vnode.ref as RefObject<typeof instance>).current = instance;
+    }
+
+    this.attachEffectableRuntimeBusWiring(instance, fiber);
+
+    // Run lifecycle after all children are materialized.
+    // Pre-mount hook buffers setState from onMount until injectUpdateHook.
+    this.injectPreMountUpdateHook(instance, fiber);
+    const startupRes = engine.runStartup(instance);
+
+    if (isThenable(startupRes)) {
+      return this.finalizeMaterializeAsync(fiber, engine, childFibers, startupRes);
+    }
+
+    if (!startupRes.ok) {
+      // Unmount already-mounted children when parent startup fails
+      const destroyChain = this.destroyChildrenOnError(childFibers);
+      if (isThenable(destroyChain)) {
+        return destroyChain.then(() => {
+          throw startupRes.error;
+        });
+      }
+      throw startupRes.error;
+    }
+
+    fiber.lifecycleStatus = engine.getStatus();
+    fiber.effectTag = null;
+    this.injectUpdateHook(instance, fiber);
+    return fiber;
+  }
+
+  /**
+   * Async continuation of {@link materialize} after a child returned a Promise.
+   * Finishes remaining child fibers with `await`, then runs parent startup.
+   *
+   * @param {RuntimeFiber<P>} fiber - current fiber
+   * @param {Component<unknown, P>} instance - component instance
+   * @param {LifecycleEngine} engine - lifecycle engine
+   * @param {VirtualServiceNode<P>} vnode - virtual node
+   * @param {VirtualServiceNode[]} childVnodes - all child vnodes
+   * @param {RuntimeFiber<unknown>[]} childFibers - already materialized child fibers
+   * @param {Promise<RuntimeFiber<unknown>>} pending - Promise for the current child
+   * @param {number} pendingIdx - index of the current child
+   * @returns {Promise<RuntimeFiber<P>>}
+   */
+  private async continueMaterializeAsync<P>(
+    fiber: RuntimeFiber<P>,
+    instance: Component<unknown, P>,
+    engine: LifecycleEngine,
+    vnode: VirtualServiceNode<P>,
+    childVnodes: VirtualServiceNode[],
+    childFibers: RuntimeFiber<unknown>[],
+    pending: PromiseLike<RuntimeFiber<unknown>>,
+    pendingIdx: number,
+  ): Promise<RuntimeFiber<P>> {
+    const childScope = this.buildChildScope(instance, fiber.scope);
+
+    childFibers.push(await pending);
+
+    for (let i = pendingIdx + 1; i < childVnodes.length; i++) {
+      const childVnode = childVnodes[i] as VirtualServiceNode;
+      const childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
+      childFibers.push(isThenable(childRes) ? await childRes : (childRes as RuntimeFiber<unknown>));
+    }
+
+    fiber.children = childFibers as Fiber[];
+
+    if (vnode.ref !== undefined) {
+      (vnode.ref as RefObject<typeof instance>).current = instance;
+    }
+
+    this.attachEffectableRuntimeBusWiring(instance, fiber);
+
+    this.injectPreMountUpdateHook(instance, fiber);
+    const startupRes = engine.runStartup(instance);
+    const resolved = isThenable(startupRes) ? await startupRes : startupRes;
+
+    if (!resolved.ok) {
+      for (const c of childFibers) {
+        const d = this.destroyFiber(c);
+        if (isThenable(d)) {
+          await d;
+        }
+      }
+      throw resolved.error;
+    }
+
+    fiber.lifecycleStatus = engine.getStatus();
+    fiber.effectTag = null;
+    this.injectUpdateHook(instance, fiber);
+    return fiber;
+  }
+
+  /**
+   * Async finalization of {@link materialize} when child fibers were gathered synchronously but {@link LifecycleEngine.runStartup} returned a Promise.
+   *
+   * @template P node props type
+   * @param {RuntimeFiber<P>} fiber - fiber of the subtree root node
+   * @param {LifecycleEngine} engine - lifecycle engine for this node
+   * @param {RuntimeFiber<unknown>[]} childFibers - already mounted child fibers (for rollback on error)
+   * @param {PromiseLike<import('./lifecycle').LifecycleTransitionResult>} pendingStartup - Promise of the `runStartup` result
+   * @returns {Promise<RuntimeFiber<P>>} ready fiber, or rollback children and rethrow
+   */
+  private async finalizeMaterializeAsync<P>(
+    fiber: RuntimeFiber<P>,
+    engine: LifecycleEngine,
+    childFibers: RuntimeFiber<unknown>[],
+    pendingStartup: PromiseLike<import('./lifecycle').LifecycleTransitionResult>,
+  ): Promise<RuntimeFiber<P>> {
+    const result = await pendingStartup;
+
+    if (!result.ok) {
+      for (const c of childFibers) {
+        const d = this.destroyFiber(c);
+        if (isThenable(d)) {
+          await d;
+        }
+      }
+      throw result.error;
+    }
+
+    fiber.lifecycleStatus = engine.getStatus();
+    fiber.effectTag = null;
+    if (fiber.instance !== null) {
+      this.injectUpdateHook(fiber.instance, fiber);
+    }
+    return fiber;
+  }
+
+  /**
+   * Unmounts already-mounted children when parent startup fails.
+   * Returns sync void if all demounts are sync, otherwise a Promise.
+   *
+   * @param {RuntimeFiber<unknown>[]} childFibers
+   * @returns {void | Promise<void>}
+   */
+  private destroyChildrenOnError (childFibers: RuntimeFiber<unknown>[]): void | Promise<void> {
+    let pending: PromiseLike<void> | null = null;
+    let startIdx = 0;
+
+    for (let i = 0; i < childFibers.length; i++) {
+      const d = this.destroyFiber(childFibers[i] as RuntimeFiber<unknown>);
+      if (isThenable(d)) {
+        pending = d;
+        startIdx = i + 1;
+        break;
+      }
+    }
+
+    if (pending === null) {
+      return;
+    }
+
+    return (async (): Promise<void> => {
+      await pending;
+      for (let i = startIdx; i < childFibers.length; i++) {
+        const d = this.destroyFiber(childFibers[i] as RuntimeFiber<unknown>);
+        if (isThenable(d)) {
+          await d;
+        }
+      }
+    })();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Reconcile
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Runs fiber-like reconcile for a single node.
+   * If type and key match — UPDATE: update props, reconcile children.
+   * If they differ — DELETE the old node, PLACE the new one.
+   *
+   * @param {RuntimeFiber<P>} current - current fiber
+   * @param {VirtualServiceNode<P>} nextVnode - new virtual node
+   * @param {RuntimeFiber | null} parentFiber - parent fiber
+   * @param {ContextScope} parentScope - parent scope
+   * @returns {Promise<RuntimeFiber<P>>}
+   */
+  private reconcileFiber<P>(
+    current: RuntimeFiber<P>,
+    nextVnode: VirtualServiceNode<P>,
+    parentFiber: RuntimeFiber<unknown> | null,
+    parentScope: ContextScope,
+  ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    const sameType = current.vnode.type === nextVnode.type;
+    const sameKey = (current.vnode.key ?? null) === (nextVnode.key ?? null);
+
+    if (sameType && sameKey) {
+      return this.updateFiber(current, nextVnode, parentFiber, parentScope);
+    }
+
+    // Type or key changed — destroy the old node, create a new one.
+    // Sync fast-path if both destroy and materialize completed synchronously.
+    const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>);
+    if (isThenable(destroyRes)) {
+      return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope));
+    }
+    return this.materialize(nextVnode, parentFiber, parentScope);
+  }
+
+  /**
+   * Updates an existing fiber: applies new props to the instance,
+   * calls onUpdate, recursively diffs children.
+   *
+   * @param {RuntimeFiber<P>} current - current fiber
+   * @param {VirtualServiceNode<P>} nextVnode - new virtual node
+   * @param {RuntimeFiber | null} parentFiber - parent fiber
+   * @param {ContextScope} parentScope - parent scope
+   * @returns {Promise<RuntimeFiber<P>>}
+   */
+  private updateFiber<P>(
+    current: RuntimeFiber<P>,
+    nextVnode: VirtualServiceNode<P>,
+    parentFiber: RuntimeFiber<unknown> | null,
+    parentScope: ContextScope,
+  ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    const instance = current.instance;
+
+    if (instance === null) {
+      throw new Error('[Effectable] GraphRuntime: UPDATE on fiber with null instance.');
+    }
+
+    const prevProps = instance.props;
+    const propsReceiver = (
+      instance as Component<unknown, P> & RuntimePropsReceiver<P>
+    )[RUNTIME_PROPS_RECEIVER];
+
+    if (typeof propsReceiver === 'function') {
+      propsReceiver.call(
+        instance as Component<unknown, P> & RuntimePropsReceiver<P>,
+        nextVnode.props
+      );
+    } else {
+      instance.props = nextVnode.props;
+    }
+
+    // Build scope for child nodes (ContextProvider may have updated values)
+    const childScope = this.buildChildScope(instance, parentScope);
+
+    // Call onUpdate if props changed
+    if (prevProps !== instance.props && current.engine.canUpdate()) {
+      try {
+        instance.onUpdate(prevProps, instance.props);
+      } catch (error: unknown) {
+        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>);
+        if (isThenable(cleanupResult)) {
+          return cleanupResult.then(() => {
+            throw error;
+          });
+        }
+        throw error;
+      }
+    }
+
+    // Update ref
+    if (nextVnode.ref !== undefined) {
+      (nextVnode.ref as RefObject<typeof instance>).current = instance;
+    }
+
+    // Reconcile child nodes (sync fast-path if all children are sync).
+    let nextChildVnodes: VirtualServiceNode[];
+    try {
+      nextChildVnodes = this.getChildVnodes(instance, nextVnode.children);
+    } catch (error: unknown) {
+      const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>);
+      if (isThenable(cleanupResult)) {
+        return cleanupResult.then(() => {
+          throw error;
+        });
+      }
+      throw error;
+    }
+
+    const childrenRes = this.reconcileChildren(
+      current.children as RuntimeFiber<unknown>[],
+      nextChildVnodes,
+      current as RuntimeFiber<unknown>,
+      childScope,
+    );
+
+    if (isThenable(childrenRes)) {
+      return childrenRes.then((nextChildren) => {
+        this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
+        return current;
+      });
+    }
+
+    this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, childrenRes);
+    return current;
+  }
+
+  /**
+   * Fiber cleanup after update/compose error: `runFailedCleanup` + bus dispose.
+   * Does not leave the node in `ready`.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber that failed
+   * @returns {void | Promise<void>}
+   */
+  private runFiberFailedCleanup (fiber: RuntimeFiber<unknown>): void | Promise<void> {
+    const instance = fiber.instance;
+    if (instance === null) {
+      return;
+    }
+
+    this.clearUpdateHook(instance);
+    this.dirtyFibers.delete(fiber);
+
+    const cleanupResult = fiber.engine.runFailedCleanup(instance, true);
+    if (isThenable(cleanupResult)) {
+      return cleanupResult.then(() => {
+        this.disposeEffectableRuntimeBusWiring(fiber);
+        fiber.lifecycleStatus = fiber.engine.getStatus();
+      });
+    }
+
+    this.disposeEffectableRuntimeBusWiring(fiber);
+    fiber.lifecycleStatus = fiber.engine.getStatus();
+  }
+
+  /**
+   * Applies the reconcile result to the current fiber in-place.
+   * In-place mutation instead of spread: 0 heap allocations on UPDATE
+   * (3.09x speedup). Safe: RuntimeFiber is private.
+   *
+   * @param {RuntimeFiber<P>} current - current fiber
+   * @param {VirtualServiceNode<P>} nextVnode - new vnode
+   * @param {RuntimeFiber<unknown> | null} parentFiber - parent fiber
+   * @param {ContextScope} parentScope - parent scope
+   * @param {RuntimeFiber<unknown>[]} nextChildren - new child fibers
+   * @returns {void}
+   */
+  private applyFiberUpdate<P> (
+    current: RuntimeFiber<P>,
+    nextVnode: VirtualServiceNode<P>,
+    parentFiber: RuntimeFiber<unknown> | null,
+    parentScope: ContextScope,
+    nextChildren: RuntimeFiber<unknown>[],
+  ): void {
+    current.vnode = nextVnode;
+    current.parentFiber = parentFiber as RuntimeFiber<unknown> | null;
+    current.children = nextChildren as Fiber[];
+    current.effectTag = FIBER_EFFECT_TAG.UPDATE;
+    current.scope = parentScope;
+    current.lifecycleStatus = current.engine.getStatus();
+  }
+
+  /**
+   * Diffs children: matches current and next child nodes by key+type.
+   * Nodes without a key are matched by position.
+   * Extra current nodes — DELETE; new unpaired nodes — PLACE.
+   *
+   * Optimizations:
+   * - isStableChildren fast-path (9.31x): if children are stable (N≤32, same type+key) — indexed loop without Map.
+   * - Skip keyedCurrentMap (6.06x): if there are no keyed children — do not create a Map at all.
+   * - Depth-indexed Map pool (5.1x): with keyed children, reuse Map via clear() instead of new Map().
+   *
+   * @param {RuntimeFiber[]} currentChildren - current child fibers
+   * @param {VirtualServiceNode[]} nextVnodes - new child virtual nodes
+   * @param {RuntimeFiber} parentFiber - parent fiber
+   * @param {ContextScope} childScope - scope for child nodes
+   * @returns {Promise<RuntimeFiber[]>}
+   */
+  private reconcileChildren (
+    currentChildren: RuntimeFiber<unknown>[],
+    nextVnodes: VirtualServiceNode[],
+    parentFiber: RuntimeFiber<unknown>,
+    childScope: ContextScope,
+  ): RuntimeFiber<unknown>[] | Promise<RuntimeFiber<unknown>[]> {
+    // === FAST PATH: stable children (N≤32, same type+key per position) ===
+    // 9.31x speedup vs full diff for stable trees (typical HFT scenario)
+    if (this.isStableChildren(currentChildren, nextVnodes)) {
+      const n = nextVnodes.length;
+      const stableResult: RuntimeFiber<unknown>[] = [];
+
+      for (let i = 0; i < n; i++) {
+        const reconciled = this.reconcileFiber(
+          currentChildren[i] as RuntimeFiber<unknown>,
+          nextVnodes[i] as VirtualServiceNode<unknown>,
+          parentFiber,
+          childScope,
+        );
+
+        if (isThenable(reconciled)) {
+          return this.continueStableReconcileAsync(
+            stableResult, reconciled, i, nextVnodes, currentChildren, parentFiber, childScope,
+          );
+        }
+
+        stableResult.push(reconciled);
+      }
+
+      return stableResult;
+    }
+
+    // === FULL DIFF PATH — always async (complex logic; sync path not optimized here) ===
+    return this.reconcileChildrenFullDiff(currentChildren, nextVnodes, parentFiber, childScope);
+  }
+
+  /**
+   * Async continuation of the stable fast-path reconcile after an async child.
+   *
+   * @param {RuntimeFiber<unknown>[]} resultSoFar - already gathered sync children
+   * @param {PromiseLike<RuntimeFiber<unknown>>} pending - Promise for the current child
+   * @param {number} pendingIdx - index of the pending child
+   * @param {VirtualServiceNode[]} nextVnodes - all new vnodes
+   * @param {RuntimeFiber<unknown>[]} currentChildren - all current fibers
+   * @param {RuntimeFiber<unknown>} parentFiber - parent fiber
+   * @param {ContextScope} childScope - children scope
+   * @returns {Promise<RuntimeFiber<unknown>[]>}
+   */
+  private async continueStableReconcileAsync (
+    resultSoFar: RuntimeFiber<unknown>[],
+    pending: PromiseLike<RuntimeFiber<unknown>>,
+    pendingIdx: number,
+    nextVnodes: VirtualServiceNode[],
+    currentChildren: RuntimeFiber<unknown>[],
+    parentFiber: RuntimeFiber<unknown>,
+    childScope: ContextScope,
+  ): Promise<RuntimeFiber<unknown>[]> {
+    this.stableAsyncContinueCount += 1;
+    resultSoFar.push(await pending);
+
+    for (let i = pendingIdx + 1; i < nextVnodes.length; i++) {
+      const reconciled = this.reconcileFiber(
+        currentChildren[i] as RuntimeFiber<unknown>,
+        nextVnodes[i] as VirtualServiceNode<unknown>,
+        parentFiber,
+        childScope,
+      );
+      resultSoFar.push(isThenable(reconciled) ? await reconciled : (reconciled as RuntimeFiber<unknown>));
+    }
+
+    return resultSoFar;
+  }
+
+  /**
+   * Full-diff reconcile: keyed/unkeyed Map + destroy orphans.
+   * Always async — internal branching is too complex for an efficient sync path.
+   *
+   * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
+   * @param {VirtualServiceNode[]} nextVnodes - new vnodes
+   * @param {RuntimeFiber<unknown>} parentFiber - parent fiber
+   * @param {ContextScope} childScope - children scope
+   * @returns {Promise<RuntimeFiber<unknown>[]>}
+   */
+  private async reconcileChildrenFullDiff (
+    currentChildren: RuntimeFiber<unknown>[],
+    nextVnodes: VirtualServiceNode[],
+    parentFiber: RuntimeFiber<unknown>,
+    childScope: ContextScope,
+  ): Promise<RuntimeFiber<unknown>[]> {
+    // Check for keyed children before creating a Map (6.06x speedup for unkeyed-only)
+    let hasKeyedCurrent = false;
+
+    for (const child of currentChildren) {
+      if (child.vnode.key !== undefined) {
+        hasKeyedCurrent = true;
+        break;
+      }
+    }
+
+    const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
+    const nextChildren: RuntimeFiber<unknown>[] = [];
+    let unkeyedIdx = 0;
+
+    if (hasKeyedCurrent) {
+      // Acquire Map from the depth-indexed pool (5.1x: Map.clear() vs new Map())
+      const keyedCurrentMap = this.acquireKeyedMap();
+      this.reconcileDepth++;
+
+      try {
+        // Build map of current children by key (for keyed matching)
+        for (const child of currentChildren) {
+          const key = child.vnode.key;
+
+          if (key !== undefined) {
+            keyedCurrentMap.set(key, child);
+          } else {
+            unkeyedCurrent.push(child);
+          }
+        }
+
+        for (const nextVnode of nextVnodes) {
+          const nextKey = nextVnode.key;
+
+          if (nextKey !== undefined && keyedCurrentMap.has(nextKey)) {
+            const currentFiber = keyedCurrentMap.get(nextKey);
+
+            if (currentFiber === undefined) {
+              throw new Error(`[Effectable] GraphRuntime: fiber with key "${nextKey}" not found in map.`);
+            }
+
+            keyedCurrentMap.delete(nextKey);
+
+            const reconciledRes = this.reconcileFiber(
+              currentFiber,
+              nextVnode as VirtualServiceNode<unknown>,
+              parentFiber,
+              childScope,
+            );
+            nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
+          } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
+            const currentFiber = unkeyedCurrent[unkeyedIdx];
+            unkeyedIdx += 1;
+
+            const reconciledRes = this.reconcileFiber(
+              currentFiber as RuntimeFiber<unknown>,
+              nextVnode as VirtualServiceNode<unknown>,
+              parentFiber,
+              childScope,
+            );
+            nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
+          } else {
+            // New node — PLACE
+            const newRes = this.materialize(nextVnode, parentFiber, childScope);
+            nextChildren.push(isThenable(newRes) ? await newRes : newRes);
+          }
+        }
+
+        // Destroy remaining unpaired current children (keyed)
+        for (const [, orphan] of keyedCurrentMap) {
+          const d = this.destroyFiber(orphan);
+          if (isThenable(d)) {
+            await d;
+          }
+        }
+      } finally {
+        this.reconcileDepth--;
+        this.releaseKeyedMap();
+      }
+    } else {
+      // No keyed children — skip Map, positional reconcile
+      for (const child of currentChildren) {
+        unkeyedCurrent.push(child);
+      }
+
+      for (const nextVnode of nextVnodes) {
+        if (unkeyedIdx < unkeyedCurrent.length) {
+          const currentFiber = unkeyedCurrent[unkeyedIdx];
+          unkeyedIdx += 1;
+
+          const reconciledRes = this.reconcileFiber(
+            currentFiber as RuntimeFiber<unknown>,
+            nextVnode as VirtualServiceNode<unknown>,
+            parentFiber,
+            childScope,
+          );
+          nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
+        } else {
+          // New node — PLACE
+          const newRes = this.materialize(nextVnode, parentFiber, childScope);
+          nextChildren.push(isThenable(newRes) ? await newRes : newRes);
+        }
+      }
+    }
+
+    // Destroy remaining unpaired unkeyed children
+    for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
+      const orphan = unkeyedCurrent[i];
+
+      if (orphan !== undefined) {
+        const d = this.destroyFiber(orphan);
+        if (isThenable(d)) {
+          await d;
+        }
+      }
+    }
+
+    return nextChildren;
+  }
+
+  /**
+   * Whether children are stable: same count, same type and key per position.
+   * Only for N≤32 — with more children the check does not pay off.
+   * When children are stable, reconcileChildren skips the full diff (9.31x speedup).
+   *
+   * @param {RuntimeFiber<unknown>[]} current - current child fibers
+   * @param {VirtualServiceNode[]} next - new child virtual nodes
+   * @returns {boolean} true if children are stable and the fast-path may be used
+   */
+  private isStableChildren (
+    current: RuntimeFiber<unknown>[],
+    next: VirtualServiceNode[],
+  ): boolean {
+    const n = current.length;
+
+    if (n !== next.length || n > 32) {
+      return false;
+    }
+
+    for (let i = 0; i < n; i++) {
+      if ((current[i] as RuntimeFiber<unknown>).vnode.type !== (next[i] as VirtualServiceNode).type) {
+        return false;
+      }
+
+      if (((current[i] as RuntimeFiber<unknown>).vnode.key ?? null) !== ((next[i] as VirtualServiceNode).key ?? null)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /**
+   * Returns a Map from the depth-indexed pool for the current recursion depth.
+   * On first visit to a depth — creates a new Map (lazy alloc).
+   * Repeated calls at the same depth get an already-cleared Map.
+   *
+   * @returns {Map<string, RuntimeFiber<unknown>>} Map for the current recursion depth
+   */
+  private acquireKeyedMap (): Map<string, RuntimeFiber<unknown>> {
+    const depth = this.reconcileDepth;
+
+    if (depth >= this.keyedMapPool.length) {
+      this.keyedMapPool.push(new Map());
+    }
+
+    return this.keyedMapPool[depth] as Map<string, RuntimeFiber<unknown>>;
+  }
+
+  /**
+   * Clears the Map for the current recursion depth and returns it to the pool.
+   * Called in finally after the keyed diff completes.
+   *
+   * @returns {void}
+   */
+  private releaseKeyedMap (): void {
+    (this.keyedMapPool[this.reconcileDepth] as Map<string, RuntimeFiber<unknown>>).clear();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Destroy
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Unmounts a fiber and its entire subtree.
+   * Order: children first (recursively), then the parent.
+   * Afterward: clears ref.current.
+   *
+   * Returns `void` synchronously if the whole subtree is sync (up to 266x speedup
+   * on an 85-node tree); otherwise a Promise. `await` works correctly with either union branch.
+   *
+   * @param {RuntimeFiber} fiber - fiber to destroy
+   * @returns {void | Promise<void>}
+   */
+  private destroyFiber (fiber: RuntimeFiber<unknown>): void | Promise<void> {
+    const children = fiber.children;
+    const n = children.length;
+
+    // Sync recursion over children until the first async
+    for (let i = 0; i < n; i++) {
+      const childRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
+      if (isThenable(childRes)) {
+        return this.continueDestroyAsync(fiber, children, i, childRes);
+      }
+    }
+
+    const instance = fiber.instance;
+    if (instance === null) {
+      return;
+    }
+
+    this.clearUpdateHook(instance);
+    this.dirtyFibers.delete(fiber);
+
+    const shutdownRes = fiber.engine.runShutdown(instance);
+    if (isThenable(shutdownRes)) {
+      return this.finalizeDestroyAsync(fiber, shutdownRes);
+    }
+
+    this.disposeEffectableRuntimeBusWiring(fiber);
+
+    // Clear ref after unmount
+    const ref = fiber.vnode.ref;
+    if (ref !== undefined) {
+      ref.current = null;
+    }
+    fiber.lifecycleStatus = fiber.engine.getStatus();
+  }
+
+  /**
+   * Async continuation of {@link destroyFiber} after one of the children returned a Promise.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - current fiber
+   * @param {Fiber[]} children - children list
+   * @param {number} pendingIdx - index of the pending child
+   * @param {PromiseLike<void>} pending - Promise from destroying the child
+   * @returns {Promise<void>}
+   */
+  private async continueDestroyAsync (
+    fiber: RuntimeFiber<unknown>,
+    children: Fiber[],
+    pendingIdx: number,
+    pending: PromiseLike<void>,
+  ): Promise<void> {
+    await pending;
+
+    for (let i = pendingIdx + 1; i < children.length; i++) {
+      const r = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
+      if (isThenable(r)) {
+        await r;
+      }
+    }
+
+    const instance = fiber.instance;
+    if (instance === null) {
+      return;
+    }
+
+    this.clearUpdateHook(instance);
+    this.dirtyFibers.delete(fiber);
+
+    const shutdownRes = fiber.engine.runShutdown(instance);
+    if (isThenable(shutdownRes)) {
+      await shutdownRes;
+    }
+
+    this.disposeEffectableRuntimeBusWiring(fiber);
+
+    const ref = fiber.vnode.ref;
+    if (ref !== undefined) {
+      ref.current = null;
+    }
+    fiber.lifecycleStatus = fiber.engine.getStatus();
+  }
+
+  /**
+   * Async finalization of {@link destroyFiber} when children were destroyed synchronously
+   * but `runShutdown` returned a Promise.
+   *
+   * @param {RuntimeFiber<unknown>} fiber
+   * @param {PromiseLike<unknown>} pendingShutdown
+   * @returns {Promise<void>}
+   */
+  private async finalizeDestroyAsync (
+    fiber: RuntimeFiber<unknown>,
+    pendingShutdown: PromiseLike<unknown>,
+  ): Promise<void> {
+    await pendingShutdown;
+
+    this.disposeEffectableRuntimeBusWiring(fiber);
+
+    const ref = fiber.vnode.ref;
+    if (ref !== undefined) {
+      ref.current = null;
+    }
+    fiber.lifecycleStatus = fiber.engine.getStatus();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Returns the list of child VirtualServiceNode: first from the instance's compose(),
+   * then from explicit vnode children (fallback).
+   *
+   * @param {Component<unknown, unknown>} instance - component instance
+   * @param {VirtualServiceNode[]} explicitChildren - children from vnode.children
+   * @returns {VirtualServiceNode[]}
+   */
+  private getChildVnodes (
+    instance: Component<unknown, unknown>,
+    explicitChildren: VirtualServiceNode[],
+  ): VirtualServiceNode[] {
+    if (typeof instance.compose !== 'function') {
+      return explicitChildren;
+    }
+
+    const composed = instance.compose();
+
+    if (composed === null) {
+      return [];
+    }
+
+    if (Array.isArray(composed)) {
+      return composed;
+    }
+
+    return [composed];
+  }
+
+  /**
+   * Builds the child scope: if the instance is a ContextProvider — extends the scope with its values.
+   *
+   * @param {Component<unknown, unknown>} instance - component instance
+   * @param {ContextScope} parentScope - parent scope
+   * @returns {ContextScope}
+   */
+  private buildChildScope (
+    instance: Component<unknown, unknown>,
+    parentScope: ContextScope,
+  ): ContextScope {
+    // Symbol flag instead of instanceof: 1.90x speedup on the negative path (ordinary components)
+    if ((instance as unknown as Record<symbol, unknown>)[IS_CONTEXT_PROVIDER] === true) {
+      return (instance as unknown as ContextProvider).applyToScope(parentScope);
+    }
+
+    return parentScope;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// effectTag types (re-export for convenience)
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a node effectTag from a situation (identity helper for {@link FiberEffectTag}).
+ *
+ * @param {FiberEffectTag} tag - value from {@link FIBER_EFFECT_TAG} or null
+ * @returns {FiberEffectTag}
+ */
+export function makeFiberEffectTag (tag: FiberEffectTag): FiberEffectTag {
+  return tag;
+}
