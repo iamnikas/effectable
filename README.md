@@ -147,7 +147,7 @@ export const MyService = connect(store, mapStateToProps)(MyServiceRaw);
 
 ## Contributing
 
-Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (enforced by commitlint + lefthook).
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (enforced by commitlint + lefthook). The same messages drive [semantic-release](https://semantic-release.app/) version bumps (`feat` → minor, `fix`/`perf` → patch, breaking → major).
 
 ```text
 feat: add HandleRegistry autoRegister example
@@ -155,14 +155,14 @@ fix: buffer setState during onMount
 docs: clarify bootstrap shutdown
 ```
 
-After `npm ci`, lefthook installs a local `commit-msg` hook. CI also lint-checks PR commits.
+After `npm ci`, lefthook installs a local `commit-msg` hook. CI also lint-checks PR commits. Prefer Conventional Commits for squash-merge titles too.
 
 ## Publishing
 
 - **Canary** (`develop`): `npm install effectable@canary`
-- **Stable** (`main` / tags `vX.Y.Z`): `npm install effectable`
+- **Stable** (`main`): `npm install effectable`
 
-Details: [docs/PUBLISHING.md](docs/PUBLISHING.md).
+Versions are bumped automatically by semantic-release in CI. Details: [docs/PUBLISHING.md](docs/PUBLISHING.md).
 
 ## License
 

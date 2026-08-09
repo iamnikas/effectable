@@ -1,17 +1,13 @@
-# Single workflow for canary + stable publishes.
 # npm Trusted Publishing allows only ONE workflow filename per package.
 #
 # Configure on npmjs.com → effectable → Settings → Trusted Publisher:
 #   Organization/user: iamnikas
 #   Repository:        effectable
 #   Workflow filename: publish.yml
-#   Environment:       leave empty (or "npm" if you uncomment environment below)
+#   Environment:       leave empty
 #
-# Channels:
-#   - push to develop     → dist-tag "canary"  (version <base>-canary.<sha>)
-#   - push tag vX.Y.Z     → dist-tag "latest"  (must match package.json)
-#   - push to main        → dist-tag "latest"  if that semver is not on npm yet
-#   - workflow_dispatch   → canary or stable
+# Version bumps + publish are driven by semantic-release from Conventional Commits
+# (same convention enforced by commitlint).
 
 name: Publish
 
@@ -20,21 +16,12 @@ on:
     branches:
       - develop
       - main
-    tags:
-      - 'v*.*.*'
   workflow_dispatch:
-    inputs:
-      channel:
-        description: 'Publish channel'
-        required: true
-        type: choice
-        default: canary
-        options:
-          - canary
-          - stable
 
 permissions:
-  contents: read
+  contents: write
+  issues: write
+  pull-requests: write
   id-token: write
 
 concurrency:
@@ -42,22 +29,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish-canary:
-    name: Publish canary
-    if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
-      (github.event_name == 'workflow_dispatch' && inputs.channel == 'canary')
+  release:
+    name: Release
     runs-on: ubuntu-latest
-    # environment: npm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
+          node-version-file: '.nvmrc'
+          # Do not set registry-url: it breaks npm Trusted Publishing (OIDC).
           package-manager-cache: false
 
       - name: Upgrade npm for OIDC trusted publishing
@@ -74,124 +60,8 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Set canary version
-        id: canary
-        run: |
-          set -euo pipefail
-          node <<'NODE'
-          const fs = require('fs');
-          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          const base = String(pkg.version).replace(/-.*$/, '');
-          const sha = process.env.GITHUB_SHA.slice(0, 7);
-          pkg.version = `${base}-canary.${sha}`;
-          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          console.log(pkg.version);
-          NODE
-          echo "version=$(node -p "require('./package.json').version")" >> "${GITHUB_OUTPUT}"
-
-      - name: Publish canary to npm
-        run: npm publish --access public --tag canary --ignore-scripts
+      - name: Release
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_CONFIG_PROVENANCE: 'true'
-
-      - name: Summary
-        run: |
-          {
-            echo "## Canary published"
-            echo ""
-            echo "- Version: \`${{ steps.canary.outputs.version }}\`"
-            echo "- Install: \`npm install effectable@canary\`"
-            echo "- Pin: \`npm install effectable@${{ steps.canary.outputs.version }}\`"
-          } >> "${GITHUB_STEP_SUMMARY}"
-
-  publish-stable:
-    name: Publish stable
-    if: >-
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_dispatch' && inputs.channel == 'stable')
-    runs-on: ubuntu-latest
-    # environment: npm
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
-          package-manager-cache: false
-
-      - name: Upgrade npm for OIDC trusted publishing
-        run: npm install -g npm@latest
-
-      - name: Resolve target version
-        id: meta
-        run: |
-          set -euo pipefail
-          PKG_VERSION="$(node -p "require('./package.json').version")"
-
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            TAG_VERSION="${GITHUB_REF_NAME#v}"
-            if [[ "${PKG_VERSION}" != "${TAG_VERSION}" ]]; then
-              echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${PKG_VERSION}"
-              exit 1
-            fi
-            if [[ "${PKG_VERSION}" == *-* ]]; then
-              echo "::error::Stable publish refuses prerelease version ${PKG_VERSION}"
-              exit 1
-            fi
-            echo "version=${PKG_VERSION}" >> "${GITHUB_OUTPUT}"
-            echo "should_publish=true" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          if [[ "${PKG_VERSION}" == *-* ]]; then
-            echo "::error::package.json version ${PKG_VERSION} looks like a prerelease; use a clean semver for stable"
-            exit 1
-          fi
-
-          if npm view "effectable@${PKG_VERSION}" version >/dev/null 2>&1; then
-            echo "Version ${PKG_VERSION} already exists on npm — skip publish."
-            echo "should_publish=false" >> "${GITHUB_OUTPUT}"
-            echo "version=${PKG_VERSION}" >> "${GITHUB_OUTPUT}"
-          else
-            echo "Version ${PKG_VERSION} not on npm — will publish."
-            echo "should_publish=true" >> "${GITHUB_OUTPUT}"
-            echo "version=${PKG_VERSION}" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Install dependencies
-        if: steps.meta.outputs.should_publish == 'true'
-        run: npm ci
-
-      - name: Typecheck and test
-        if: steps.meta.outputs.should_publish == 'true'
-        run: |
-          npm run typecheck
-          npm test
-
-      - name: Build
-        if: steps.meta.outputs.should_publish == 'true'
-        run: npm run build
-
-      - name: Publish stable to npm
-        if: steps.meta.outputs.should_publish == 'true'
-        run: npm publish --access public --tag latest --ignore-scripts
-        env:
-          NPM_CONFIG_PROVENANCE: 'true'
-
-      - name: Summary
-        run: |
-          {
-            echo "## Stable publish"
-            echo ""
-            echo "- Version: \`${{ steps.meta.outputs.version }}\`"
-            echo "- Published: \`${{ steps.meta.outputs.should_publish }}\`"
-            if [[ "${{ steps.meta.outputs.should_publish }}" == "true" ]]; then
-              echo "- Install: \`npm install effectable@${{ steps.meta.outputs.version }}\`"
-            else
-              echo "- Skipped (version already on npm)."
-            fi
-          } >> "${GITHUB_STEP_SUMMARY}"
+        run: npx semantic-release

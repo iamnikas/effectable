@@ -1,67 +1,74 @@
 # Publishing
 
-Releases use GitHub Actions + npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC). No long-lived `NPM_TOKEN` is required after the first package exists on npm.
+Releases use [semantic-release](https://semantic-release.app/) on GitHub Actions with npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC). No long-lived `NPM_TOKEN` is required.
 
-Workflow: [`.github/workflows/publish.yml`](../.github/workflows/publish.yml)
+Workflow: [`.github/workflows/publish.yml`](../.github/workflows/publish.yml)  
+Config: [`release.config.cjs`](../release.config.cjs)
+
+Commit messages must follow [Conventional Commits](https://www.conventionalcommits.org/) (enforced by commitlint + lefthook). Those messages are what semantic-release uses to decide the next version.
 
 ## One-time npm setup
 
-1. Create the package once (if it does not exist yet), e.g. local first publish:
-
-   ```bash
-   npm login
-   npm publish --access public
-   ```
-
+1. Package must already exist on npm (one-time local publish if needed).
 2. On [npmjs.com](https://www.npmjs.com) → package **effectable** → **Settings** → **Trusted Publisher**:
    - Organization or user: `iamnikas`
    - Repository: `effectable`
    - Workflow filename: `publish.yml` (filename only)
-   - Environment: leave empty (unless you enable `environment: npm` in the workflow)
+   - Environment: leave empty
    - Allowed actions: `npm publish`
-3. Optionally restrict token publishing under **Publishing access** after OIDC works.
 
 ## Channels
 
-| Trigger | npm dist-tag | Version shape | Install |
+| Branch / trigger | npm dist-tag | Version shape | Who bumps |
 | --- | --- | --- | --- |
-| Push to `develop` | `canary` | `<package.json>-canary.<sha7>` e.g. `0.1.0-canary.a1b2c3d` | `npm i effectable@canary` |
-| Push to `main` (new semver in `package.json`) | `latest` | exact `package.json` version | `npm i effectable` |
-| Git tag `vX.Y.Z` | `latest` | must equal `package.json` | `npm i effectable@X.Y.Z` |
-| Actions → Run workflow | `canary` or `stable` | same rules | — |
+| Push to `develop` | `canary` | `X.Y.Z-canary.N` | semantic-release |
+| Push to `main` | `latest` | `X.Y.Z` | semantic-release |
+| Actions → Run workflow | same as branch | same | semantic-release |
 
-Canary versions are written only in the CI workspace; they are **not** committed back to git.
+No manual edits to `"version"` in `package.json` for routine releases. The release commit (`chore(release): … [skip ci]`) updates `package.json`, `package-lock.json`, and `CHANGELOG.md`.
 
-## Commit messages
+## Bump rules (commitlint ↔ semantic-release)
 
-This repo uses Conventional Commits (`commitlint` + `lefthook` on `commit-msg`).
-PR commits are also checked in CI. Preferred types: `feat`, `fix`, `docs`, `refactor`, `test`, `ci`, `chore`, `perf`.
+| Commit type | Release |
+| --- | --- |
+| `feat:` | minor |
+| `fix:` / `perf:` | patch |
+| `BREAKING CHANGE:` footer or `feat!:` / `fix!:` | major |
+| `docs:`, `chore:`, `ci:`, `test:`, `refactor:` (no bang) | no release |
 
-Stable version bumps in `package.json` remain **manual** for now (no semantic-release yet).
+Squash-merge PR titles **must** stay Conventional Commits — squash message is what lands on the branch.
 
-## Recommended release flow
+## Recommended flow
 
-### Canary (continuous)
+### Canary
 
-1. Merge work into `develop`.
-2. CI publishes `effectable@canary` automatically.
+1. Merge work into `develop` with Conventional Commits.
+2. Publish workflow runs `semantic-release` → npm `@canary` when there are releasable commits since the last canary/stable tag.
 
-### Stable (semver)
+### Stable
 
-1. On `develop` (or a release PR into `main`), bump `package.json` `"version"` with semver (`0.1.0` → `0.1.1` / `0.2.0` / `1.0.0`).
-2. Merge into `main`.
-3. Publish job runs: if that version is not on npm yet → publishes to `latest`.
-4. Optionally tag for clarity:
+1. Merge `develop` → `main` (or land releasable commits on `main`).
+2. Publish workflow runs `semantic-release` → npm `@latest` + GitHub Release + tag `vX.Y.Z`.
 
-   ```bash
-   git tag v0.1.1
-   git push origin v0.1.1
-   ```
+### First-time baseline (already published `0.1.0`)
 
-   Tag publish is idempotent if the version already exists (main job will skip).
+If `0.1.0` is on npm but git has no matching tag, create it once on the release commit so the next bump starts from there:
 
-Do not put `-canary` / other prerelease suffixes into `package.json` on `main`.
+```bash
+git tag v0.1.0 <commit-sha>
+git push origin v0.1.0
+```
+
+Otherwise semantic-release may try to publish a version that already exists.
+
+## Local dry-run
+
+```bash
+npx semantic-release --dry-run
+```
+
+Needs a full git history and network for npm/GitHub metadata; does not publish.
 
 ## Provenance
 
-Publishes set `NPM_CONFIG_PROVENANCE=true`. Provenance requires a **public** GitHub repository.
+Publishes set `NPM_CONFIG_PROVENANCE=true`. Provenance requires a **public** GitHub repository. Do not set `registry-url` in `actions/setup-node` for this workflow — it breaks OIDC trusted publishing.
