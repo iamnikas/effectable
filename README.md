@@ -1,5 +1,10 @@
 # Effectable
 
+[![npm](https://img.shields.io/npm/v/effectable.svg)](https://www.npmjs.com/package/effectable)
+[![CI](https://github.com/iamnikas/effectable/actions/workflows/ci.yml/badge.svg)](https://github.com/iamnikas/effectable/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Node.js](https://img.shields.io/node/v/effectable.svg)](https://nodejs.org)
+
 Reactive layer library: explicit bootstrap-path, Redux-RxJS store, base class with lifecycle, class-based HOC `connect`, and GraphRuntime with a declarative component tree (`h`, `compose`).
 
 ## Installation
