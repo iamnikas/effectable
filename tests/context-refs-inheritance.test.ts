@@ -70,16 +70,14 @@ describe('Context decorator inheritance', () => {
         public contextB!: number;
       }
 
-      const runtime = new GraphRuntime();
-      const provider = new ContextProvider({
+      const rootNode = h(ContextProvider, {
         value: [
           [TEST_CONTEXT_A, 'test-value'],
           [TEST_CONTEXT_B, 99],
         ],
-      });
+      }, [h(Derived, {})]);
 
-      const rootNode = h(provider, {}, [h(Derived, {})]);
-      await runtime.mount('/', rootNode);
+      const runtime = await GraphRuntime.mount(rootNode);
 
       const instances = runtime.getAll(Derived);
       expect(instances.length).toBe(1);
@@ -88,7 +86,7 @@ describe('Context decorator inheritance', () => {
       expect(instance.contextA).toBe('test-value');
       expect(instance.contextB).toBe(99);
 
-      await runtime.unmount('/');
+      await runtime.unmount();
     });
 
     it('should not share metadata between siblings', () => {
@@ -153,17 +151,15 @@ describe('Context decorator inheritance', () => {
       expect(fields.find((f) => f.propertyKey === 'contextB')).toBeDefined();
       expect(fields.find((f) => f.propertyKey === 'contextC')).toBeDefined();
 
-      const runtime = new GraphRuntime();
-      const provider = new ContextProvider({
+      const rootNode = h(ContextProvider, {
         value: [
           [TEST_CONTEXT_A, 'test'],
           [TEST_CONTEXT_B, 100],
           [TEST_CONTEXT_C, true],
         ],
-      });
+      }, [h(Child, {})]);
 
-      const rootNode = h(provider, {}, [h(Child, {})]);
-      await runtime.mount('/', rootNode);
+      const runtime = await GraphRuntime.mount(rootNode);
 
       const instances = runtime.getAll(Child);
       const instance = instances[0] as Child;
@@ -172,7 +168,7 @@ describe('Context decorator inheritance', () => {
       expect(instance.contextB).toBe(100);
       expect(instance.contextC).toBe(true);
 
-      await runtime.unmount('/');
+      await runtime.unmount();
     });
   });
 

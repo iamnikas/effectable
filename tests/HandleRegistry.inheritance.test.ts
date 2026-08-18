@@ -5,17 +5,22 @@
  * @module Effectable/runtime/HandleRegistry.inheritance.test
  */
 
-import { HandleRegistry, UseImperativeHandle, UseRef, forwardRef } from 'Effectable';
+import {
+  HandleRegistry,
+  UseImperativeHandle as HandleRegistryUseImperativeHandle,
+  UseRef as HandleRegistryUseRef,
+  forwardRef,
+} from 'Effectable';
 
 describe('HandleRegistry decorator inheritance', () => {
   describe('@forwardRef class decorator', () => {
     it('should not share metadata between parent and child', () => {
       @forwardRef('base-key')
       class Base {
-        @UseRef()
+        @HandleRegistryUseRef()
         public ref = {};
 
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public baseMethod (): string {
           return 'base';
         }
@@ -23,7 +28,7 @@ describe('HandleRegistry decorator inheritance', () => {
 
       @forwardRef('derived-key')
       class Derived extends Base {
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public derivedMethod (): string {
           return 'derived';
         }
@@ -52,10 +57,10 @@ describe('HandleRegistry decorator inheritance', () => {
     it('should allow child class to override forwardRef key', () => {
       @forwardRef('base-key')
       class Base {
-        @UseRef()
+        @HandleRegistryUseRef()
         public ref = {};
 
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public method (): string {
           return 'base';
         }
@@ -77,10 +82,10 @@ describe('HandleRegistry decorator inheritance', () => {
     it('should allow child to use factory function for key', () => {
       @forwardRef('base-key')
       class Base {
-        @UseRef()
+        @HandleRegistryUseRef()
         public ref = {};
 
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public method (): string {
           return 'base';
         }
@@ -114,10 +119,10 @@ describe('HandleRegistry decorator inheritance', () => {
     it('should collect methods from both base and derived', () => {
       @forwardRef('test-key')
       class Base {
-        @UseRef()
+        @HandleRegistryUseRef()
         public ref = {};
 
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public baseMethod (): string {
           return 'base';
         }
@@ -125,7 +130,7 @@ describe('HandleRegistry decorator inheritance', () => {
 
       @forwardRef('test-key-derived')
       class Derived extends Base {
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public derivedMethod (): string {
           return 'derived';
         }
@@ -146,10 +151,10 @@ describe('HandleRegistry decorator inheritance', () => {
     it('should not mutate parent class metadata', () => {
       @forwardRef('base-key')
       class Base {
-        @UseRef()
+        @HandleRegistryUseRef()
         public ref = {};
 
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public baseMethod (): string {
           return 'base';
         }
@@ -157,7 +162,7 @@ describe('HandleRegistry decorator inheritance', () => {
 
       @forwardRef('derived-key')
       class Derived extends Base {
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public derivedMethod (): string {
           return 'derived';
         }
@@ -187,10 +192,10 @@ describe('HandleRegistry decorator inheritance', () => {
     it('should handle three-level inheritance', () => {
       @forwardRef('grandparent-key')
       class GrandParent {
-        @UseRef()
+        @HandleRegistryUseRef()
         public ref = {};
 
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public grandparentMethod (): string {
           return 'grandparent';
         }
@@ -198,7 +203,7 @@ describe('HandleRegistry decorator inheritance', () => {
 
       @forwardRef('parent-key')
       class Parent extends GrandParent {
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public parentMethod (): string {
           return 'parent';
         }
@@ -206,7 +211,7 @@ describe('HandleRegistry decorator inheritance', () => {
 
       @forwardRef('child-key')
       class Child extends Parent {
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public childMethod (): string {
           return 'child';
         }
@@ -234,10 +239,10 @@ describe('HandleRegistry decorator inheritance', () => {
     it('should not share metadata between siblings', () => {
       @forwardRef('base-key')
       class Base {
-        @UseRef()
+        @HandleRegistryUseRef()
         public ref = {};
 
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public baseMethod (): string {
           return 'base';
         }
@@ -245,7 +250,7 @@ describe('HandleRegistry decorator inheritance', () => {
 
       @forwardRef('sibling-a-key')
       class SiblingA extends Base {
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public methodA (): string {
           return 'a';
         }
@@ -253,7 +258,7 @@ describe('HandleRegistry decorator inheritance', () => {
 
       @forwardRef('sibling-b-key')
       class SiblingB extends Base {
-        @UseImperativeHandle()
+        @HandleRegistryUseImperativeHandle()
         public methodB (): string {
           return 'b';
         }

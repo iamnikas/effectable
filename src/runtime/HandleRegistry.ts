@@ -111,10 +111,22 @@ export class HandleRegistry {
       throw new Error('HandleRegistry.autoRegister: invalid instance');
     }
 
-    const refPropertyKey = Reflect.getOwnMetadata(
-      USE_REF_PROPERTY_METADATA_KEY,
-      ctor
-    ) as string | undefined;
+    let refPropertyKey: string | undefined;
+    let current: Function | null = ctor;
+    while (current != null && typeof current === 'function') {
+      refPropertyKey = Reflect.getOwnMetadata(
+        USE_REF_PROPERTY_METADATA_KEY,
+        current
+      ) as string | undefined;
+      if (refPropertyKey !== undefined) {
+        break;
+      }
+      const next = Object.getPrototypeOf(current);
+      if (typeof next !== 'function' || next === null) {
+        break;
+      }
+      current = next;
+    }
 
     if (typeof refPropertyKey === 'undefined') {
       throw new Error('HandleRegistry.autoRegister: missing ref property metadata (@UseRef)');
@@ -125,12 +137,26 @@ export class HandleRegistry {
       throw new Error('HandleRegistry.autoRegister: ref property is not an object');
     }
 
-    const methodNames = Reflect.getOwnMetadata(
-      USE_IMPERATIVE_HANDLE_METADATA_KEY,
-      ctor
-    ) as Set<string> | undefined;
+    const methodNames = new Set<string>();
+    current = ctor;
+    while (current != null && typeof current === 'function') {
+      const ownMethods = Reflect.getOwnMetadata(
+        USE_IMPERATIVE_HANDLE_METADATA_KEY,
+        current
+      ) as Set<string> | undefined;
+      if (ownMethods !== undefined) {
+        for (const methodName of ownMethods) {
+          methodNames.add(methodName);
+        }
+      }
+      const next = Object.getPrototypeOf(current);
+      if (typeof next !== 'function' || next === null) {
+        break;
+      }
+      current = next;
+    }
 
-    if (typeof methodNames === 'undefined' || methodNames.size === 0) {
+    if (methodNames.size === 0) {
       throw new Error('HandleRegistry.autoRegister: no @UseImperativeHandle methods');
     }
 
@@ -154,10 +180,22 @@ export class HandleRegistry {
       throw new Error('HandleRegistry.autoRegister: invalid instance');
     }
 
-    const keyOrFactory = Reflect.getOwnMetadata(
-      USE_REF_METADATA_KEY,
-      ctor
-    ) as HandleRefKeyFactory<unknown> | undefined;
+    let keyOrFactory: HandleRefKeyFactory<unknown> | undefined;
+    let current: Function | null = ctor;
+    while (current != null && typeof current === 'function') {
+      keyOrFactory = Reflect.getOwnMetadata(
+        USE_REF_METADATA_KEY,
+        current
+      ) as HandleRefKeyFactory<unknown> | undefined;
+      if (keyOrFactory !== undefined) {
+        break;
+      }
+      const next = Object.getPrototypeOf(current);
+      if (typeof next !== 'function' || next === null) {
+        break;
+      }
+      current = next;
+    }
 
     if (typeof keyOrFactory === 'undefined') {
       throw new Error('HandleRegistry.autoRegister: missing @UseRef metadata');
