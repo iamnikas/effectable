@@ -2219,7 +2219,8 @@ describe('GraphRuntime', () => {
       const RuntimeFactory = GraphRuntime as unknown as new () => GraphRuntime;
       const runtime = new RuntimeFactory();
 
-      expect(runtime.isActive()).toBe(true);
+      // Runtime created directly (not via mount) is in IDLE state
+      expect(runtime.isActive()).toBe(false);
       expect(runtime.getRootInstance()).toBeNull();
 
       await expect(

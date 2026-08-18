@@ -153,8 +153,6 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
 export class GraphRuntime {
   /** Current root fiber tree (current tree). */
   private currentRoot: RuntimeFiber | null = null;
-  /** Whether unmount has completed. */
-  private unmounted = false;
   /**
    * Entry counter for {@link continueStableReconcileAsync} (test/debug probe).
    * Not reset automatically — compare before/after around reconcile.
@@ -241,11 +239,6 @@ export class GraphRuntime {
    * Cached unmount promise for concurrent unmount callers (issue #11).
    */
   private cachedUnmountPromise: Promise<void> | null = null;
-
-  /**
-   * Whether unmount has started (reject new reconcile after this).
-   */
-  private unmountStarted = false;
 
   /**
    * Instances are created only via {@link GraphRuntime.mount}; direct `new GraphRuntime()` is unavailable externally.
@@ -582,7 +575,7 @@ export class GraphRuntime {
    * @returns {void}
    */
   private scheduleUpdate (fiber: RuntimeFiber<unknown>): void {
-    if (this.unmounted || this.unmountStarted || this.state === RUNTIME_STATE.FAILED) {
+    if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
       return;
     }
 
@@ -683,7 +676,7 @@ export class GraphRuntime {
    * @returns {void}
    */
   private scheduleDirtyFlushMicrotask (): void {
-    if (this.flushScheduled || this.unmounted || this.unmountStarted || this.state === RUNTIME_STATE.FAILED) {
+    if (this.flushScheduled || this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
       return;
     }
 
@@ -722,7 +715,7 @@ export class GraphRuntime {
   private async flushDirtyFibers (): Promise<void> {
     this.flushScheduled = false;
 
-    if (this.unmounted || this.unmountStarted || this.flushing || this.state === RUNTIME_STATE.FAILED) {
+    if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED || this.flushing) {
       this.dirtyFibers.clear();
       return;
     }
@@ -734,7 +727,7 @@ export class GraphRuntime {
 
     try {
       for (const fiber of snapshot) {
-        if (this.unmounted || this.unmountStarted || this.state === RUNTIME_STATE.FAILED) {
+        if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
           break;
         }
         const res = this.reconcileDirtyFiber(fiber);
@@ -763,7 +756,7 @@ export class GraphRuntime {
     }
 
     // If new dirty fibers appeared during flush — schedule the next pass
-    if (this.dirtyFibers.size > 0 && !this.unmounted && !this.unmountStarted && this.state !== RUNTIME_STATE.FAILED) {
+    if (this.dirtyFibers.size > 0 && this.state === RUNTIME_STATE.ACTIVE) {
       if (this.dirtyFlushPassCount >= GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES) {
         this.dirtyFibers.clear();
         this.dirtyFlushPassCount = 0;
@@ -800,7 +793,7 @@ export class GraphRuntime {
    * @returns {void | Promise<void>}
    */
   private reconcileDirtyFiber (fiber: RuntimeFiber<unknown>): void | Promise<void> {
-    if (this.unmounted || this.unmountStarted) {
+    if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
       return;
     }
 
@@ -909,7 +902,7 @@ export class GraphRuntime {
    */
   public async reconcile<P = unknown>(nextTree: VirtualServiceNode<P>): Promise<void> {
     // Reject immediately if unmount has started or completed
-    if (this.unmountStarted || this.unmounted) {
+    if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
       throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
     }
 
@@ -921,7 +914,7 @@ export class GraphRuntime {
     // Serialize via operation queue
     await this.enqueueOperation(async () => {
       // Double-check after queue wait
-      if (this.unmountStarted || this.unmounted) {
+      if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
         throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
       }
 
@@ -939,7 +932,7 @@ export class GraphRuntime {
         await this.activeFlush;
       }
 
-      if (this.unmountStarted || this.unmounted) {
+      if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
         throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
       }
 
@@ -987,7 +980,7 @@ export class GraphRuntime {
    */
   public async unmount (): Promise<void> {
     // If unmount already completed, return immediately
-    if (this.unmounted) {
+    if (this.state === RUNTIME_STATE.UNMOUNTED) {
       return;
     }
 
@@ -996,18 +989,16 @@ export class GraphRuntime {
       return this.cachedUnmountPromise;
     }
 
-    // Mark unmount started: reject new reconcile calls
-    this.unmountStarted = true;
-    
-    // Transition to UNMOUNTING state
+    // Transition to UNMOUNTING state (reject new reconcile calls)
+    // If already FAILED, stay FAILED until unmount completes
     if (this.state !== RUNTIME_STATE.FAILED) {
       this.state = RUNTIME_STATE.UNMOUNTING;
     }
 
     // Create and cache the unmount promise
     this.cachedUnmountPromise = this.enqueueOperation(async () => {
-      // Double-check unmounted flag
-      if (this.unmounted) {
+      // Double-check unmounted state
+      if (this.state === RUNTIME_STATE.UNMOUNTED) {
         return;
       }
 
@@ -1024,7 +1015,6 @@ export class GraphRuntime {
         }
       }
 
-      this.unmounted = true;
       this.state = RUNTIME_STATE.UNMOUNTED;
 
       if (this.currentRoot !== null) {
@@ -1059,7 +1049,7 @@ export class GraphRuntime {
    * @returns {boolean}
    */
   public isActive (): boolean {
-    return this.state !== RUNTIME_STATE.FAILED && !this.unmounted;
+    return this.state === RUNTIME_STATE.ACTIVE;
   }
 
   /**
