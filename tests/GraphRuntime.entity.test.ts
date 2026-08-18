@@ -382,7 +382,7 @@ describe('GraphRuntime', () => {
 
       await expect(
         runtime.reconcile(h(LeafComponent, { value: 1 }))
-      ).rejects.toThrow('[Effectable] GraphRuntime: reconcile attempted after unmount.');
+      ).rejects.toThrow('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
     });
 
     it('after unmount getRootInstance() returns null', async () => {
