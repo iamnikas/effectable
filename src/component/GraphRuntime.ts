@@ -885,6 +885,14 @@ export class GraphRuntime {
     // Recursively materialize children before running the parent's lifecycle
     const childVnodes = this.getChildVnodes(instance, vnode.children);
 
+    // Validate unique keys BEFORE materialization (Option A: React v16.5 contract)
+    // Prevent partial tree construction when duplicate keys are present
+    this.validateUniqueKeys(
+      childVnodes.map(vnode => ({ vnode, instance: null })),
+      fiber as RuntimeFiber<unknown>,
+      'current'
+    );
+
     for (let i = 0; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
       let childRes: RuntimeFiber<unknown> | Promise<RuntimeFiber<unknown>>;
