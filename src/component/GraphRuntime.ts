@@ -731,14 +731,19 @@ export class GraphRuntime {
     } catch (error: unknown) {
       this.flushing = false;
       
-      // Notify error handler (issue #10)
+      // Notify error handler before fail-stop (issue #10)
       if (this.onAutoReconcileError !== null) {
         this.onAutoReconcileError(error);
       }
       
-      // Re-throw to propagate to microtask wrapper, but don't fail-stop
-      // (dirty-flush errors on child fibers are recoverable)
-      throw error;
+      // Fail-stop on unrecoverable dirty-flush error (issue #10)
+      const failError = error instanceof Error ? error : new Error(String(error));
+      const failRes = this.failStop(failError);
+      if (isThenable(failRes)) {
+        await failRes;
+      }
+      
+      throw failError;
     } finally {
       this.flushing = false;
     }
@@ -853,14 +858,25 @@ export class GraphRuntime {
     const rt = new GraphRuntime();
     rt.effectableRuntimeBuses = typeof runtimeBuses === 'undefined' ? null : runtimeBuses;
     rt.onAutoReconcileError = typeof onAutoReconcileError === 'function' ? onAutoReconcileError : null;
-    const res = rt.materialize(
-      root as VirtualServiceNode<unknown>,
-      null,
-      initialScope,
-    );
-    rt.currentRoot = isThenable(res) ? await res : res;
-    rt.state = RUNTIME_STATE.ACTIVE;
-    return rt;
+    
+    try {
+      const res = rt.materialize(
+        root as VirtualServiceNode<unknown>,
+        null,
+        initialScope,
+      );
+      rt.currentRoot = isThenable(res) ? await res : res;
+      rt.state = RUNTIME_STATE.ACTIVE;
+      return rt;
+    } catch (error: unknown) {
+      // Fail-stop on unrecoverable mount error (issue #10)
+      const failError = error instanceof Error ? error : new Error(String(error));
+      const failRes = rt.failStop(failError);
+      if (isThenable(failRes)) {
+        await failRes;
+      }
+      throw failError;
+    }
   }
 
   /**
@@ -923,14 +939,26 @@ export class GraphRuntime {
       this.flushScheduled = false;
       this.dirtyFlushPassCount = 0;
 
-      const res = this.reconcileFiber(
-        this.currentRoot,
-        nextTree as VirtualServiceNode<unknown>,
-        null,
-        this.currentRoot.scope,
-      );
+      try {
+        const res = this.reconcileFiber(
+          this.currentRoot,
+          nextTree as VirtualServiceNode<unknown>,
+          null,
+          this.currentRoot.scope,
+        );
 
-      this.currentRoot = isThenable(res) ? await res : res;
+        this.currentRoot = isThenable(res) ? await res : res;
+      } catch (error: unknown) {
+        // Fail-stop on unrecoverable reconcile error (issue #10)
+        // Set currentRoot to null before failStop to avoid double-destroy
+        this.currentRoot = null;
+        const failError = error instanceof Error ? error : new Error(String(error));
+        const failRes = this.failStop(failError);
+        if (isThenable(failRes)) {
+          await failRes;
+        }
+        throw failError;
+      }
     });
   }
 
