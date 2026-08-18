@@ -32,7 +32,7 @@ const ON_EVENT_ENTRIES = 'effectable:runtime:OnEvent:entries';
 
 function appendPropKey (ctor: Function, metaKey: string, propertyKey: string | symbol): void {
   const key = String(propertyKey);
-  const current = Reflect.getMetadata(metaKey, ctor) as string[] | undefined;
+  const current = Reflect.getOwnMetadata(metaKey, ctor) as string[] | undefined;
   const next = typeof current === 'undefined' ? [key] : [...current, key];
   Reflect.defineMetadata(metaKey, next, ctor);
 }
@@ -42,7 +42,7 @@ function appendHandlerEntry (
   metaKey: string,
   entry: { type: string; method: string }
 ): void {
-  const current = Reflect.getMetadata(metaKey, ctor) as Array<{ type: string; method: string }> | undefined;
+  const current = Reflect.getOwnMetadata(metaKey, ctor) as Array<{ type: string; method: string }> | undefined;
   const next = typeof current === 'undefined' ? [entry] : [...current, entry];
   Reflect.defineMetadata(metaKey, next, ctor);
 }
@@ -159,12 +159,12 @@ export function createRuntimeBuses<
 }
 
 function getStringPropKeys (ctor: Function, metaKey: string): string[] {
-  const own = Reflect.getMetadata(metaKey, ctor) as string[] | undefined;
+  const own = Reflect.getOwnMetadata(metaKey, ctor) as string[] | undefined;
   return typeof own === 'undefined' ? [] : [...own];
 }
 
 function getHandlerEntries (ctor: Function, metaKey: string): Array<{ type: string; method: string }> {
-  const own = Reflect.getMetadata(metaKey, ctor) as Array<{ type: string; method: string }> | undefined;
+  const own = Reflect.getOwnMetadata(metaKey, ctor) as Array<{ type: string; method: string }> | undefined;
   return typeof own === 'undefined' ? [] : [...own];
 }
 
