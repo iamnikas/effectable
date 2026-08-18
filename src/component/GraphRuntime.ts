@@ -6,7 +6,7 @@
  * - Fiber-like reconcile: diff current vs next trees by key + type, assign effectTags.
  *   Reconciliation mutates the live graph (not an isolated work-in-progress tree).
  * - Drive lifecycle via LifecycleEngine: startup in topological order (children before parent),
- *   shutdown in reverse order (parent before children).
+ *   shutdown in the same order (children before parent).
  * - Inject contexts (@UseContext) and bind refs on mount.
  * - Pass updated props into existing instances during reconcile.
  * - Serialize all graph operations through a single operation queue (issue #11).
@@ -970,7 +970,7 @@ export class GraphRuntime {
 
   /**
    * Fully unmounts the component tree.
-   * Calls onUnmount for each node in reverse order (children before parent) and
+   * Calls onUnmount for each node (children before parent) and
    * moves stages to destroyed via LifecycleEngine.
    *
    * Issue #11: unmount is serialized, cached promise returned for concurrent callers.

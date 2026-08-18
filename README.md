@@ -47,7 +47,7 @@ Architecture overview: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 - Creates `EventBus`, `CommandBus`, `QueryBus`, and `HandleRegistry` when the caller does not pass them explicitly.
 - Mounts the root component via `GraphRuntime` (including ones wrapped with `connect`).
-- Returns a handle with `shutdown()` for graceful teardown: calls `onUnmount` in reverse order.
+- Returns a handle with `shutdown()` for graceful teardown: calls `onUnmount` children-first, then parent; siblings sequentially in compose order; async `onUnmount` is awaited.
 - On startup failure, automatically cleans up already created runtime primitives.
 
 ### Bootstrap-path example
