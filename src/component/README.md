@@ -55,6 +55,17 @@ Updates `state` and calls `onUpdate(prev, next)`.
 
 Optional declarative method. Returns `VirtualServiceNode | VirtualServiceNode[] | null` — a subtree described via `h(Ctor, props, children)`. Called by GraphRuntime; side effects inside are forbidden (subscriptions, network, handler registration).
 
+**Keyed children contract:** When using the optional `key` parameter in `h(Ctor, props, key)` for dynamic lists, sibling keys MUST be unique. Duplicate keys are invalid per React v16.5 keyed child reconciliation semantics and will throw a deterministic error during reconcile. This prevents undefined matching behavior and lifecycle leaks (orphaned fibers not unmounted).
+
+Example with unique keys:
+```typescript
+public override compose(): VirtualServiceNode[] {
+  return this.state.items.map(item => 
+    h(ItemComponent, { id: item.id }, item.id)  // key = item.id (must be unique)
+  );
+}
+```
+
 ### Lifecycle: who calls what
 
 - **GraphRuntime** calls `onMount → onUpdate* → onUnmount` according to LifecycleEngine state.
