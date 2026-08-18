@@ -4,11 +4,14 @@
  * Responsibilities:
  * - Materialize a VirtualServiceNode tree into real component instances (Fiber tree).
  * - Fiber-like reconcile: diff current vs next trees by key + type, assign effectTags.
+ *   Reconciliation mutates the live graph (not an isolated work-in-progress tree).
  * - Drive lifecycle via LifecycleEngine: startup in topological order (children before parent),
  *   shutdown in reverse order (parent before children).
  * - Inject contexts (@UseContext) and bind refs on mount.
  * - Pass updated props into existing instances during reconcile.
  * - Serialize all graph operations through a single operation queue (issue #11).
+ * - Fail-stop on unrecoverable errors: mark runtime FAILED, reject later reconcile,
+ *   unmount stays safe (issue #10).
  *
  * Current limitations:
  * - Work loop is synchronous (no priority lanes — next increment).
@@ -62,6 +65,28 @@ function isThenable<T> (value: T | PromiseLike<T>): value is PromiseLike<T> {
     typeof (value as { then?: unknown }).then === 'function'
   );
 }
+
+// ---------------------------------------------------------------------------
+// Runtime state machine (issue #10)
+// ---------------------------------------------------------------------------
+
+/**
+ * Runtime state literals (issue #10).
+ * Private to GraphRuntime; reduced set without mounting/reconciling.
+ */
+const RUNTIME_STATE = {
+  IDLE: 'idle',
+  ACTIVE: 'active',
+  FAILED: 'failed',
+  UNMOUNTING: 'unmounting',
+  UNMOUNTED: 'unmounted',
+} as const;
+
+/**
+ * Runtime state type derived from RUNTIME_STATE.
+ * Not exported from package index (internal diagnostic only).
+ */
+type RuntimeState = (typeof RUNTIME_STATE)[keyof typeof RUNTIME_STATE];
 
 // ---------------------------------------------------------------------------
 // Helper types
@@ -135,6 +160,19 @@ export class GraphRuntime {
    * Not reset automatically — compare before/after around reconcile.
    */
   private stableAsyncContinueCount = 0;
+
+  /**
+   * Runtime state machine (issue #10).
+   * IDLE → ACTIVE (on mount) → FAILED | UNMOUNTING → UNMOUNTED.
+   * FAILED is terminal: subsequent reconcile rejects, unmount is safe.
+   */
+  private state: RuntimeState = RUNTIME_STATE.IDLE;
+
+  /**
+   * Terminal error captured by failStop() (issue #10).
+   * Stored to reject later reconcile calls with the same error.
+   */
+  private terminalError: Error | null = null;
 
   /**
    * Runtime buses for auto-wiring decorators on nodes (optional, set in {@link GraphRuntime.mount}).
@@ -213,6 +251,46 @@ export class GraphRuntime {
    * Instances are created only via {@link GraphRuntime.mount}; direct `new GraphRuntime()` is unavailable externally.
    */
   private constructor () {}
+
+  /**
+   * Fail-stop: mark the runtime as failed, disable scheduling, tear down the graph best-effort.
+   * After fail-stop:
+   * - state is FAILED
+   * - terminalError is set
+   * - currentRoot is null
+   * - later reconcile() rejects with the terminal error
+   * - unmount() is safe and joinable
+   *
+   * Issue #10: no failed reconcile leaves the runtime active with a partial graph.
+   *
+   * @param {Error} error - unrecoverable error that triggered fail-stop
+   * @returns {void | Promise<void>}
+   */
+  private failStop (error: Error): void | Promise<void> {
+    // Idempotent: if already failed, skip
+    if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTED) {
+      return;
+    }
+
+    this.state = RUNTIME_STATE.FAILED;
+    this.terminalError = error;
+
+    // Disable scheduling immediately
+    this.dirtyFibers.clear();
+    this.flushScheduled = false;
+
+    // Best-effort teardown of the current/partial graph
+    if (this.currentRoot !== null) {
+      const destroyRes = this.destroyFiber(this.currentRoot);
+      this.currentRoot = null;
+      
+      if (isThenable(destroyRes)) {
+        return destroyRes.catch(() => {
+          // Ignore cleanup errors during fail-stop
+        });
+      }
+    }
+  }
 
   /**
    * Auto-wires runtime-bus decorators onto the instance before {@link LifecycleEngine.runStartup}.
@@ -484,11 +562,13 @@ export class GraphRuntime {
    * - If an ancestor of the fiber is already queued → skip (ancestor covers the subtree).
    * - If descendants of the fiber are queued → remove them (fiber covers their subtrees).
    *
+   * Issue #10: skip scheduling when runtime is FAILED.
+   *
    * @param {RuntimeFiber<unknown>} fiber - fiber whose subtree needs rebuild
    * @returns {void}
    */
   private scheduleUpdate (fiber: RuntimeFiber<unknown>): void {
-    if (this.unmounted || this.unmountStarted) {
+    if (this.unmounted || this.unmountStarted || this.state === RUNTIME_STATE.FAILED) {
       return;
     }
 
@@ -584,10 +664,12 @@ export class GraphRuntime {
   /**
    * Queues one dirty-flush microtask and publishes {@link activeFlush} for await from `reconcile`.
    *
+   * Issue #10: skip scheduling when runtime is FAILED.
+   *
    * @returns {void}
    */
   private scheduleDirtyFlushMicrotask (): void {
-    if (this.flushScheduled || this.unmounted || this.unmountStarted) {
+    if (this.flushScheduled || this.unmounted || this.unmountStarted || this.state === RUNTIME_STATE.FAILED) {
       return;
     }
 
@@ -595,10 +677,8 @@ export class GraphRuntime {
     const flushWork = new Promise<void>((resolve) => {
       queueMicrotask(() => {
         this.flushDirtyFibers()
-          .catch((err: unknown) => {
-            if (this.onAutoReconcileError !== null) {
-              this.onAutoReconcileError(err);
-            }
+          .catch(() => {
+            // Error already handled in flushDirtyFibers (onAutoReconcileError + fail-stop)
           })
           .finally(() => {
             resolve();
@@ -621,13 +701,14 @@ export class GraphRuntime {
    * The chain of repeat passes is capped by {@link GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES}.
    *
    * Issue #11: respects unmountStarted to cancel flush when unmount begins.
+   * Issue #10: on unrecoverable error, invokes onAutoReconcileError then fail-stops.
    *
    * @returns {Promise<void>}
    */
   private async flushDirtyFibers (): Promise<void> {
     this.flushScheduled = false;
 
-    if (this.unmounted || this.unmountStarted || this.flushing) {
+    if (this.unmounted || this.unmountStarted || this.flushing || this.state === RUNTIME_STATE.FAILED) {
       this.dirtyFibers.clear();
       return;
     }
@@ -639,7 +720,7 @@ export class GraphRuntime {
 
     try {
       for (const fiber of snapshot) {
-        if (this.unmounted || this.unmountStarted) {
+        if (this.unmounted || this.unmountStarted || this.state === RUNTIME_STATE.FAILED) {
           break;
         }
         const res = this.reconcileDirtyFiber(fiber);
@@ -647,18 +728,42 @@ export class GraphRuntime {
           await res;
         }
       }
+    } catch (error: unknown) {
+      this.flushing = false;
+      
+      // Notify error handler (issue #10)
+      if (this.onAutoReconcileError !== null) {
+        this.onAutoReconcileError(error);
+      }
+      
+      // Re-throw to propagate to microtask wrapper, but don't fail-stop
+      // (dirty-flush errors on child fibers are recoverable)
+      throw error;
     } finally {
       this.flushing = false;
     }
 
     // If new dirty fibers appeared during flush — schedule the next pass
-    if (this.dirtyFibers.size > 0 && !this.unmounted && !this.unmountStarted) {
+    if (this.dirtyFibers.size > 0 && !this.unmounted && !this.unmountStarted && this.state !== RUNTIME_STATE.FAILED) {
       if (this.dirtyFlushPassCount >= GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES) {
         this.dirtyFibers.clear();
         this.dirtyFlushPassCount = 0;
-        throw new Error(
+        const loopError = new Error(
           `GraphRuntime: dirty flush exceeded ${String(GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES)} passes (anti-loop)`
         );
+        
+        // Notify error handler before fail-stop (issue #10)
+        if (this.onAutoReconcileError !== null) {
+          this.onAutoReconcileError(loopError);
+        }
+        
+        // Fail-stop on loop limit (issue #10)
+        const failRes = this.failStop(loopError);
+        if (isThenable(failRes)) {
+          await failRes;
+        }
+        
+        throw loopError;
       }
       this.scheduleDirtyFlushMicrotask();
     } else {
@@ -754,21 +859,23 @@ export class GraphRuntime {
       initialScope,
     );
     rt.currentRoot = isThenable(res) ? await res : res;
+    rt.state = RUNTIME_STATE.ACTIVE;
     return rt;
   }
 
   /**
    * Reconciles against a new tree.
-   * Builds a work-in-progress tree, computes effectTags, applies changes:
+   * Diffs the current tree against the new one, computes effectTags, applies changes:
    * - PLACE: create and mount a new node
    * - UPDATE: update props on an existing instance, call onUpdate
    * - DELETE: unmount and destroy a node
    *
    * Issue #11: all reconcile calls are serialized through the operation queue.
+   * Issue #10: rejects with terminal error when runtime is FAILED.
    *
    * @param {VirtualServiceNode<P>} nextTree - new virtual tree
    * @returns {Promise<void>}
-   * @throws {Error} if the runtime is already unmounted or unmount has started
+   * @throws {Error} if the runtime is already unmounted, unmount has started, or runtime is failed
    */
   public async reconcile<P = unknown>(nextTree: VirtualServiceNode<P>): Promise<void> {
     // Reject immediately if unmount has started or completed
@@ -776,11 +883,20 @@ export class GraphRuntime {
       throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
     }
 
+    // Reject immediately if runtime is in failed state (issue #10)
+    if (this.state === RUNTIME_STATE.FAILED) {
+      throw this.terminalError || new Error('[Effectable] GraphRuntime: reconcile attempted after terminal failure.');
+    }
+
     // Serialize via operation queue
     await this.enqueueOperation(async () => {
       // Double-check after queue wait
       if (this.unmountStarted || this.unmounted) {
         throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
+      }
+
+      if (this.state === RUNTIME_STATE.FAILED) {
+        throw this.terminalError || new Error('[Effectable] GraphRuntime: reconcile attempted after terminal failure.');
       }
 
       if (this.currentRoot === null) {
@@ -795,6 +911,10 @@ export class GraphRuntime {
 
       if (this.unmountStarted || this.unmounted) {
         throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
+      }
+
+      if (this.state === RUNTIME_STATE.FAILED) {
+        throw this.terminalError || new Error('[Effectable] GraphRuntime: reconcile attempted after terminal failure.');
       }
 
       // Manual reconcile covers the whole tree from the root: cancel pending auto-flush
@@ -820,6 +940,7 @@ export class GraphRuntime {
    * moves stages to destroyed via LifecycleEngine.
    *
    * Issue #11: unmount is serialized, cached promise returned for concurrent callers.
+   * Issue #10: safe and joinable even when runtime is FAILED.
    *
    * @returns {Promise<void>}
    */
@@ -836,6 +957,11 @@ export class GraphRuntime {
 
     // Mark unmount started: reject new reconcile calls
     this.unmountStarted = true;
+    
+    // Transition to UNMOUNTING state
+    if (this.state !== RUNTIME_STATE.FAILED) {
+      this.state = RUNTIME_STATE.UNMOUNTING;
+    }
 
     // Create and cache the unmount promise
     this.cachedUnmountPromise = this.enqueueOperation(async () => {
@@ -858,6 +984,7 @@ export class GraphRuntime {
       }
 
       this.unmounted = true;
+      this.state = RUNTIME_STATE.UNMOUNTED;
 
       if (this.currentRoot !== null) {
         const d = this.destroyFiber(this.currentRoot);
@@ -885,12 +1012,13 @@ export class GraphRuntime {
   }
 
   /**
-   * Whether the runtime is active (unmount has not been called).
+   * Whether the runtime is active (not failed and unmount has not been called).
+   * Issue #10: returns false when state is FAILED.
    *
    * @returns {boolean}
    */
   public isActive (): boolean {
-    return !this.unmounted;
+    return this.state !== RUNTIME_STATE.FAILED && !this.unmounted;
   }
 
   /**
@@ -930,6 +1058,16 @@ export class GraphRuntime {
    */
   public getStableAsyncContinueCount (): number {
     return this.stableAsyncContinueCount;
+  }
+
+  /**
+   * Current runtime state (issue #10).
+   * Test/debug probe; not a production API.
+   *
+   * @returns {RuntimeState} current state
+   */
+  public getState (): RuntimeState {
+    return this.state;
   }
 
   /**
