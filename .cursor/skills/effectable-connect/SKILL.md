@@ -292,7 +292,7 @@ Typical process composition:
 2. `const ConnectedRoot = connectApplicationRoot(rootStore)` — factory from `app.ts`.
 3. `await bootstrap({ name, RootComponent: ConnectedRoot, props, … })` (optionally with shared runtime buses / HandleRegistry).
 4. Root props — process dependencies + optional `appStore: rootStore` for outward references; **do not** pass `store` as a prop for child-HOC subscription.
-5. Shutdown — `handle.shutdown()` → `onUnmount` in reverse order.
+5. Shutdown — `handle.shutdown()` → `onUnmount` children-first, then parent; siblings in compose order.
 
 ## Mapper names
 
