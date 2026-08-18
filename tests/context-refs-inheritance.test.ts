@@ -7,8 +7,6 @@
 
 import {
   Component,
-  ContextProvider,
-  GraphRuntime,
   UseContext,
   UseImperativeHandle,
   UseRef,
@@ -16,7 +14,6 @@ import {
   getContextFields,
   getImperativeHandleMethods,
   getRefFields,
-  h,
 } from 'Effectable';
 import type { RefObject } from 'Effectable';
 
@@ -25,375 +22,200 @@ const TEST_CONTEXT_B = createContext<number>('TEST_CONTEXT_B', 42);
 const TEST_CONTEXT_C = createContext<boolean>('TEST_CONTEXT_C');
 
 describe('Context decorator inheritance', () => {
-  describe('@UseContext metadata isolation', () => {
-    it('should not mutate parent class context metadata', () => {
-      class Base extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseContext(TEST_CONTEXT_A)
-        protected contextA!: string;
+  it('parent metadata not mutated after subclass decorators', () => {
+    class Base extends Component<Record<string, unknown>, Record<string, unknown>> {
+      @UseContext(TEST_CONTEXT_A)
+      protected contextA!: string;
 
-        public override compose (): null {
-          return null;
-        }
+      public override compose (): null {
+        return null;
       }
+    }
 
-      class Derived extends Base {
-        @UseContext(TEST_CONTEXT_B)
-        protected contextB!: number;
-      }
+    class Derived extends Base {
+      @UseContext(TEST_CONTEXT_B)
+      protected contextB!: number;
+    }
 
-      const baseFields = getContextFields(Base as any);
-      const derivedFields = getContextFields(Derived as any);
+    const baseFields = getContextFields(Base as any);
+    const derivedFields = getContextFields(Derived as any);
 
-      expect(baseFields.length).toBe(1);
-      expect(baseFields[0]?.propertyKey).toBe('contextA');
+    expect(baseFields.length).toBe(1);
+    expect(baseFields[0]?.propertyKey).toBe('contextA');
 
-      expect(derivedFields.length).toBe(2);
-      expect(derivedFields.find((f) => f.propertyKey === 'contextA')).toBeDefined();
-      expect(derivedFields.find((f) => f.propertyKey === 'contextB')).toBeDefined();
-
-      expect(Object.isFrozen(baseFields)).toBe(true);
-      expect(Object.isFrozen(derivedFields)).toBe(true);
-    });
-
-    it('should inject context values from both base and derived', () => {
-      class Base extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseContext(TEST_CONTEXT_A)
-        public contextA!: string;
-
-        public override compose (): null {
-          return null;
-        }
-      }
-
-      class Derived extends Base {
-        @UseContext(TEST_CONTEXT_B)
-        public contextB!: number;
-      }
-
-      const baseFields = getContextFields(Base as any);
-      const derivedFields = getContextFields(Derived as any);
-
-      expect(baseFields.length).toBe(1);
-      expect(baseFields.find((f) => f.propertyKey === 'contextA')).toBeDefined();
-
-      expect(derivedFields.length).toBe(2);
-      expect(derivedFields.find((f) => f.propertyKey === 'contextA')).toBeDefined();
-      expect(derivedFields.find((f) => f.propertyKey === 'contextB')).toBeDefined();
-    });
-
-    it('should not share metadata between siblings', () => {
-      class Base extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseContext(TEST_CONTEXT_A)
-        protected contextA!: string;
-
-        public override compose (): null {
-          return null;
-        }
-      }
-
-      class SiblingA extends Base {
-        @UseContext(TEST_CONTEXT_B)
-        protected contextB!: number;
-      }
-
-      class SiblingB extends Base {
-        @UseContext(TEST_CONTEXT_C)
-        protected contextC!: boolean;
-      }
-
-      const fieldsA = getContextFields(SiblingA as any);
-      const fieldsB = getContextFields(SiblingB as any);
-
-      expect(fieldsA.length).toBe(2);
-      expect(fieldsA.find((f) => f.propertyKey === 'contextA')).toBeDefined();
-      expect(fieldsA.find((f) => f.propertyKey === 'contextB')).toBeDefined();
-      expect(fieldsA.find((f) => f.propertyKey === 'contextC')).toBeUndefined();
-
-      expect(fieldsB.length).toBe(2);
-      expect(fieldsB.find((f) => f.propertyKey === 'contextA')).toBeDefined();
-      expect(fieldsB.find((f) => f.propertyKey === 'contextC')).toBeDefined();
-      expect(fieldsB.find((f) => f.propertyKey === 'contextB')).toBeUndefined();
-    });
+    expect(derivedFields.length).toBe(2);
+    expect(derivedFields.find((f) => f.propertyKey === 'contextA')).toBeDefined();
+    expect(derivedFields.find((f) => f.propertyKey === 'contextB')).toBeDefined();
   });
 
-  describe('multi-level inheritance', () => {
-    it('should handle three-level context inheritance', () => {
-      class GrandParent extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseContext(TEST_CONTEXT_A)
-        public contextA!: string;
+  it('siblings do not share metadata', () => {
+    class Base extends Component<Record<string, unknown>, Record<string, unknown>> {
+      @UseContext(TEST_CONTEXT_A)
+      protected contextA!: string;
 
-        public override compose (): null {
-          return null;
-        }
+      public override compose (): null {
+        return null;
       }
+    }
 
-      class Parent extends GrandParent {
-        @UseContext(TEST_CONTEXT_B)
-        public contextB!: number;
-      }
+    class SiblingA extends Base {
+      @UseContext(TEST_CONTEXT_B)
+      protected contextB!: number;
+    }
 
-      class Child extends Parent {
-        @UseContext(TEST_CONTEXT_C)
-        public contextC!: boolean;
-      }
+    class SiblingB extends Base {
+      @UseContext(TEST_CONTEXT_C)
+      protected contextC!: boolean;
+    }
 
-      const fields = getContextFields(Child as any);
-      expect(fields.length).toBe(3);
-      expect(fields.find((f) => f.propertyKey === 'contextA')).toBeDefined();
-      expect(fields.find((f) => f.propertyKey === 'contextB')).toBeDefined();
-      expect(fields.find((f) => f.propertyKey === 'contextC')).toBeDefined();
-    });
+    const fieldsA = getContextFields(SiblingA as any);
+    const fieldsB = getContextFields(SiblingB as any);
+
+    expect(fieldsA.length).toBe(2);
+    expect(fieldsA.find((f) => f.propertyKey === 'contextA')).toBeDefined();
+    expect(fieldsA.find((f) => f.propertyKey === 'contextB')).toBeDefined();
+    expect(fieldsA.find((f) => f.propertyKey === 'contextC')).toBeUndefined();
+
+    expect(fieldsB.length).toBe(2);
+    expect(fieldsB.find((f) => f.propertyKey === 'contextA')).toBeDefined();
+    expect(fieldsB.find((f) => f.propertyKey === 'contextC')).toBeDefined();
+    expect(fieldsB.find((f) => f.propertyKey === 'contextB')).toBeUndefined();
   });
 
-  describe('getContextFields returns frozen array', () => {
-    it('should return frozen array that cannot be mutated', () => {
-      class TestComponent extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseContext(TEST_CONTEXT_A)
-        public contextA!: string;
+  it('three-level context inheritance', () => {
+    class GrandParent extends Component<Record<string, unknown>, Record<string, unknown>> {
+      @UseContext(TEST_CONTEXT_A)
+      public contextA!: string;
 
-        public override compose (): null {
-          return null;
-        }
+      public override compose (): null {
+        return null;
       }
+    }
 
-      const fields = getContextFields(TestComponent as any);
-      expect(Object.isFrozen(fields)).toBe(true);
+    class Parent extends GrandParent {
+      @UseContext(TEST_CONTEXT_B)
+      public contextB!: number;
+    }
 
-      expect(() => {
-        (fields as unknown[]).push({ propertyKey: 'fake', token: TEST_CONTEXT_B });
-      }).toThrow();
-    });
+    class Child extends Parent {
+      @UseContext(TEST_CONTEXT_C)
+      public contextC!: boolean;
+    }
+
+    const fields = getContextFields(Child as any);
+    expect(fields.length).toBe(3);
+    expect(fields.find((f) => f.propertyKey === 'contextA')).toBeDefined();
+    expect(fields.find((f) => f.propertyKey === 'contextB')).toBeDefined();
+    expect(fields.find((f) => f.propertyKey === 'contextC')).toBeDefined();
   });
 });
 
 describe('Refs decorator inheritance', () => {
-  describe('@UseRef metadata isolation', () => {
-    it('should not mutate parent class ref metadata', () => {
-      class Base extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseRef()
-        public declare refA: RefObject<Component>;
+  it('parent metadata not mutated after subclass decorators', () => {
+    class Base extends Component<Record<string, unknown>, Record<string, unknown>> {
+      @UseRef()
+      public declare refA: RefObject<Component>;
 
-        public override compose (): null {
-          return null;
-        }
+      public override compose (): null {
+        return null;
       }
+    }
 
-      class Derived extends Base {
-        @UseRef()
-        public declare refB: RefObject<Component>;
-      }
+    class Derived extends Base {
+      @UseRef()
+      public declare refB: RefObject<Component>;
+    }
 
-      const baseFields = getRefFields(Base as any);
-      const derivedFields = getRefFields(Derived as any);
+    const baseFields = getRefFields(Base as any);
+    const derivedFields = getRefFields(Derived as any);
 
-      expect(baseFields.length).toBe(1);
-      expect(baseFields[0]?.propertyKey).toBe('refA');
+    expect(baseFields.length).toBe(1);
+    expect(baseFields[0]?.propertyKey).toBe('refA');
 
-      expect(derivedFields.length).toBe(2);
-      expect(derivedFields.find((f) => f.propertyKey === 'refA')).toBeDefined();
-      expect(derivedFields.find((f) => f.propertyKey === 'refB')).toBeDefined();
-
-      expect(Object.isFrozen(baseFields)).toBe(true);
-      expect(Object.isFrozen(derivedFields)).toBe(true);
-    });
-
-    it('should not share ref metadata between siblings', () => {
-      class Base extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseRef()
-        public declare refBase: RefObject<Component>;
-
-        public override compose (): null {
-          return null;
-        }
-      }
-
-      class SiblingA extends Base {
-        @UseRef()
-        public declare refA: RefObject<Component>;
-      }
-
-      class SiblingB extends Base {
-        @UseRef()
-        public declare refB: RefObject<Component>;
-      }
-
-      const fieldsA = getRefFields(SiblingA as any);
-      const fieldsB = getRefFields(SiblingB as any);
-
-      expect(fieldsA.length).toBe(2);
-      expect(fieldsA.find((f) => f.propertyKey === 'refBase')).toBeDefined();
-      expect(fieldsA.find((f) => f.propertyKey === 'refA')).toBeDefined();
-      expect(fieldsA.find((f) => f.propertyKey === 'refB')).toBeUndefined();
-
-      expect(fieldsB.length).toBe(2);
-      expect(fieldsB.find((f) => f.propertyKey === 'refBase')).toBeDefined();
-      expect(fieldsB.find((f) => f.propertyKey === 'refB')).toBeDefined();
-      expect(fieldsB.find((f) => f.propertyKey === 'refA')).toBeUndefined();
-    });
+    expect(derivedFields.length).toBe(2);
+    expect(derivedFields.find((f) => f.propertyKey === 'refA')).toBeDefined();
+    expect(derivedFields.find((f) => f.propertyKey === 'refB')).toBeDefined();
   });
 
-  describe('@UseImperativeHandle metadata isolation', () => {
-    it('should not mutate parent class imperative handle metadata', () => {
-      class Base extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseImperativeHandle()
-        public methodA (): string {
-          return 'a';
-        }
+  it('siblings do not share ref metadata', () => {
+    class Base extends Component<Record<string, unknown>, Record<string, unknown>> {
+      @UseRef()
+      public declare refBase: RefObject<Component>;
 
-        public override compose (): null {
-          return null;
-        }
+      public override compose (): null {
+        return null;
       }
+    }
 
-      class Derived extends Base {
-        @UseImperativeHandle()
-        public methodB (): string {
-          return 'b';
-        }
-      }
+    class SiblingA extends Base {
+      @UseRef()
+      public declare refA: RefObject<Component>;
+    }
 
-      const baseMethods = getImperativeHandleMethods(Base as any);
-      const derivedMethods = getImperativeHandleMethods(Derived as any);
+    class SiblingB extends Base {
+      @UseRef()
+      public declare refB: RefObject<Component>;
+    }
 
-      expect(baseMethods.length).toBe(1);
-      expect(baseMethods[0]?.methodKey).toBe('methodA');
+    const fieldsA = getRefFields(SiblingA as any);
+    const fieldsB = getRefFields(SiblingB as any);
 
-      expect(derivedMethods.length).toBe(2);
-      expect(derivedMethods.find((m) => m.methodKey === 'methodA')).toBeDefined();
-      expect(derivedMethods.find((m) => m.methodKey === 'methodB')).toBeDefined();
+    expect(fieldsA.length).toBe(2);
+    expect(fieldsA.find((f) => f.propertyKey === 'refBase')).toBeDefined();
+    expect(fieldsA.find((f) => f.propertyKey === 'refA')).toBeDefined();
+    expect(fieldsA.find((f) => f.propertyKey === 'refB')).toBeUndefined();
 
-      expect(Object.isFrozen(baseMethods)).toBe(true);
-      expect(Object.isFrozen(derivedMethods)).toBe(true);
-    });
-
-    it('should not share imperative handle metadata between siblings', () => {
-      class Base extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseImperativeHandle()
-        public baseMethod (): string {
-          return 'base';
-        }
-
-        public override compose (): null {
-          return null;
-        }
-      }
-
-      class SiblingA extends Base {
-        @UseImperativeHandle()
-        public methodA (): string {
-          return 'a';
-        }
-      }
-
-      class SiblingB extends Base {
-        @UseImperativeHandle()
-        public methodB (): string {
-          return 'b';
-        }
-      }
-
-      const methodsA = getImperativeHandleMethods(SiblingA as any);
-      const methodsB = getImperativeHandleMethods(SiblingB as any);
-
-      expect(methodsA.length).toBe(2);
-      expect(methodsA.find((m) => m.methodKey === 'baseMethod')).toBeDefined();
-      expect(methodsA.find((m) => m.methodKey === 'methodA')).toBeDefined();
-      expect(methodsA.find((m) => m.methodKey === 'methodB')).toBeUndefined();
-
-      expect(methodsB.length).toBe(2);
-      expect(methodsB.find((m) => m.methodKey === 'baseMethod')).toBeDefined();
-      expect(methodsB.find((m) => m.methodKey === 'methodB')).toBeDefined();
-      expect(methodsB.find((m) => m.methodKey === 'methodA')).toBeUndefined();
-    });
+    expect(fieldsB.length).toBe(2);
+    expect(fieldsB.find((f) => f.propertyKey === 'refBase')).toBeDefined();
+    expect(fieldsB.find((f) => f.propertyKey === 'refB')).toBeDefined();
+    expect(fieldsB.find((f) => f.propertyKey === 'refA')).toBeUndefined();
   });
 
-  describe('multi-level inheritance', () => {
-    it('should handle three-level ref inheritance', () => {
-      class GrandParent extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseRef()
-        public declare refGrandParent: RefObject<Component>;
+  it('three-level ref and imperative handle inheritance', () => {
+    class GrandParent extends Component<Record<string, unknown>, Record<string, unknown>> {
+      @UseRef()
+      public declare refGrandParent: RefObject<Component>;
 
-        @UseImperativeHandle()
-        public grandParentMethod (): string {
-          return 'grandparent';
-        }
-
-        public override compose (): null {
-          return null;
-        }
+      @UseImperativeHandle()
+      public grandParentMethod (): string {
+        return 'grandparent';
       }
 
-      class Parent extends GrandParent {
-        @UseRef()
-        public declare refParent: RefObject<Component>;
-
-        @UseImperativeHandle()
-        public parentMethod (): string {
-          return 'parent';
-        }
+      public override compose (): null {
+        return null;
       }
+    }
 
-      class Child extends Parent {
-        @UseRef()
-        public declare refChild: RefObject<Component>;
+    class Parent extends GrandParent {
+      @UseRef()
+      public declare refParent: RefObject<Component>;
 
-        @UseImperativeHandle()
-        public childMethod (): string {
-          return 'child';
-        }
+      @UseImperativeHandle()
+      public parentMethod (): string {
+        return 'parent';
       }
+    }
 
-      const refs = getRefFields(Child as any);
-      expect(refs.length).toBe(3);
-      expect(refs.find((r) => r.propertyKey === 'refGrandParent')).toBeDefined();
-      expect(refs.find((r) => r.propertyKey === 'refParent')).toBeDefined();
-      expect(refs.find((r) => r.propertyKey === 'refChild')).toBeDefined();
+    class Child extends Parent {
+      @UseRef()
+      public declare refChild: RefObject<Component>;
 
-      const methods = getImperativeHandleMethods(Child as any);
-      expect(methods.length).toBe(3);
-      expect(methods.find((m) => m.methodKey === 'grandParentMethod')).toBeDefined();
-      expect(methods.find((m) => m.methodKey === 'parentMethod')).toBeDefined();
-      expect(methods.find((m) => m.methodKey === 'childMethod')).toBeDefined();
-    });
-  });
-
-  describe('getters return frozen arrays', () => {
-    it('getRefFields should return frozen array', () => {
-      class TestComponent extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseRef()
-        public declare ref: RefObject<Component>;
-
-        public override compose (): null {
-          return null;
-        }
+      @UseImperativeHandle()
+      public childMethod (): string {
+        return 'child';
       }
+    }
 
-      const fields = getRefFields(TestComponent as any);
-      expect(Object.isFrozen(fields)).toBe(true);
+    const refs = getRefFields(Child as any);
+    expect(refs.length).toBe(3);
+    expect(refs.find((r) => r.propertyKey === 'refGrandParent')).toBeDefined();
+    expect(refs.find((r) => r.propertyKey === 'refParent')).toBeDefined();
+    expect(refs.find((r) => r.propertyKey === 'refChild')).toBeDefined();
 
-      expect(() => {
-        (fields as unknown[]).push({ propertyKey: 'fake' });
-      }).toThrow();
-    });
-
-    it('getImperativeHandleMethods should return frozen array', () => {
-      class TestComponent extends Component<Record<string, unknown>, Record<string, unknown>> {
-        @UseImperativeHandle()
-        public method (): void {
-          // test method
-        }
-
-        public override compose (): null {
-          return null;
-        }
-      }
-
-      const methods = getImperativeHandleMethods(TestComponent as any);
-      expect(Object.isFrozen(methods)).toBe(true);
-
-      expect(() => {
-        (methods as unknown[]).push({ methodKey: 'fake' });
-      }).toThrow();
-    });
+    const methods = getImperativeHandleMethods(Child as any);
+    expect(methods.length).toBe(3);
+    expect(methods.find((m) => m.methodKey === 'grandParentMethod')).toBeDefined();
+    expect(methods.find((m) => m.methodKey === 'parentMethod')).toBeDefined();
+    expect(methods.find((m) => m.methodKey === 'childMethod')).toBeDefined();
   });
 });

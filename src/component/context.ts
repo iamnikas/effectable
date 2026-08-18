@@ -289,31 +289,13 @@ export function UseContext<T> (token: ContextToken<T>): PropertyDecorator {
     const current = constructor[CONTEXT_FIELDS_META_KEY];
     const isInherited = current !== undefined && !Object.hasOwn(constructor, CONTEXT_FIELDS_META_KEY);
 
-    let next: ContextFieldMeta[];
-    if (isInherited) {
-      next = [...current];
-    } else if (current === undefined) {
-      next = [];
-    } else {
-      next = current;
-    }
-
+    const next = isInherited ? [...current] : (current ?? []);
     next.push({ propertyKey, token: token as ContextToken<unknown> });
 
-    Object.defineProperty(constructor, CONTEXT_FIELDS_META_KEY, {
-      value: next,
-      writable: false,
-      enumerable: false,
-      configurable: true,
-    });
+    constructor[CONTEXT_FIELDS_META_KEY] = next;
 
     if (!constructor[HAS_CONTEXT_FIELDS_KEY]) {
-      Object.defineProperty(constructor, HAS_CONTEXT_FIELDS_KEY, {
-        value: true,
-        writable: false,
-        enumerable: false,
-        configurable: true,
-      });
+      constructor[HAS_CONTEXT_FIELDS_KEY] = true;
     }
   };
 }
@@ -329,7 +311,7 @@ export function getContextFields (
   componentClass: { [CONTEXT_FIELDS_META_KEY]?: ContextFieldMeta[] },
 ): readonly ContextFieldMeta[] {
   const fields = componentClass[CONTEXT_FIELDS_META_KEY];
-  return fields === undefined ? [] : Object.freeze([...fields]);
+  return fields === undefined ? [] : [...fields];
 }
 
 /**

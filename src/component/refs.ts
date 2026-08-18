@@ -77,23 +77,10 @@ export function UseRef (): PropertyDecorator {
     const current = constructor[REF_FIELDS_META_KEY];
     const isInherited = current !== undefined && !Object.hasOwn(constructor, REF_FIELDS_META_KEY);
 
-    let next: RefFieldMeta[];
-    if (isInherited) {
-      next = [...current];
-    } else if (current === undefined) {
-      next = [];
-    } else {
-      next = current;
-    }
-
+    const next = isInherited ? [...current] : (current ?? []);
     next.push({ propertyKey });
 
-    Object.defineProperty(constructor, REF_FIELDS_META_KEY, {
-      value: next,
-      writable: false,
-      enumerable: false,
-      configurable: true,
-    });
+    constructor[REF_FIELDS_META_KEY] = next;
 
     const refKey = `__ref_${String(propertyKey)}`;
 
@@ -139,23 +126,10 @@ export function UseImperativeHandle (): MethodDecorator {
     const current = constructor[IMPERATIVE_HANDLE_META_KEY];
     const isInherited = current !== undefined && !Object.hasOwn(constructor, IMPERATIVE_HANDLE_META_KEY);
 
-    let next: ImperativeHandleMeta[];
-    if (isInherited) {
-      next = [...current];
-    } else if (current === undefined) {
-      next = [];
-    } else {
-      next = current;
-    }
-
+    const next = isInherited ? [...current] : (current ?? []);
     next.push({ methodKey });
 
-    Object.defineProperty(constructor, IMPERATIVE_HANDLE_META_KEY, {
-      value: next,
-      writable: false,
-      enumerable: false,
-      configurable: true,
-    });
+    constructor[IMPERATIVE_HANDLE_META_KEY] = next;
   };
 }
 
@@ -172,14 +146,14 @@ export function getRefFields (
   componentClass: { [REF_FIELDS_META_KEY]?: RefFieldMeta[] },
 ): readonly RefFieldMeta[] {
   const fields = componentClass[REF_FIELDS_META_KEY];
-  return fields === undefined ? [] : Object.freeze([...fields]);
+  return fields === undefined ? [] : [...fields];
 }
 
 /**
  * Returns the array of methods registered by {@link UseImperativeHandle} on the given constructor.
  *
- * If meta is absent, returns a new empty array. If meta is present, returns a frozen copy
- * of the internal array (external mutations are prevented).
+ * If meta is absent, returns a new empty array. If meta is present, returns a copy
+ * of the internal array (external mutations do not affect the metadata).
  *
  * @param {object} componentClass - component constructor: object with optional {@link IMPERATIVE_HANDLE_META_KEY}
  * @returns {readonly ImperativeHandleMeta[]} imperative API method records; order matches decorator application order
@@ -188,5 +162,5 @@ export function getImperativeHandleMethods (
   componentClass: { [IMPERATIVE_HANDLE_META_KEY]?: ImperativeHandleMeta[] },
 ): readonly ImperativeHandleMeta[] {
   const methods = componentClass[IMPERATIVE_HANDLE_META_KEY];
-  return methods === undefined ? [] : Object.freeze([...methods]);
+  return methods === undefined ? [] : [...methods];
 }
