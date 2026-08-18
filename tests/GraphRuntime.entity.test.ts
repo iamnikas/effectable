@@ -740,6 +740,65 @@ describe('GraphRuntime', () => {
       await runtime.unmount();
     });
 
+    it('ContextProvider mounts explicit children and they receive the provider value', async () => {
+      // Lifecycle verification: child must actually mount and receive the provider value
+      class ConsumerWithLifecycle extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(NUMBER_TOKEN)
+        public injectedValue = -1;
+
+        public mountCalled = false;
+        public receivedOnMount: number | undefined;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.mountCalled = true;
+          this.receivedOnMount = this.injectedValue;
+        }
+      }
+
+      class ConsumerRef extends Component<Record<string, never>, Record<string, never>> {
+        @UseRef()
+        private declare childRef: RefObject<ConsumerWithLifecycle>;
+
+        constructor () {
+          super({});
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          return [
+            h(ContextProvider, { value: [NUMBER_TOKEN, 123] }, [
+              h(ConsumerWithLifecycle, {}, this.childRef),
+            ]),
+          ];
+        }
+
+        public getChildRef (): RefObject<ConsumerWithLifecycle> {
+          return this.childRef;
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(h(ConsumerRef, {}));
+      const root = runtime.getRootInstance() as ConsumerRef;
+      const childRef = root.getChildRef();
+
+      expect(childRef.current).not.toBeNull();
+
+      if (childRef.current === null) {
+        throw new Error('expected ConsumerWithLifecycle to be mounted');
+      }
+
+      // Assert lifecycle: child was mounted
+      expect(childRef.current.mountCalled).toBe(true);
+      // Assert value injection: child received provider value
+      expect(childRef.current.receivedOnMount).toBe(123);
+      expect(childRef.current.injectedValue).toBe(123);
+
+      await runtime.unmount();
+    });
+
     it('ScopedConsumerParent: child NumberConsumer via ref receives the value from initialScope', async () => {
       const scope = extendScope(EMPTY_CONTEXT_SCOPE, NUMBER_TOKEN, 55);
 
