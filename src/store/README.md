@@ -4,6 +4,22 @@ A Redux v4-compatible store with reactive RxJS extensions.
 Core Redux behavior is strictly compatible; state$ and select() are additions.
 It has no application-specific dependencies and can be used in any project.
 
+## What changed (strict Redux v4 compatibility)
+
+This store now enforces strict Redux v4 contracts:
+
+**Before:**
+- Action check accepted arrays and class instances
+- Reducer could return `undefined` without error
+- `dispatch()` / `getState()` still worked after `destroy()`
+- Docs implied `MiddlewareAPI` had `state$` (it never did)
+
+**After:**
+- Actions must be plain objects with `Object.prototype` (rejects arrays, class instances, `Object.create(null)`)
+- Reducer returning `undefined` throws; last good state stays
+- After `destroy()`: `dispatch()` and `getState()` throw; `state$` is completed
+- `MiddlewareAPI` is only `dispatch` + `getState`; use `getState()` inside middleware, subscribe to `store.state$` outside
+
 ## File structure
 
 ```text
