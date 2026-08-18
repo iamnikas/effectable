@@ -257,11 +257,12 @@ export class GraphRuntime {
    * After fail-stop:
    * - state is FAILED
    * - terminalError is set
-   * - currentRoot is null
+   * - currentRoot is null (even if destroyFiber throws)
    * - later reconcile() rejects with the terminal error
    * - unmount() is safe and joinable
    *
    * Issue #10: no failed reconcile leaves the runtime active with a partial graph.
+   * Issue #12 primary-error rules: cleanup errors attached as rollbackErrors, never replace primary.
    *
    * @param {Error} error - unrecoverable error that triggered fail-stop
    * @returns {void | Promise<void>}
@@ -280,14 +281,27 @@ export class GraphRuntime {
     this.flushScheduled = false;
 
     // Best-effort teardown of the current/partial graph
+    // MUST set currentRoot = null even if destroyFiber throws (issue #12)
     if (this.currentRoot !== null) {
-      const destroyRes = this.destroyFiber(this.currentRoot);
+      const root = this.currentRoot;
       this.currentRoot = null;
       
+      // Collect cleanup errors during fail-stop (issue #12: attach as rollbackErrors)
+      const cleanupErrors: Error[] = [];
+      const destroyRes = this.destroyFiber(root, cleanupErrors);
+      
       if (isThenable(destroyRes)) {
-        return destroyRes.catch(() => {
-          // Ignore cleanup errors during fail-stop
+        // Async path: attach cleanup errors after completion
+        return destroyRes.then(() => {
+          if (cleanupErrors.length > 0) {
+            (error as Error & { rollbackErrors?: Error[] }).rollbackErrors = cleanupErrors;
+          }
         });
+      }
+      
+      // Sync path: attach cleanup errors immediately
+      if (cleanupErrors.length > 0) {
+        (error as Error & { rollbackErrors?: Error[] }).rollbackErrors = cleanupErrors;
       }
     }
   }
@@ -1963,15 +1977,15 @@ export class GraphRuntime {
    * @param {RuntimeFiber} fiber - fiber to destroy
    * @returns {void | Promise<void>}
    */
-  private destroyFiber (fiber: RuntimeFiber<unknown>): void | Promise<void> {
+  private destroyFiber (fiber: RuntimeFiber<unknown>, collectErrors: Error[] | null = null): void | Promise<void> {
     const children = fiber.children;
     const n = children.length;
 
     // Sync recursion over children until the first async
     for (let i = 0; i < n; i++) {
-      const childRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
+      const childRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, collectErrors);
       if (isThenable(childRes)) {
-        return this.continueDestroyAsync(fiber, children, i, childRes);
+        return this.continueDestroyAsync(fiber, children, i, childRes, collectErrors);
       }
     }
 
@@ -1985,7 +1999,23 @@ export class GraphRuntime {
 
     const shutdownRes = fiber.engine.runShutdown(instance);
     if (isThenable(shutdownRes)) {
-      return this.finalizeDestroyAsync(fiber, shutdownRes);
+      return this.finalizeDestroyAsync(fiber, shutdownRes, collectErrors);
+    }
+
+    // Check for shutdown errors (issue #12: cleanup errors must be visible during fail-stop)
+    if (!shutdownRes.ok) {
+      if (collectErrors !== null) {
+        // Fail-stop mode: collect cleanup errors, don't throw
+        collectErrors.push(shutdownRes.error instanceof Error ? shutdownRes.error : new Error(String(shutdownRes.error)));
+      }
+      // Still finalize the fiber even if shutdown failed
+      this.disposeEffectableRuntimeBusWiring(fiber);
+      const ref = fiber.vnode.ref;
+      if (ref !== undefined) {
+        ref.current = null;
+      }
+      fiber.lifecycleStatus = fiber.engine.getStatus();
+      return;
     }
 
     this.disposeEffectableRuntimeBusWiring(fiber);
@@ -2012,11 +2042,12 @@ export class GraphRuntime {
     children: Fiber[],
     pendingIdx: number,
     pending: PromiseLike<void>,
+    collectErrors: Error[] | null = null,
   ): Promise<void> {
     await pending;
 
     for (let i = pendingIdx + 1; i < children.length; i++) {
-      const r = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
+      const r = this.destroyFiber(children[i] as RuntimeFiber<unknown>, collectErrors);
       if (isThenable(r)) {
         await r;
       }
@@ -2032,7 +2063,16 @@ export class GraphRuntime {
 
     const shutdownRes = fiber.engine.runShutdown(instance);
     if (isThenable(shutdownRes)) {
-      await shutdownRes;
+      const asyncRes = await shutdownRes;
+      if (typeof asyncRes === 'object' && asyncRes !== null && 'ok' in asyncRes && !asyncRes.ok) {
+        if (collectErrors !== null) {
+          collectErrors.push(asyncRes.error instanceof Error ? asyncRes.error : new Error(String(asyncRes.error)));
+        }
+      }
+    } else if (!shutdownRes.ok) {
+      if (collectErrors !== null) {
+        collectErrors.push(shutdownRes.error instanceof Error ? shutdownRes.error : new Error(String(shutdownRes.error)));
+      }
     }
 
     this.disposeEffectableRuntimeBusWiring(fiber);
@@ -2055,8 +2095,26 @@ export class GraphRuntime {
   private async finalizeDestroyAsync (
     fiber: RuntimeFiber<unknown>,
     pendingShutdown: PromiseLike<unknown>,
+    collectErrors: Error[] | null = null,
   ): Promise<void> {
-    await pendingShutdown;
+    const shutdownRes = await pendingShutdown;
+
+    // Check for shutdown errors (issue #12: cleanup errors must be visible during fail-stop)
+    if (typeof shutdownRes === 'object' && shutdownRes !== null && 'ok' in shutdownRes && !shutdownRes.ok) {
+      if (collectErrors !== null) {
+        // Fail-stop mode: collect cleanup errors, don't throw
+        const err = (shutdownRes as { ok: false; error: unknown }).error;
+        collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+      // Still finalize the fiber even if shutdown failed
+      this.disposeEffectableRuntimeBusWiring(fiber);
+      const ref = fiber.vnode.ref;
+      if (ref !== undefined) {
+        ref.current = null;
+      }
+      fiber.lifecycleStatus = fiber.engine.getStatus();
+      return;
+    }
 
     this.disposeEffectableRuntimeBusWiring(fiber);
 
