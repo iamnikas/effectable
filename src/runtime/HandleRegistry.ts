@@ -67,7 +67,7 @@ export function UseImperativeHandle (): MethodDecorator {
     }
 
     const ctor = target.constructor;
-    const current = Reflect.getMetadata(
+    const current = Reflect.getOwnMetadata(
       USE_IMPERATIVE_HANDLE_METADATA_KEY,
       ctor
     ) as Set<string> | undefined;
@@ -111,7 +111,7 @@ export class HandleRegistry {
       throw new Error('HandleRegistry.autoRegister: invalid instance');
     }
 
-    const refPropertyKey = Reflect.getMetadata(
+    const refPropertyKey = Reflect.getOwnMetadata(
       USE_REF_PROPERTY_METADATA_KEY,
       ctor
     ) as string | undefined;
@@ -125,7 +125,7 @@ export class HandleRegistry {
       throw new Error('HandleRegistry.autoRegister: ref property is not an object');
     }
 
-    const methodNames = Reflect.getMetadata(
+    const methodNames = Reflect.getOwnMetadata(
       USE_IMPERATIVE_HANDLE_METADATA_KEY,
       ctor
     ) as Set<string> | undefined;
@@ -154,7 +154,7 @@ export class HandleRegistry {
       throw new Error('HandleRegistry.autoRegister: invalid instance');
     }
 
-    const keyOrFactory = Reflect.getMetadata(
+    const keyOrFactory = Reflect.getOwnMetadata(
       USE_REF_METADATA_KEY,
       ctor
     ) as HandleRefKeyFactory<unknown> | undefined;
