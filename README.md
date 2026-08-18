@@ -4,6 +4,7 @@
 [![CI](https://github.com/iamnikas/effectable/actions/workflows/ci.yml/badge.svg)](https://github.com/iamnikas/effectable/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/node/v/effectable.svg)](https://nodejs.org)
+[![ESLint](https://img.shields.io/badge/ESLint-10-4B32C3?logo=eslint&logoColor=white)](https://eslint.org)
 
 Reactive layer library: explicit bootstrap-path, Redux-RxJS store, base class with lifecycle, class-based HOC `connect`, and GraphRuntime with a declarative component tree (`h`, `compose`).
 
@@ -160,7 +161,7 @@ fix: buffer setState during onMount
 docs: clarify bootstrap shutdown
 ```
 
-After `npm ci`, lefthook installs a local `commit-msg` hook. CI also lint-checks PR commits. Prefer Conventional Commits for squash-merge titles too.
+After `npm ci`, lefthook installs a local `commit-msg` hook. CI also lint-checks PR commits. Prefer Conventional Commits for squash-merge titles too. Unused imports are an ESLint error, and the lefthook pre-commit hook runs `eslint --fix` automatically.
 
 ## Publishing
 
