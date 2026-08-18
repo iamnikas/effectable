@@ -885,6 +885,14 @@ export class GraphRuntime {
     // Recursively materialize children before running the parent's lifecycle
     const childVnodes = this.getChildVnodes(instance, vnode.children);
 
+    // Validate unique keys BEFORE materialization (Option A: React v16.5 contract)
+    // Prevent partial tree construction when duplicate keys are present
+    this.validateUniqueKeys(
+      childVnodes.map(vnode => ({ vnode, instance: null })),
+      fiber as RuntimeFiber<unknown>,
+      'current'
+    );
+
     for (let i = 0; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
       let childRes: RuntimeFiber<unknown> | Promise<RuntimeFiber<unknown>>;
@@ -1400,14 +1408,59 @@ export class GraphRuntime {
   }
 
   /**
+   * Validates that sibling keys are unique within a list.
+   * Follows React v16.5 keyed child reconciliation contract: duplicate keys are invalid.
+   * Throws a descriptive error including the duplicate key and parent component identity.
+   *
+   * @param {Array<{ vnode: { key?: string }; instance?: Component<unknown, unknown> | null }>} items - list of fibers or vnodes
+   * @param {RuntimeFiber<unknown>} parentFiber - parent fiber (for error message)
+   * @param {string} listName - "current" or "next" (for error message)
+   * @returns {void}
+   * @throws {Error} when duplicate keys are detected
+   */
+  private validateUniqueKeys (
+    items: Array<{ vnode: { key?: string }; instance?: Component<unknown, unknown> | null }>,
+    parentFiber: RuntimeFiber<unknown>,
+    listName: string,
+  ): void {
+    const seenKeys = new Set<string>();
+    
+    for (const item of items) {
+      const key = item.vnode.key;
+      
+      if (key !== undefined) {
+        if (seenKeys.has(key)) {
+          const parentInstance = parentFiber.instance;
+          const parentName = parentInstance !== null 
+            ? parentInstance.constructor.name 
+            : 'unknown';
+          
+          throw new Error(
+            `[Effectable] GraphRuntime: duplicate key "${key}" in ${listName} children of ${parentName}. ` +
+            `Sibling keys must be unique (React v16.5 keyed child reconciliation contract). ` +
+            `Duplicates cause undefined matching behavior and lifecycle leaks.`
+          );
+        }
+        
+        seenKeys.add(key);
+      }
+    }
+  }
+
+  /**
    * Full-diff reconcile: keyed/unkeyed Map + destroy orphans.
    * Always async — internal branching is too complex for an efficient sync path.
+   *
+   * Contract: Sibling keys must be unique (React v16.5 keyed child reconciliation).
+   * Validates both current and next children BEFORE any side effects.
+   * Throws deterministic error on duplicate keys to prevent lifecycle leaks.
    *
    * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
    * @param {VirtualServiceNode[]} nextVnodes - new vnodes
    * @param {RuntimeFiber<unknown>} parentFiber - parent fiber
    * @param {ContextScope} childScope - children scope
    * @returns {Promise<RuntimeFiber<unknown>[]>}
+   * @throws {Error} when duplicate keys are detected in current or next children
    */
   private async reconcileChildrenFullDiff (
     currentChildren: RuntimeFiber<unknown>[],
@@ -1415,6 +1468,14 @@ export class GraphRuntime {
     parentFiber: RuntimeFiber<unknown>,
     childScope: ContextScope,
   ): Promise<RuntimeFiber<unknown>[]> {
+    // Validate unique keys BEFORE any side effects (Option A: React v16.5 contract)
+    this.validateUniqueKeys(currentChildren, parentFiber, 'current');
+    this.validateUniqueKeys(
+      nextVnodes.map(vnode => ({ vnode, instance: null })),
+      parentFiber,
+      'next'
+    );
+
     // Check for keyed children before creating a Map (6.06x speedup for unkeyed-only)
     let hasKeyedCurrent = false;
 

@@ -882,11 +882,24 @@ describe('GraphRuntime', () => {
         }
       }
 
+      // Option A contract: duplicate keys in current children are invalid
+      await expect(
+        GraphRuntime.mount(
+          h(DupHost, {
+            items: [
+              { key: 'dup', label: 'first' },
+              { key: 'dup', label: 'second' },
+            ],
+          }),
+        ),
+      ).rejects.toThrow('duplicate key "dup" in current children');
+
+      // Option A contract: duplicate keys in next children are invalid
       const runtime = await GraphRuntime.mount(
         h(DupHost, {
           items: [
-            { key: 'dup', label: 'first' },
-            { key: 'dup', label: 'second' },
+            { key: 'unique-a', label: 'first' },
+            { key: 'unique-b', label: 'second' },
           ],
         }),
       );
@@ -895,19 +908,16 @@ describe('GraphRuntime', () => {
       mounts.length = 0;
       unmounts.length = 0;
 
-      // length 2→1: isStableChildren=false → full keyed diff;
-      // Map.set overwrites key=dup with the last fiber (second).
-      await runtime.reconcile(
-        h(DupHost, {
-          items: [{ key: 'dup', label: 'reuse' }],
-        }),
-      );
-
-      expect(mounts).toEqual([]);
-      // Actual contract: Map.set overwrites the key without destroying the previous fiber,
-      // so a sibling with a duplicate key is not visited in the orphan pass and onUnmount
-      // is not called when the list shrinks (lifecycle leak vs unique keys).
-      expect(unmounts).toEqual([]);
+      await expect(
+        runtime.reconcile(
+          h(DupHost, {
+            items: [
+              { key: 'dup', label: 'reuse-1' },
+              { key: 'dup', label: 'reuse-2' },
+            ],
+          }),
+        ),
+      ).rejects.toThrow('duplicate key "dup" in next children');
 
       await runtime.unmount();
     });
