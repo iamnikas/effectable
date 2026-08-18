@@ -170,7 +170,7 @@ export function UseImperativeHandle (): MethodDecorator {
  */
 export function getRefFields (
   componentClass: { [REF_FIELDS_META_KEY]?: RefFieldMeta[] },
-): RefFieldMeta[] {
+): readonly RefFieldMeta[] {
   const fields = componentClass[REF_FIELDS_META_KEY];
   return fields === undefined ? [] : Object.freeze([...fields]);
 }
@@ -178,15 +178,15 @@ export function getRefFields (
 /**
  * Returns the array of methods registered by {@link UseImperativeHandle} on the given constructor.
  *
- * If meta is absent, returns a new empty array. If meta is present, returns the same array stored
- * on the constructor (external mutations affect the metadata).
+ * If meta is absent, returns a new empty array. If meta is present, returns a frozen copy
+ * of the internal array (external mutations are prevented).
  *
  * @param {object} componentClass - component constructor: object with optional {@link IMPERATIVE_HANDLE_META_KEY}
- * @returns {ImperativeHandleMeta[]} imperative API method records; order matches decorator application order
+ * @returns {readonly ImperativeHandleMeta[]} imperative API method records; order matches decorator application order
  */
 export function getImperativeHandleMethods (
   componentClass: { [IMPERATIVE_HANDLE_META_KEY]?: ImperativeHandleMeta[] },
-): ImperativeHandleMeta[] {
+): readonly ImperativeHandleMeta[] {
   const methods = componentClass[IMPERATIVE_HANDLE_META_KEY];
   return methods === undefined ? [] : Object.freeze([...methods]);
 }
