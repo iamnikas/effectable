@@ -74,17 +74,27 @@ export function UseRef (): PropertyDecorator {
       [REF_FIELDS_META_KEY]?: RefFieldMeta[];
     };
 
-    if (!Array.isArray(constructor[REF_FIELDS_META_KEY])) {
-      constructor[REF_FIELDS_META_KEY] = [];
+    const current = constructor[REF_FIELDS_META_KEY];
+    const isInherited = current !== undefined && !Object.hasOwn(constructor, REF_FIELDS_META_KEY);
+
+    let next: RefFieldMeta[];
+    if (isInherited) {
+      next = [...current];
+    } else if (current === undefined) {
+      next = [];
+    } else {
+      next = current;
     }
 
-    const existing = constructor[REF_FIELDS_META_KEY];
+    next.push({ propertyKey });
 
-    if (existing !== undefined) {
-      existing.push({ propertyKey });
-    }
+    Object.defineProperty(constructor, REF_FIELDS_META_KEY, {
+      value: next,
+      writable: false,
+      enumerable: false,
+      configurable: true,
+    });
 
-    // Pre-compute storage key once in closure (30.9x speedup vs string concat per getter call)
     const refKey = `__ref_${String(propertyKey)}`;
 
     Object.defineProperty(target, propertyKey, {
@@ -126,15 +136,26 @@ export function UseImperativeHandle (): MethodDecorator {
       [IMPERATIVE_HANDLE_META_KEY]?: ImperativeHandleMeta[];
     };
 
-    if (!Array.isArray(constructor[IMPERATIVE_HANDLE_META_KEY])) {
-      constructor[IMPERATIVE_HANDLE_META_KEY] = [];
+    const current = constructor[IMPERATIVE_HANDLE_META_KEY];
+    const isInherited = current !== undefined && !Object.hasOwn(constructor, IMPERATIVE_HANDLE_META_KEY);
+
+    let next: ImperativeHandleMeta[];
+    if (isInherited) {
+      next = [...current];
+    } else if (current === undefined) {
+      next = [];
+    } else {
+      next = current;
     }
 
-    const existing = constructor[IMPERATIVE_HANDLE_META_KEY];
+    next.push({ methodKey });
 
-    if (existing !== undefined) {
-      existing.push({ methodKey });
-    }
+    Object.defineProperty(constructor, IMPERATIVE_HANDLE_META_KEY, {
+      value: next,
+      writable: false,
+      enumerable: false,
+      configurable: true,
+    });
   };
 }
 
@@ -150,7 +171,8 @@ export function UseImperativeHandle (): MethodDecorator {
 export function getRefFields (
   componentClass: { [REF_FIELDS_META_KEY]?: RefFieldMeta[] },
 ): RefFieldMeta[] {
-  return componentClass[REF_FIELDS_META_KEY] ?? [];
+  const fields = componentClass[REF_FIELDS_META_KEY];
+  return fields === undefined ? [] : Object.freeze([...fields]);
 }
 
 /**
@@ -165,5 +187,6 @@ export function getRefFields (
 export function getImperativeHandleMethods (
   componentClass: { [IMPERATIVE_HANDLE_META_KEY]?: ImperativeHandleMeta[] },
 ): ImperativeHandleMeta[] {
-  return componentClass[IMPERATIVE_HANDLE_META_KEY] ?? [];
+  const methods = componentClass[IMPERATIVE_HANDLE_META_KEY];
+  return methods === undefined ? [] : Object.freeze([...methods]);
 }
