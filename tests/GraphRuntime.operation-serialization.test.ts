@@ -229,7 +229,7 @@ describe('GraphRuntime operation serialization (issue #11)', () => {
       }
     }
 
-    it('failed operation does not poison the queue forever', async () => {
+    it('failed operation transitions runtime to FAILED state (issue #10)', async () => {
       const runtime = await GraphRuntime.mount(h(FailOnReconcileRoot, { shouldFail: false }));
 
       // First reconcile will fail
@@ -237,18 +237,22 @@ describe('GraphRuntime operation serialization (issue #11)', () => {
         runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: true }))
       ).rejects.toThrow('Intentional reconcile failure');
 
-      // Runtime should still be active
-      expect(runtime.isActive()).toBe(true);
+      // Runtime should be in FAILED state (issue #10)
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('failed');
 
-      // Subsequent reconcile with valid data should succeed (queue not poisoned)
-      await runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: false }));
+      // Subsequent reconcile should reject (runtime is FAILED)
+      await expect(
+        runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: false }))
+      ).rejects.toThrow();
 
-      // Can still unmount
+      // Can still unmount safely
       await runtime.unmount();
       expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('unmounted');
     });
 
-    it('concurrent callers are serialized, errors propagate to individual callers', async () => {
+    it('concurrent callers are serialized, first failure causes FAILED state', async () => {
       const runtime = await GraphRuntime.mount(h(FailOnReconcileRoot, { shouldFail: false }));
 
       // Start multiple reconciles concurrently
@@ -258,8 +262,12 @@ describe('GraphRuntime operation serialization (issue #11)', () => {
       // First one should fail
       await expect(reconcile1).rejects.toThrow('Intentional reconcile failure');
 
-      // Second one should succeed (different operation, processed after first fails)
-      await reconcile2;
+      // Second one should also reject (runtime is FAILED after first failure)
+      await expect(reconcile2).rejects.toThrow();
+
+      // Runtime should be FAILED
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('failed');
 
       await runtime.unmount();
     });

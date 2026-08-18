@@ -386,7 +386,7 @@ describe('GraphRuntime resilience (P1 I38–I42)', () => {
   });
 
   describe('I39 — leaf error on a deep tree', () => {
-    it('on leaf onMount error during reconcile rethrows, runtime stays active until unmount', async () => {
+    it('on leaf onMount error during reconcile rethrows, runtime transitions to FAILED (issue #10)', async () => {
       const depth = 16;
       const runtime = await GraphRuntime.mount(
         h(DeepFailNestHost, {
@@ -410,11 +410,15 @@ describe('GraphRuntime resilience (P1 I38–I42)', () => {
         ),
       ).rejects.toThrow('FailOnMountLeaf: intentional mount failure');
 
-      expect(runtime.isActive()).toBe(true);
+      // Runtime transitions to FAILED on unrecoverable error (issue #10)
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('failed');
 
+      // Unmount is still safe
       await runtime.unmount();
       await runtime.unmount();
       expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('unmounted');
     });
 
     it('on leaf onMount error at start mount rejects and repeated unmount without runtime is idempotent', async () => {
