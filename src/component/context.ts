@@ -19,7 +19,6 @@
  */
 
 import { Component } from './Component';
-import type { VirtualServiceNode } from './types';
 
 // ---------------------------------------------------------------------------
 // ContextToken
@@ -213,16 +212,6 @@ export class ContextProvider extends Component<
     // Single pair: [token, value]
     const [token, val] = value as [ContextToken<unknown>, unknown];
     return extendScope(parentScope, token, val);
-  }
-
-  /**
-   * The provider does not render children itself — that is done by the parent's compose/h;
-   * the node exists only to participate in scope computation.
-   *
-   * @returns {null} no child virtual nodes
-   */
-  public override compose (): VirtualServiceNode[] | null {
-    return null;
   }
 }
 

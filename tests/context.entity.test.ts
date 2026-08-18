@@ -208,12 +208,6 @@ describe('UseContext / getContextFields / injectContextFields', () => {
 });
 
 describe('ContextProvider entity contract', () => {
-  it('CTX-12: provider compose() returns null', () => {
-    const provider = new ContextProvider({ value: [TOKEN_A, 'x'] });
-
-    expect(provider.compose()).toBeNull();
-  });
-
   it('CTX-13: IS_CONTEXT_PROVIDER on ContextProvider prototype is true', () => {
     const proto = ContextProvider.prototype as unknown as Record<symbol, unknown>;
 
