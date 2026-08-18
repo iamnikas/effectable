@@ -242,7 +242,7 @@ export interface MiddlewareAPI<D = Dispatch, S = unknown> {
  * };
  */
 export interface Middleware<
-  DispatchExt = {},
+  _DispatchExt = {},
   S = unknown,
   D = Dispatch
 > {
