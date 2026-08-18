@@ -87,9 +87,10 @@ export function createStore<S, A extends Action> (
       );
     }
 
-    // Reject class instances (only accept plain objects and Object.create(null))
+    // Reject class instances and Object.create(null) (strict Redux v4 behavior)
+    // Real Redux only accepts objects with Object.prototype
     const proto = Object.getPrototypeOf(action);
-    if (proto !== null && proto !== Object.prototype) {
+    if (proto !== Object.prototype) {
       throw new Error(
         'Actions must be plain objects. Use custom middleware for async actions.'
       );

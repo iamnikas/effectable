@@ -216,11 +216,11 @@ export interface MiddlewareAPI<D = Dispatch, S = unknown> {
  * Middleware can:
  * - Intercept actions
  * - Perform side-effects
- * - Dispatch new actions
+ * - Dispatch new actions via api.dispatch()
+ * - Read state via api.getState()
  * - Modify or block actions
  * - Call next() multiple times
  * - Use async/await
- * - Subscribe to state$ for reactive logic
  *
  * @template S - State type
  * @template A - Action type
