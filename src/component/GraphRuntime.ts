@@ -8,6 +8,7 @@
  *   shutdown in reverse order (parent before children).
  * - Inject contexts (@UseContext) and bind refs on mount.
  * - Pass updated props into existing instances during reconcile.
+ * - Serialize all graph operations through a single operation queue (issue #11).
  *
  * Current limitations:
  * - Work loop is synchronous (no priority lanes — next increment).
@@ -186,6 +187,27 @@ export class GraphRuntime {
    * Set via the fourth argument of {@link GraphRuntime.mount}.
    */
   private onAutoReconcileError: ((err: unknown) => void) | null = null;
+
+  /**
+   * Operation queue: serializes reconcile and unmount (issue #11).
+   * Each operation is a Promise-returning function executed sequentially.
+   */
+  private operationQueue: Array<() => Promise<void>> = [];
+
+  /**
+   * Whether an operation is currently running.
+   */
+  private operationInProgress = false;
+
+  /**
+   * Cached unmount promise for concurrent unmount callers (issue #11).
+   */
+  private cachedUnmountPromise: Promise<void> | null = null;
+
+  /**
+   * Whether unmount has started (reject new reconcile after this).
+   */
+  private unmountStarted = false;
 
   /**
    * Instances are created only via {@link GraphRuntime.mount}; direct `new GraphRuntime()` is unavailable externally.
@@ -466,7 +488,7 @@ export class GraphRuntime {
    * @returns {void}
    */
   private scheduleUpdate (fiber: RuntimeFiber<unknown>): void {
-    if (this.unmounted) {
+    if (this.unmounted || this.unmountStarted) {
       return;
     }
 
@@ -501,12 +523,71 @@ export class GraphRuntime {
   }
 
   /**
+   * Enqueues an operation and starts the queue processor if idle.
+   * Operations are executed sequentially; concurrent callers await the same in-flight operation.
+   * Issue #11: serialize all graph mutations.
+   *
+   * @param {() => Promise<void>} operation - operation to enqueue
+   * @returns {Promise<void>}
+   */
+  private async enqueueOperation (operation: () => Promise<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.operationQueue.push(async () => {
+        try {
+          await operation();
+          resolve();
+        } catch (error: unknown) {
+          reject(error);
+        }
+      });
+
+      if (!this.operationInProgress) {
+        // Start processing without awaiting to allow concurrent enqueuing
+        void this.processOperationQueue();
+      }
+    });
+  }
+
+  /**
+   * Processes the operation queue: runs operations one at a time.
+   * Issue #11: single serialized owner of tree mutations.
+   * Errors from individual operations are propagated to their callers but do not stop the queue.
+   *
+   * @returns {Promise<void>}
+   */
+  private async processOperationQueue (): Promise<void> {
+    if (this.operationInProgress) {
+      return;
+    }
+
+    this.operationInProgress = true;
+
+    try {
+      while (this.operationQueue.length > 0) {
+        const operation = this.operationQueue.shift();
+        if (operation === undefined) {
+          break;
+        }
+
+        try {
+          await operation();
+        } catch {
+          // Error is already propagated to the caller via the promise wrapper
+          // Continue processing the queue (don't poison it forever)
+        }
+      }
+    } finally {
+      this.operationInProgress = false;
+    }
+  }
+
+  /**
    * Queues one dirty-flush microtask and publishes {@link activeFlush} for await from `reconcile`.
    *
    * @returns {void}
    */
   private scheduleDirtyFlushMicrotask (): void {
-    if (this.flushScheduled || this.unmounted) {
+    if (this.flushScheduled || this.unmounted || this.unmountStarted) {
       return;
     }
 
@@ -539,12 +620,14 @@ export class GraphRuntime {
    * Guarded by the `flushing` flag against re-entrancy.
    * The chain of repeat passes is capped by {@link GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES}.
    *
+   * Issue #11: respects unmountStarted to cancel flush when unmount begins.
+   *
    * @returns {Promise<void>}
    */
   private async flushDirtyFibers (): Promise<void> {
     this.flushScheduled = false;
 
-    if (this.unmounted || this.flushing) {
+    if (this.unmounted || this.unmountStarted || this.flushing) {
       this.dirtyFibers.clear();
       return;
     }
@@ -556,7 +639,7 @@ export class GraphRuntime {
 
     try {
       for (const fiber of snapshot) {
-        if (this.unmounted) {
+        if (this.unmounted || this.unmountStarted) {
           break;
         }
         const res = this.reconcileDirtyFiber(fiber);
@@ -569,7 +652,7 @@ export class GraphRuntime {
     }
 
     // If new dirty fibers appeared during flush — schedule the next pass
-    if (this.dirtyFibers.size > 0 && !this.unmounted) {
+    if (this.dirtyFibers.size > 0 && !this.unmounted && !this.unmountStarted) {
       if (this.dirtyFlushPassCount >= GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES) {
         this.dirtyFibers.clear();
         this.dirtyFlushPassCount = 0;
@@ -593,7 +676,7 @@ export class GraphRuntime {
    * @returns {void | Promise<void>}
    */
   private reconcileDirtyFiber (fiber: RuntimeFiber<unknown>): void | Promise<void> {
-    if (this.unmounted) {
+    if (this.unmounted || this.unmountStarted) {
       return;
     }
 
@@ -681,43 +764,54 @@ export class GraphRuntime {
    * - UPDATE: update props on an existing instance, call onUpdate
    * - DELETE: unmount and destroy a node
    *
+   * Issue #11: all reconcile calls are serialized through the operation queue.
+   *
    * @param {VirtualServiceNode<P>} nextTree - new virtual tree
    * @returns {Promise<void>}
-   * @throws {Error} if the runtime is already unmounted
+   * @throws {Error} if the runtime is already unmounted or unmount has started
    */
   public async reconcile<P = unknown>(nextTree: VirtualServiceNode<P>): Promise<void> {
-    if (this.unmounted) {
-      throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount.');
+    // Reject immediately if unmount has started or completed
+    if (this.unmountStarted || this.unmounted) {
+      throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
     }
 
-    if (this.currentRoot === null) {
-      throw new Error('[Effectable] GraphRuntime: currentRoot is not initialized.');
-    }
+    // Serialize via operation queue
+    await this.enqueueOperation(async () => {
+      // Double-check after queue wait
+      if (this.unmountStarted || this.unmounted) {
+        throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
+      }
 
-    // Await the full dirty-flush chain (including re-schedule) — otherwise manual
-    // reconcile overlaps the snapshot auto-flush.
-    while (this.activeFlush !== null) {
-      await this.activeFlush;
-    }
+      if (this.currentRoot === null) {
+        throw new Error('[Effectable] GraphRuntime: currentRoot is not initialized.');
+      }
 
-    if (this.unmounted) {
-      throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount.');
-    }
+      // Await the full dirty-flush chain (including re-schedule) — otherwise manual
+      // reconcile overlaps the snapshot auto-flush.
+      while (this.activeFlush !== null) {
+        await this.activeFlush;
+      }
 
-    // Manual reconcile covers the whole tree from the root: cancel pending auto-flush
-    // to avoid double-mounting components from concurrent reconcile paths.
-    this.dirtyFibers.clear();
-    this.flushScheduled = false;
-    this.dirtyFlushPassCount = 0;
+      if (this.unmountStarted || this.unmounted) {
+        throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
+      }
 
-    const res = this.reconcileFiber(
-      this.currentRoot,
-      nextTree as VirtualServiceNode<unknown>,
-      null,
-      this.currentRoot.scope,
-    );
+      // Manual reconcile covers the whole tree from the root: cancel pending auto-flush
+      // to avoid double-mounting components from concurrent reconcile paths.
+      this.dirtyFibers.clear();
+      this.flushScheduled = false;
+      this.dirtyFlushPassCount = 0;
 
-    this.currentRoot = isThenable(res) ? await res : res;
+      const res = this.reconcileFiber(
+        this.currentRoot,
+        nextTree as VirtualServiceNode<unknown>,
+        null,
+        this.currentRoot.scope,
+      );
+
+      this.currentRoot = isThenable(res) ? await res : res;
+    });
   }
 
   /**
@@ -725,22 +819,56 @@ export class GraphRuntime {
    * Calls onUnmount for each node in reverse order (children before parent) and
    * moves stages to destroyed via LifecycleEngine.
    *
+   * Issue #11: unmount is serialized, cached promise returned for concurrent callers.
+   *
    * @returns {Promise<void>}
    */
   public async unmount (): Promise<void> {
+    // If unmount already completed, return immediately
     if (this.unmounted) {
       return;
     }
 
-    this.unmounted = true;
-
-    if (this.currentRoot !== null) {
-      const d = this.destroyFiber(this.currentRoot);
-      if (isThenable(d)) {
-        await d;
-      }
-      this.currentRoot = null;
+    // If unmount is in progress, return the cached promise (issue #11)
+    if (this.cachedUnmountPromise !== null) {
+      return this.cachedUnmountPromise;
     }
+
+    // Mark unmount started: reject new reconcile calls
+    this.unmountStarted = true;
+
+    // Create and cache the unmount promise
+    this.cachedUnmountPromise = this.enqueueOperation(async () => {
+      // Double-check unmounted flag
+      if (this.unmounted) {
+        return;
+      }
+
+      // Cancel any pending dirty flush
+      this.dirtyFibers.clear();
+      this.flushScheduled = false;
+
+      // Wait for in-flight dirty flush to complete (issue #11)
+      if (this.activeFlush !== null) {
+        try {
+          await this.activeFlush;
+        } catch {
+          // Ignore flush errors during unmount
+        }
+      }
+
+      this.unmounted = true;
+
+      if (this.currentRoot !== null) {
+        const d = this.destroyFiber(this.currentRoot);
+        if (isThenable(d)) {
+          await d;
+        }
+        this.currentRoot = null;
+      }
+    });
+
+    return this.cachedUnmountPromise;
   }
 
   /**
