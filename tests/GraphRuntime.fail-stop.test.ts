@@ -125,7 +125,7 @@ class FailOnUpdateRoot extends Component<Record<string, never>, { shouldFail: bo
 
 describe('GraphRuntime fail-stop (issue #10)', () => {
   describe('root replacement failure', () => {
-    it('sync mount failure → getState() FAILED, getRootInstance() null, later reconcile rejects', async () => {
+    it('sync mount failure → throws, does not return failed instance', async () => {
       await expect(
         GraphRuntime.mount(h(FailOnMountRoot, { shouldFail: true }))
       ).rejects.toThrow('FailOnMountRoot: intentional mount failure');
@@ -133,7 +133,7 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
       // Runtime should not be returned on mount failure
     });
 
-    it('async mount failure → getState() FAILED, getRootInstance() null, later reconcile rejects', async () => {
+    it('async mount failure → throws, does not return failed instance', async () => {
       await expect(
         GraphRuntime.mount(h(AsyncFailOnMountRoot, { shouldFail: true }))
       ).rejects.toThrow('AsyncFailOnMountRoot: intentional async mount failure');
@@ -393,7 +393,7 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
       await runtime.unmount();
     });
 
-    it('async compose error during dirty flush → FAILED', async () => {
+    it('sync compose error during dirty flush → FAILED', async () => {
       const errors: unknown[] = [];
 
       class AsyncDirtyFailRoot extends Component<Record<string, never>, { shouldFail: boolean }> {
@@ -784,6 +784,76 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
 
       // Timer should have been cleared during rollback
       expect(timerCleared).toBe(true);
+    });
+
+    it('onUnmount throw during fail-stop teardown → getState() FAILED, getRootInstance() null, later reconcile rejects with ORIGINAL error, cleanup error on rollbackErrors', async () => {
+      class ThrowOnUnmount extends Component<Record<string, never>, Record<string, never>> {
+        constructor (props: Record<string, never>) {
+          super(props);
+          this.state = {};
+        }
+
+        public override compose (): VirtualServiceNode {
+          return h(TestLeaf, { value: 1 });
+        }
+
+        public override onUnmount (): void {
+          throw new Error('ThrowOnUnmount: intentional cleanup error');
+        }
+      }
+
+      class FailOnReconcileRoot extends Component<{ shouldFail: boolean }, Record<string, never>> {
+        constructor (props: { shouldFail: boolean }) {
+          super(props);
+          this.state = {};
+        }
+
+        public override compose (): VirtualServiceNode {
+          if (this.props.shouldFail) {
+            throw new Error('FailOnReconcileRoot: intentional reconcile failure');
+          }
+          return h(ThrowOnUnmount, {});
+        }
+      }
+
+      // Mount with successful child
+      const runtime = await GraphRuntime.mount(
+        h(FailOnReconcileRoot, { shouldFail: false })
+      );
+
+      expect(runtime.isActive()).toBe(true);
+      expect(runtime.getRootInstance()).not.toBeNull();
+
+      // Reconcile with failure - this should trigger fail-stop and attempt to destroy ThrowOnUnmount
+      let reconcileError: Error | null = null;
+      try {
+        await runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: true }));
+      } catch (err: unknown) {
+        reconcileError = err as Error;
+      }
+
+      expect(reconcileError).not.toBeNull();
+      expect(reconcileError?.message).toContain('FailOnReconcileRoot: intentional reconcile failure');
+
+      // getState() should be FAILED
+      expect(runtime.getState()).toBe('failed');
+
+      // getRootInstance() should be null
+      expect(runtime.getRootInstance()).toBeNull();
+
+      // Cleanup error should be attached as rollbackErrors
+      const rollbackErrors = (reconcileError as Error & { rollbackErrors?: Error[] })?.rollbackErrors;
+      expect(rollbackErrors).toBeDefined();
+      expect(rollbackErrors?.length).toBeGreaterThan(0);
+      expect(rollbackErrors?.[0]?.message).toContain('ThrowOnUnmount: intentional cleanup error');
+
+      // Later reconcile should reject with terminal error (original error)
+      await expect(
+        runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: false }))
+      ).rejects.toThrow('FailOnReconcileRoot: intentional reconcile failure');
+
+      // Unmount should still be safe
+      await runtime.unmount();
     });
   });
 });
