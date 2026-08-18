@@ -119,11 +119,8 @@ function getMappedPropsRecord (mapped: unknown): Record<string, unknown> | null 
 /**
  * Converts mapDispatchToProps (function or action creators object) into a flat object for merge into props.
  *
- * Function as third argument: when `function.length <= 1` it is treated as “dispatch only”
- * and called as `fn(dispatch)` (no need for a `(d) => mapXxx(d)` wrapper).
- * Full form `(dispatch, props) => …` — when `function.length >= 2`, both arguments are passed.
- * Do not use a default value on the second parameter if it is needed in the body — then
- * `function.length` will be 1 and `props` will not reach the callback.
+ * Function as third argument: always called as `fn(dispatch, props)`.
+ * Extra arguments are ignored by JS functions that do not use them.
  *
  * @template S store state type
  * @template P instance props type
@@ -143,16 +140,8 @@ function resolveMapDispatchProps<S, P, A extends Action> (
   }
 
   if (typeof mapDispatch === 'function') {
-    const fn = mapDispatch as
-      | MapDispatchToPropsFunction<S, P, A>
-      | MapDispatchToPropsDispatchOnly<A>;
-    let out: unknown;
-
-    if ((fn as { length: number }).length >= 2) {
-      out = (fn as MapDispatchToPropsFunction<S, P, A>)(store.dispatch, props);
-    } else {
-      out = (fn as MapDispatchToPropsDispatchOnly<A>)(store.dispatch);
-    }
+    const fn = mapDispatch as MapDispatchToPropsFunction<S, P, A>;
+    const out: unknown = fn(store.dispatch, props);
 
     if (out == null || typeof out !== 'object' || Array.isArray(out)) {
       return null;
