@@ -10,7 +10,7 @@ Reactive layer library: explicit bootstrap-path, Redux-RxJS store, base class wi
 
 ## Installation
 
-Requires **Node.js 18.18+** and **npm 9+**.
+Requires **Node.js 22+** and **npm 9+**.
 
 ```bash
 npm install effectable
