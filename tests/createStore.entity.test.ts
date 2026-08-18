@@ -264,7 +264,7 @@ describe('createStore', () => {
       store.destroy();
     });
 
-    it('dispatch of Object.create(null) with type is allowed', () => {
+    it('dispatch of Object.create(null) throws (strict Redux v4 behavior)', () => {
       const store = createStore<CounterState, CounterAction>(
         counterReducer,
         initialCounterState,
@@ -275,9 +275,8 @@ describe('createStore', () => {
 
       expect(() => {
         store.dispatch(action);
-      }).not.toThrow();
+      }).toThrow(/plain objects/);
 
-      expect(store.getState().count).toBe(1);
       store.destroy();
     });
   });

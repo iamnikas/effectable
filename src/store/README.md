@@ -333,17 +333,16 @@ The library maintains strict Redux v4 compatibility for core store behavior:
 
 ✅ `createStore(reducer, initialState, enhancer)`
 ✅ `applyMiddleware(...middlewares)`
-✅ `store.dispatch(action)` — strict plain object validation (rejects arrays, class instances)
+✅ `store.dispatch(action)` — strict plain object validation (rejects arrays, class instances, Object.create(null))
 ✅ `store.getState()`
 ✅ Middleware signature `(store) => (next) => (action) => result`
 ✅ Reducer pattern `(state, action) => newState`
 ✅ Reducer must not return `undefined`
-✅ Dispatch/getState guarded after `destroy()` (throw errors)
 
 **RxJS extensions (not in Redux):**
 - `store.state$` — Observable of state changes
 - `store.select(selector)` — selector with distinctUntilChanged
-- `store.destroy()` — cleanup method
+- `store.destroy()` — cleanup method (guarded: dispatch/getState throw after destroy)
 
 **Not implemented:**
 ❌ `store.subscribe()` - use `store.state$`

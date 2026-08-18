@@ -317,56 +317,66 @@ describe('Redux compatibility functional tests', () => {
     });
   });
 
-  describe('Object.create(null) action with type increments state', () => {
-    it('accepts Object.create(null) action and applies it correctly', () => {
+  describe('strict plain object validation (Redux v4 behavior)', () => {
+    it('rejects Object.create(null) actions (matches Redux v4)', () => {
       const store = createStore<CounterState, CounterAction>(
         counterReducer,
         initialState,
       );
 
-      // Create an action with null prototype
+      // Redux v4 rejects Object.create(null) - only accepts Object.prototype
       const action = Object.create(null) as CounterAction;
       action.type = 'INC';
 
       expect(() => {
         store.dispatch(action);
-      }).not.toThrow();
-
-      expect(store.getState().count).toBe(1);
-
-      // Another null-proto action
-      const action2 = Object.create(null) as CounterAction;
-      action2.type = 'SET';
-      action2.payload = 42;
-
-      store.dispatch(action2);
-
-      expect(store.getState().count).toBe(42);
+      }).toThrow(/plain objects/);
 
       store.destroy();
     });
 
-    it('null-proto action works with middleware', () => {
-      const seenActions: string[] = [];
+    it('rejects arrays (matches Redux v4)', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialState,
+      );
 
-      const middleware: Middleware<unknown, CounterState> = () => (next) => (action: unknown) => {
-        const typed = action as CounterAction;
-        seenActions.push(typed.type);
-        return next(typed);
-      };
+      expect(() => {
+        store.dispatch([{ type: 'INC' }] as unknown as CounterAction);
+      }).toThrow(/plain objects/);
+
+      store.destroy();
+    });
+
+    it('rejects class instances (matches Redux v4)', () => {
+      class ActionClass {
+        type = 'INC';
+      }
 
       const store = createStore<CounterState, CounterAction>(
         counterReducer,
         initialState,
-        applyMiddleware(middleware)
       );
 
-      const action = Object.create(null) as CounterAction;
-      action.type = 'INC';
+      expect(() => {
+        store.dispatch(new ActionClass() as unknown as CounterAction);
+      }).toThrow(/plain objects/);
 
-      store.dispatch(action);
+      store.destroy();
+    });
 
-      expect(seenActions).toEqual(['INC']);
+    it('accepts plain object literals', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialState,
+      );
+
+      const action: CounterAction = { type: 'INC' };
+
+      expect(() => {
+        store.dispatch(action);
+      }).not.toThrow();
+
       expect(store.getState().count).toBe(1);
 
       store.destroy();
