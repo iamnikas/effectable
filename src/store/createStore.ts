@@ -1,8 +1,8 @@
 /**
  * Redux Store Creator with RxJS Support
  *
- * Implements createStore, compatible with Redux v4,
- * but using RxJS for reactive state management.
+ * Implements createStore with strict Redux v4 compatibility
+ * plus reactive RxJS extensions (state$, select).
  *
  * @module Effectable/store/createStore
  */
@@ -53,6 +53,9 @@ export function createStore<S, A extends Action> (
   // Flag to prevent dispatch while a reducer is running
   let isDispatching = false;
 
+  // Flag to track if the store has been destroyed
+  let isDestroyed = false;
+
   /**
    * Base dispatch without middleware
    *
@@ -63,8 +66,30 @@ export function createStore<S, A extends Action> (
    * @returns The same action
    */
   function dispatch<B extends A> (action: B): B {
-    // Action validation
+    // Guard: store has been destroyed
+    if (isDestroyed) {
+      throw new Error(
+        'Cannot dispatch an action after the store has been destroyed.'
+      );
+    }
+
+    // Action validation - strict plain object check (Redux-compatible)
     if (typeof action !== 'object' || action === null) {
+      throw new Error(
+        'Actions must be plain objects. Use custom middleware for async actions.'
+      );
+    }
+
+    // Reject arrays (typeof [] === 'object' but not a plain object)
+    if (Array.isArray(action)) {
+      throw new Error(
+        'Actions must be plain objects. Use custom middleware for async actions.'
+      );
+    }
+
+    // Reject class instances (only accept plain objects and Object.create(null))
+    const proto = Object.getPrototypeOf(action);
+    if (proto !== null && proto !== Object.prototype) {
       throw new Error(
         'Actions must be plain objects. Use custom middleware for async actions.'
       );
@@ -90,6 +115,14 @@ export function createStore<S, A extends Action> (
 
       // Call reducer to get the new state
       newState = reducer(currentState, action);
+
+      // Redux-compatible: reject undefined state from reducer
+      if (typeof newState === 'undefined') {
+        throw new Error(
+          `Reducer returned undefined when handling action "${action.type}". ` +
+          'To ignore an action, you must explicitly return the previous state.'
+        );
+      }
     } finally {
       // Important: reset the flag before notifying subscribers
       // so they can safely dispatch follow-up actions (as in Redux).
@@ -107,7 +140,14 @@ export function createStore<S, A extends Action> (
    *
    * @returns Current Store state
    */
-  const getState = (): S => state$.getValue();
+  const getState = (): S => {
+    if (isDestroyed) {
+      throw new Error(
+        'Cannot access state after the store has been destroyed.'
+      );
+    }
+    return state$.getValue();
+  };
 
   /**
    * Universal select method for applying selectors
@@ -141,6 +181,7 @@ export function createStore<S, A extends Action> (
    * store.destroy();
    */
   const destroy = (): void => {
+    isDestroyed = true;
     state$.complete();
   };
 
