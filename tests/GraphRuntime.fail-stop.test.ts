@@ -228,6 +228,76 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
       await runtime.unmount();
     });
 
+    it('child reconcile failure tears down live tree resources (refs, handlers)', async () => {
+      const ref: { current: Component<unknown, unknown> | null } = { current: null };
+      let unmountCount = 0;
+
+      class ResourceLeaf extends Component<Record<string, never>, { value: number }> {
+        private timer: NodeJS.Timeout | null = null;
+
+        constructor (props: { value: number }) {
+          super(props);
+          this.state = {};
+        }
+
+        public override onMount (): void {
+          // Simulate a resource (timer)
+          this.timer = setTimeout(() => {
+            // no-op
+          }, 60000);
+        }
+
+        public override onUnmount (): void {
+          unmountCount += 1;
+          if (this.timer !== null) {
+            clearTimeout(this.timer);
+            this.timer = null;
+          }
+        }
+      }
+
+      class ParentWithResource extends Component<Record<string, never>, { useFailChild: boolean }> {
+        constructor (props: { useFailChild: boolean }) {
+          super(props);
+          this.state = {};
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          if (this.props.useFailChild) {
+            return [h(FailOnMountRoot, { shouldFail: true }, 'fail-child')];
+          }
+          return [h(ResourceLeaf, { value: 1 }, ref)];
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(
+        h(ParentWithResource, { useFailChild: false })
+      );
+
+      expect(runtime.isActive()).toBe(true);
+      expect(ref.current).not.toBeNull();
+      const oldInstance = ref.current;
+      expect(unmountCount).toBe(0);
+
+      // Reconcile with child that will fail (should tear down old tree)
+      await expect(
+        runtime.reconcile(h(ParentWithResource, { useFailChild: true }))
+      ).rejects.toThrow('FailOnMountRoot: intentional mount failure');
+
+      // Runtime should be FAILED
+      expect(runtime.getState()).toBe('failed');
+      expect(runtime.getRootInstance()).toBeNull();
+
+      // Old instance should have been unmounted (ref cleared, onUnmount called)
+      expect(ref.current).toBeNull();
+      expect(unmountCount).toBe(1);
+
+      // Verify the old instance is the one that was unmounted
+      expect(oldInstance).toBeInstanceOf(ResourceLeaf);
+
+      await runtime.unmount();
+    });
+
     it('descendant failure during reconcile → FAILED, not ACTIVE', async () => {
       class DeepNestHost extends Component<Record<string, never>, { useFailChild: boolean }> {
         constructor (props: { useFailChild: boolean }) {

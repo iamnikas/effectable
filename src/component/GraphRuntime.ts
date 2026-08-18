@@ -950,8 +950,7 @@ export class GraphRuntime {
         this.currentRoot = isThenable(res) ? await res : res;
       } catch (error: unknown) {
         // Fail-stop on unrecoverable reconcile error (issue #10)
-        // Set currentRoot to null before failStop to avoid double-destroy
-        this.currentRoot = null;
+        // Let failStop destroy current tree and null currentRoot (single owner)
         const failError = error instanceof Error ? error : new Error(String(error));
         const failRes = this.failStop(failError);
         if (isThenable(failRes)) {

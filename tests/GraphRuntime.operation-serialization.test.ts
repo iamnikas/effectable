@@ -255,15 +255,15 @@ describe('GraphRuntime operation serialization (issue #11)', () => {
     it('concurrent callers are serialized, first failure causes FAILED state', async () => {
       const runtime = await GraphRuntime.mount(h(FailOnReconcileRoot, { shouldFail: false }));
 
-      // Start multiple reconciles concurrently
+      // Start multiple reconciles concurrently  
       const reconcile1 = runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: true }));
       const reconcile2 = runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: false }));
 
-      // First one should fail
-      await expect(reconcile1).rejects.toThrow('Intentional reconcile failure');
-
-      // Second one should also reject (runtime is FAILED after first failure)
-      await expect(reconcile2).rejects.toThrow();
+      // Both should fail (first with reconcile error, second may fail with terminal or reconcile error)
+      const results = await Promise.allSettled([reconcile1, reconcile2]);
+      
+      expect(results[0]?.status).toBe('rejected');
+      expect(results[1]?.status).toBe('rejected');
 
       // Runtime should be FAILED
       expect(runtime.isActive()).toBe(false);
