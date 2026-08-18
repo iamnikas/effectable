@@ -2369,7 +2369,7 @@ describe('GraphRuntime', () => {
       });
     }
 
-    it('without onAutoReconcileError a compose error in auto-flush does not crash the runtime', async () => {
+    it('without onAutoReconcileError a compose error in auto-flush transitions to FAILED (issue #10)', async () => {
       class BoomComposeRoot extends Component<{ boom: boolean }, Record<string, never>> {
         constructor () {
           super({});
@@ -2395,9 +2395,12 @@ describe('GraphRuntime', () => {
       root.setState({ boom: true });
       await drainMicrotasks();
 
-      expect(runtime.isActive()).toBe(true);
-      expect(runtime.getRootInstance()).not.toBeNull();
+      // Dirty-flush error transitions to FAILED (issue #10)
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('failed');
+      expect(runtime.getRootInstance()).toBeNull();
 
+      // Unmount is still safe
       await runtime.unmount();
     });
 
@@ -2492,7 +2495,8 @@ describe('GraphRuntime', () => {
       const RuntimeFactory = GraphRuntime as unknown as new () => GraphRuntime;
       const runtime = new RuntimeFactory();
 
-      expect(runtime.isActive()).toBe(true);
+      // Runtime created directly (not via mount) is in IDLE state
+      expect(runtime.isActive()).toBe(false);
       expect(runtime.getRootInstance()).toBeNull();
 
       await expect(

@@ -229,7 +229,7 @@ describe('GraphRuntime operation serialization (issue #11)', () => {
       }
     }
 
-    it('failed operation does not poison the queue forever', async () => {
+    it('failed operation transitions runtime to FAILED state (issue #10)', async () => {
       const runtime = await GraphRuntime.mount(h(FailOnReconcileRoot, { shouldFail: false }));
 
       // First reconcile will fail
@@ -237,29 +237,37 @@ describe('GraphRuntime operation serialization (issue #11)', () => {
         runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: true }))
       ).rejects.toThrow('Intentional reconcile failure');
 
-      // Runtime should still be active
-      expect(runtime.isActive()).toBe(true);
+      // Runtime should be in FAILED state (issue #10)
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('failed');
 
-      // Subsequent reconcile with valid data should succeed (queue not poisoned)
-      await runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: false }));
+      // Subsequent reconcile should reject (runtime is FAILED)
+      await expect(
+        runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: false }))
+      ).rejects.toThrow();
 
-      // Can still unmount
+      // Can still unmount safely
       await runtime.unmount();
       expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('unmounted');
     });
 
-    it('concurrent callers are serialized, errors propagate to individual callers', async () => {
+    it('concurrent callers are serialized, first failure causes FAILED state', async () => {
       const runtime = await GraphRuntime.mount(h(FailOnReconcileRoot, { shouldFail: false }));
 
-      // Start multiple reconciles concurrently
+      // Start multiple reconciles concurrently  
       const reconcile1 = runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: true }));
       const reconcile2 = runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: false }));
 
-      // First one should fail
-      await expect(reconcile1).rejects.toThrow('Intentional reconcile failure');
+      // Both should fail (first with reconcile error, second may fail with terminal or reconcile error)
+      const results = await Promise.allSettled([reconcile1, reconcile2]);
+      
+      expect(results[0]?.status).toBe('rejected');
+      expect(results[1]?.status).toBe('rejected');
 
-      // Second one should succeed (different operation, processed after first fails)
-      await reconcile2;
+      // Runtime should be FAILED
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('failed');
 
       await runtime.unmount();
     });
