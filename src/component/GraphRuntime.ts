@@ -707,7 +707,7 @@ export class GraphRuntime {
    * Guarded by the `flushing` flag against re-entrancy.
    * The chain of repeat passes is capped by {@link GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES}.
    *
-   * Issue #11: respects unmountStarted to cancel flush when unmount begins.
+   * Issue #11: respects state (UNMOUNTING/UNMOUNTED/FAILED) to cancel flush when unmount begins or failure occurs.
    * Issue #10: on unrecoverable error, invokes onAutoReconcileError then fail-stops.
    *
    * @returns {Promise<void>}
@@ -898,7 +898,7 @@ export class GraphRuntime {
    *
    * @param {VirtualServiceNode<P>} nextTree - new virtual tree
    * @returns {Promise<void>}
-   * @throws {Error} if the runtime is already unmounted, unmount has started, or runtime is failed
+   * @throws {Error} if the runtime state is UNMOUNTING, UNMOUNTED, or FAILED
    */
   public async reconcile<P = unknown>(nextTree: VirtualServiceNode<P>): Promise<void> {
     // Reject immediately if unmount has started or completed
