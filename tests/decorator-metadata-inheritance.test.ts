@@ -95,12 +95,14 @@ describe('BusDecorators metadata inheritance', () => {
         }
       }
 
-      const buses = createRuntimeBuses<TC, TQ, TE>();
+      const buses1 = createRuntimeBuses<TC, TQ, TE>();
+      const buses2 = createRuntimeBuses<TC, TQ, TE>();
+
       const baseInstance = new Base();
       const derivedInstance = new Derived();
 
-      const disposeBase = wireRuntimeBuses(baseInstance, buses);
-      const disposeDerived = wireRuntimeBuses(derivedInstance, buses);
+      const disposeBase = wireRuntimeBuses(baseInstance, buses1);
+      const disposeDerived = wireRuntimeBuses(derivedInstance, buses2);
 
       disposeBase();
       disposeDerived();
@@ -121,12 +123,14 @@ describe('BusDecorators metadata inheritance', () => {
         }
       }
 
-      const buses = createRuntimeBuses<TC, TQ, TE>();
+      const buses1 = createRuntimeBuses<TC, TQ, TE>();
+      const buses2 = createRuntimeBuses<TC, TQ, TE>();
+
       const baseInstance = new Base();
       const derivedInstance = new Derived();
 
-      const disposeBase = wireRuntimeBuses(baseInstance, buses);
-      const disposeDerived = wireRuntimeBuses(derivedInstance, buses);
+      const disposeBase = wireRuntimeBuses(baseInstance, buses1);
+      const disposeDerived = wireRuntimeBuses(derivedInstance, buses2);
 
       disposeBase();
       disposeDerived();
@@ -147,12 +151,14 @@ describe('BusDecorators metadata inheritance', () => {
         }
       }
 
-      const buses = createRuntimeBuses<TC, TQ, TE>();
+      const buses1 = createRuntimeBuses<TC, TQ, TE>();
+      const buses2 = createRuntimeBuses<TC, TQ, TE>();
+
       const baseInstance = new Base();
       const derivedInstance = new Derived();
 
-      const disposeBase = wireRuntimeBuses(baseInstance, buses);
-      const disposeDerived = wireRuntimeBuses(derivedInstance, buses);
+      const disposeBase = wireRuntimeBuses(baseInstance, buses1);
+      const disposeDerived = wireRuntimeBuses(derivedInstance, buses2);
 
       disposeBase();
       disposeDerived();
