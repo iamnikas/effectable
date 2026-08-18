@@ -19,7 +19,6 @@
  */
 
 import { Component } from './Component';
-import type { VirtualServiceNode } from './types';
 
 // ---------------------------------------------------------------------------
 // ContextToken
