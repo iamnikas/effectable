@@ -67,6 +67,25 @@ function isThenable<T> (value: T | PromiseLike<T>): value is PromiseLike<T> {
 // ---------------------------------------------------------------------------
 
 /**
+ * Construction journal: tracks resources acquired during fiber materialization.
+ * On failure, resources are released in reverse acquisition order (issue #12).
+ */
+interface FiberConstructionJournal {
+  /** Scheduler hook injection step completed. */
+  schedulerHookAttached?: boolean;
+  /** Runtime bus wiring step completed. */
+  busWiringAttached?: boolean;
+  /** Ref binding step completed. */
+  refBound?: boolean;
+  /** Successfully mounted child fibers (in acquisition order). */
+  mountedChildren: RuntimeFiber<unknown>[];
+  /** Original ref owner (for identity-safe clearing during rollback). */
+  refOwner?: Component<unknown, unknown>;
+  /** Rollback already invoked (idempotency guard). */
+  rolledBack?: boolean;
+}
+
+/**
  * Internal extended fiber with lifecycle-engine and scope.
  */
 interface RuntimeFiber<P = unknown> extends Fiber<P> {
@@ -84,6 +103,11 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
    * {@link SCHEDULE_UPDATE_HOOK} was injected: after startup, {@link scheduleUpdate} must run.
    */
   pendingScheduleUpdate?: boolean;
+  /**
+   * Construction journal: records acquired resources during materialization.
+   * Used for transactional rollback on failure (issue #12).
+   */
+  constructionJournal?: FiberConstructionJournal;
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +227,180 @@ export class GraphRuntime {
     }
 
     delete fiber.effectableRuntimeBusDisposer;
+  }
+
+  /**
+   * Identity-safe ref clearing: clears ref.current only if it still points to the expected owner.
+   * Prevents an old rollback from clearing a ref that a newer materialization already reused.
+   * Partial foundation for #17 (complete decorator-backed ref storage is out of scope for #12).
+   *
+   * @param {RefObject<unknown>} ref - ref object
+   * @param {Component<unknown, unknown>} expectedOwner - expected current owner
+   * @returns {void}
+   */
+  private clearRefSafe (ref: RefObject<unknown>, expectedOwner: Component<unknown, unknown>): void {
+    if (ref.current === expectedOwner) {
+      ref.current = null;
+    }
+  }
+
+  /**
+   * Transactional rollback for failed fiber materialization.
+   * Releases acquired resources in reverse acquisition order:
+   * 1. disable scheduler hook
+   * 2. dispose runtime bus registrations
+   * 3. clear bound ref (identity-safe)
+   * 4. run failed-startup cleanup
+   * 5. destroy mounted children in reverse order
+   * 6. unlink the partial fiber
+   * Cleanup is best-effort: one failure does not skip remaining steps.
+   * Preserves the original materialization error; cleanup errors are attached.
+   * Rollback is idempotent.
+   *
+   * @param {RuntimeFiber<P>} fiber - fiber being rolled back
+   * @param {Error} primaryError - original materialization/startup error
+   * @returns {void | Promise<void>}
+   */
+  private rollbackFailedMaterialization<P> (
+    fiber: RuntimeFiber<P>,
+    primaryError: Error,
+  ): void | Promise<void> {
+    const journal = fiber.constructionJournal;
+    if (journal === undefined || journal.rolledBack === true) {
+      return;
+    }
+    journal.rolledBack = true;
+
+    const cleanupErrors: Error[] = [];
+    const instance = fiber.instance;
+
+    // 1. Disable scheduler hook
+    if (journal.schedulerHookAttached === true && instance !== null) {
+      try {
+        this.clearUpdateHook(instance);
+        this.dirtyFibers.delete(fiber);
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    // 2. Dispose runtime bus registrations
+    if (journal.busWiringAttached === true) {
+      try {
+        this.disposeEffectableRuntimeBusWiring(fiber);
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    // 3. Clear bound ref (identity-safe)
+    if (journal.refBound === true && fiber.vnode.ref !== undefined && journal.refOwner !== undefined) {
+      try {
+        this.clearRefSafe(fiber.vnode.ref, journal.refOwner);
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    // 4. Run failed-startup cleanup (if instance exists)
+    let cleanupPromise: Promise<void> | null = null;
+    if (instance !== null) {
+      try {
+        const cleanupRes = fiber.engine.runFailedCleanup(instance, true);
+        if (isThenable(cleanupRes)) {
+          cleanupPromise = cleanupRes;
+        }
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    // 5. Destroy mounted children in reverse order
+    const destroyChildrenAndFinalize = (): void | Promise<void> => {
+      const children = journal.mountedChildren;
+      for (let i = children.length - 1; i >= 0; i -= 1) {
+        try {
+          const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
+          if (isThenable(destroyRes)) {
+            return this.continueRollbackDestroyAsync(
+              children,
+              i,
+              destroyRes,
+              primaryError,
+              cleanupErrors,
+            );
+          }
+        } catch (err) {
+          cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+
+      // 6. Finalize: attach cleanup errors to primary error
+      this.finalizeRollback(primaryError, cleanupErrors);
+    };
+
+    if (cleanupPromise !== null) {
+      return cleanupPromise.then(
+        () => destroyChildrenAndFinalize(),
+        (err) => {
+          cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+          return destroyChildrenAndFinalize();
+        },
+      );
+    }
+
+    return destroyChildrenAndFinalize();
+  }
+
+  /**
+   * Async continuation of rollback child destruction after one child's destroy returned a Promise.
+   *
+   * @param {RuntimeFiber<unknown>[]} children - mounted children
+   * @param {number} lastIdx - index of the last processed child
+   * @param {Promise<void>} pending - Promise from destroying the previous child
+   * @param {Error} primaryError - original materialization error
+   * @param {Error[]} cleanupErrors - accumulated cleanup errors
+   * @returns {Promise<void>}
+   */
+  private async continueRollbackDestroyAsync (
+    children: RuntimeFiber<unknown>[],
+    lastIdx: number,
+    pending: Promise<void>,
+    primaryError: Error,
+    cleanupErrors: Error[],
+  ): Promise<void> {
+    try {
+      await pending;
+    } catch (err) {
+      cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+    }
+
+    for (let i = lastIdx - 1; i >= 0; i -= 1) {
+      try {
+        const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
+        if (isThenable(destroyRes)) {
+          await destroyRes;
+        }
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    this.finalizeRollback(primaryError, cleanupErrors);
+  }
+
+  /**
+   * Attaches cleanup errors to the primary error and rethrows.
+   *
+   * @param {Error} primaryError - original materialization error
+   * @param {Error[]} cleanupErrors - cleanup errors
+   * @returns {never}
+   */
+  private finalizeRollback (primaryError: Error, cleanupErrors: Error[]): never {
+    if (cleanupErrors.length > 0) {
+      (primaryError as Error & { rollbackErrors?: Error[] }).rollbackErrors = cleanupErrors;
+    }
+    throw primaryError;
   }
 
   /**
@@ -679,15 +877,30 @@ export class GraphRuntime {
       effectTag: FIBER_EFFECT_TAG.PLACE,
       engine,
       scope: parentScope,
+      constructionJournal: {
+        mountedChildren: [],
+      },
     };
 
     // Recursively materialize children before running the parent's lifecycle
     const childVnodes = this.getChildVnodes(instance, vnode.children);
-    const childFibers: RuntimeFiber<unknown>[] = [];
 
     for (let i = 0; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
-      const childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
+      let childRes: RuntimeFiber<unknown> | Promise<RuntimeFiber<unknown>>;
+      
+      try {
+        childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+        if (isThenable(rollbackRes)) {
+          return rollbackRes.then(() => {
+            throw error;
+          }) as Promise<RuntimeFiber<P>>;
+        }
+        throw error;
+      }
 
       if (isThenable(childRes)) {
         // Hit an async child — continue the materialization tail in the async continuation.
@@ -697,23 +910,52 @@ export class GraphRuntime {
           engine,
           vnode,
           childVnodes,
-          childFibers,
+          childScope,
           childRes,
           i,
         );
       }
 
-      childFibers.push(childRes as RuntimeFiber<unknown>);
+      fiber.constructionJournal!.mountedChildren.push(childRes as RuntimeFiber<unknown>);
     }
 
-    fiber.children = childFibers as Fiber[];
+    fiber.children = fiber.constructionJournal!.mountedChildren as Fiber[];
 
     // Bind ref to the instance
     if (vnode.ref !== undefined) {
-      (vnode.ref as RefObject<typeof instance>).current = instance;
+      try {
+        (vnode.ref as RefObject<typeof instance>).current = instance;
+        fiber.constructionJournal!.refBound = true;
+        fiber.constructionJournal!.refOwner = instance;
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+        if (isThenable(rollbackRes)) {
+          return rollbackRes.then(() => {
+            throw error;
+          }) as Promise<RuntimeFiber<P>>;
+        }
+        throw error;
+      }
     }
 
-    this.attachEffectableRuntimeBusWiring(instance, fiber);
+    try {
+      this.attachEffectableRuntimeBusWiring(instance, fiber);
+      if (fiber.effectableRuntimeBusDisposer !== undefined) {
+        fiber.constructionJournal!.busWiringAttached = true;
+      }
+    } catch (err) {
+      const rollbackRes = this.rollbackFailedMaterialization(
+        fiber,
+        err instanceof Error ? err : new Error(String(err)),
+      );
+      if (isThenable(rollbackRes)) {
+        return rollbackRes.then(() => {
+          throw err;
+        }) as Promise<RuntimeFiber<P>>;
+      }
+      throw err;
+    }
 
     // Run lifecycle after all children are materialized.
     // Pre-mount hook buffers setState from onMount until injectUpdateHook.
@@ -721,22 +963,23 @@ export class GraphRuntime {
     const startupRes = engine.runStartup(instance);
 
     if (isThenable(startupRes)) {
-      return this.finalizeMaterializeAsync(fiber, engine, childFibers, startupRes);
+      return this.finalizeMaterializeAsync(fiber, engine, startupRes);
     }
 
     if (!startupRes.ok) {
-      // Unmount already-mounted children when parent startup fails
-      const destroyChain = this.destroyChildrenOnError(childFibers);
-      if (isThenable(destroyChain)) {
-        return destroyChain.then(() => {
-          throw startupRes.error;
-        });
+      const error = startupRes.error instanceof Error ? startupRes.error : new Error(String(startupRes.error));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        return rollbackRes.then(() => {
+          throw error;
+        }) as Promise<RuntimeFiber<P>>;
       }
-      throw startupRes.error;
+      throw error;
     }
 
     fiber.lifecycleStatus = engine.getStatus();
     fiber.effectTag = null;
+    fiber.constructionJournal!.schedulerHookAttached = true;
     this.injectUpdateHook(instance, fiber);
     return fiber;
   }
@@ -750,7 +993,7 @@ export class GraphRuntime {
    * @param {LifecycleEngine} engine - lifecycle engine
    * @param {VirtualServiceNode<P>} vnode - virtual node
    * @param {VirtualServiceNode[]} childVnodes - all child vnodes
-   * @param {RuntimeFiber<unknown>[]} childFibers - already materialized child fibers
+   * @param {ContextScope} childScope - scope for child nodes
    * @param {Promise<RuntimeFiber<unknown>>} pending - Promise for the current child
    * @param {number} pendingIdx - index of the current child
    * @returns {Promise<RuntimeFiber<P>>}
@@ -761,44 +1004,89 @@ export class GraphRuntime {
     engine: LifecycleEngine,
     vnode: VirtualServiceNode<P>,
     childVnodes: VirtualServiceNode[],
-    childFibers: RuntimeFiber<unknown>[],
+    childScope: ContextScope,
     pending: PromiseLike<RuntimeFiber<unknown>>,
     pendingIdx: number,
   ): Promise<RuntimeFiber<P>> {
-    const childScope = this.buildChildScope(instance, fiber.scope);
+    const journal = fiber.constructionJournal!;
 
-    childFibers.push(await pending);
+    try {
+      journal.mountedChildren.push(await pending);
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        await rollbackRes;
+      }
+      throw error;
+    }
 
     for (let i = pendingIdx + 1; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
-      const childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
-      childFibers.push(isThenable(childRes) ? await childRes : (childRes as RuntimeFiber<unknown>));
+      
+      try {
+        const childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
+        const resolvedChild = isThenable(childRes) ? await childRes : (childRes as RuntimeFiber<unknown>);
+        journal.mountedChildren.push(resolvedChild);
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+        if (isThenable(rollbackRes)) {
+          await rollbackRes;
+        }
+        throw error;
+      }
     }
 
-    fiber.children = childFibers as Fiber[];
+    fiber.children = journal.mountedChildren as Fiber[];
 
     if (vnode.ref !== undefined) {
-      (vnode.ref as RefObject<typeof instance>).current = instance;
+      try {
+        (vnode.ref as RefObject<typeof instance>).current = instance;
+        journal.refBound = true;
+        journal.refOwner = instance;
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+        if (isThenable(rollbackRes)) {
+          await rollbackRes;
+        }
+        throw error;
+      }
     }
 
-    this.attachEffectableRuntimeBusWiring(instance, fiber);
+    try {
+      this.attachEffectableRuntimeBusWiring(instance, fiber);
+      if (fiber.effectableRuntimeBusDisposer !== undefined) {
+        journal.busWiringAttached = true;
+      }
+    } catch (err) {
+      const rollbackRes = this.rollbackFailedMaterialization(
+        fiber,
+        err instanceof Error ? err : new Error(String(err)),
+      );
+      if (isThenable(rollbackRes)) {
+        await rollbackRes;
+      }
+      throw err;
+    }
 
     this.injectPreMountUpdateHook(instance, fiber);
     const startupRes = engine.runStartup(instance);
     const resolved = isThenable(startupRes) ? await startupRes : startupRes;
 
     if (!resolved.ok) {
-      for (const c of childFibers) {
-        const d = this.destroyFiber(c);
-        if (isThenable(d)) {
-          await d;
-        }
+      const error = resolved.error instanceof Error ? resolved.error : new Error(String(resolved.error));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        await rollbackRes;
       }
-      throw resolved.error;
+      throw error;
     }
 
     fiber.lifecycleStatus = engine.getStatus();
     fiber.effectTag = null;
+    journal.schedulerHookAttached = true;
     this.injectUpdateHook(instance, fiber);
     return fiber;
   }
@@ -809,70 +1097,35 @@ export class GraphRuntime {
    * @template P node props type
    * @param {RuntimeFiber<P>} fiber - fiber of the subtree root node
    * @param {LifecycleEngine} engine - lifecycle engine for this node
-   * @param {RuntimeFiber<unknown>[]} childFibers - already mounted child fibers (for rollback on error)
    * @param {PromiseLike<import('./lifecycle').LifecycleTransitionResult>} pendingStartup - Promise of the `runStartup` result
    * @returns {Promise<RuntimeFiber<P>>} ready fiber, or rollback children and rethrow
    */
   private async finalizeMaterializeAsync<P>(
     fiber: RuntimeFiber<P>,
     engine: LifecycleEngine,
-    childFibers: RuntimeFiber<unknown>[],
     pendingStartup: PromiseLike<import('./lifecycle').LifecycleTransitionResult>,
   ): Promise<RuntimeFiber<P>> {
     const result = await pendingStartup;
+    const journal = fiber.constructionJournal!;
 
     if (!result.ok) {
-      for (const c of childFibers) {
-        const d = this.destroyFiber(c);
-        if (isThenable(d)) {
-          await d;
-        }
+      const error = result.error instanceof Error ? result.error : new Error(String(result.error));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        await rollbackRes;
       }
-      throw result.error;
+      throw error;
     }
 
     fiber.lifecycleStatus = engine.getStatus();
     fiber.effectTag = null;
     if (fiber.instance !== null) {
+      journal.schedulerHookAttached = true;
       this.injectUpdateHook(fiber.instance, fiber);
     }
     return fiber;
   }
 
-  /**
-   * Unmounts already-mounted children when parent startup fails.
-   * Returns sync void if all demounts are sync, otherwise a Promise.
-   *
-   * @param {RuntimeFiber<unknown>[]} childFibers
-   * @returns {void | Promise<void>}
-   */
-  private destroyChildrenOnError (childFibers: RuntimeFiber<unknown>[]): void | Promise<void> {
-    let pending: PromiseLike<void> | null = null;
-    let startIdx = 0;
-
-    for (let i = 0; i < childFibers.length; i++) {
-      const d = this.destroyFiber(childFibers[i] as RuntimeFiber<unknown>);
-      if (isThenable(d)) {
-        pending = d;
-        startIdx = i + 1;
-        break;
-      }
-    }
-
-    if (pending === null) {
-      return;
-    }
-
-    return (async (): Promise<void> => {
-      await pending;
-      for (let i = startIdx; i < childFibers.length; i++) {
-        const d = this.destroyFiber(childFibers[i] as RuntimeFiber<unknown>);
-        if (isThenable(d)) {
-          await d;
-        }
-      }
-    })();
-  }
 
   // ---------------------------------------------------------------------------
   // Reconcile
