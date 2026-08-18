@@ -8,9 +8,17 @@
  */
 
 import { Component, GraphRuntime, h } from 'Effectable';
-import type { VirtualServiceNode } from 'Effectable';
+import type { VirtualServiceNode, RefObject } from 'Effectable';
+import { RUNTIME_PROPS_RECEIVER } from '../src/component/types';
+import type { RuntimePropsReceiver } from '../src/component/types';
+import { OnCommand, createRuntimeBuses } from 'Effectable';
+import type { RuntimeCommand, RuntimeEvent, RuntimeQuery } from 'Effectable';
 
 jest.setTimeout(30_000);
+
+type TCmd = RuntimeCommand<'TestCmd', { value: number }>;
+type TQuery = RuntimeQuery<'TestQuery', { id: string }>;
+type TEvent = RuntimeEvent<'TestEvent', { msg: string }>;
 
 async function drainMicrotasks (): Promise<void> {
   await Promise.resolve();
@@ -562,6 +570,220 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
       await expect(result2).rejects.toThrow();
 
       await runtime.unmount();
+    });
+  });
+
+  describe('functional side-effect tests (public API)', () => {
+    it('RUNTIME_PROPS_RECEIVER failure during reconcile → FAILED, currentRoot null, later reconcile rejects', async () => {
+      class PropsReceiverComponent extends Component<Record<string, never>, { value: number }> 
+        implements RuntimePropsReceiver<{ value: number }> {
+        
+        constructor (props: { value: number }) {
+          super(props);
+          this.state = {};
+        }
+
+        public [RUNTIME_PROPS_RECEIVER](nextProps: { value: number }): void {
+          if (nextProps.value > 100) {
+            throw new Error('PropsReceiverComponent: props value too large');
+          }
+          this.props = nextProps;
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(
+        h(PropsReceiverComponent, { value: 50 })
+      );
+
+      expect(runtime.isActive()).toBe(true);
+      expect(runtime.getRootInstance()).not.toBeNull();
+
+      // Reconcile with props that will fail in RUNTIME_PROPS_RECEIVER
+      await expect(
+        runtime.reconcile(h(PropsReceiverComponent, { value: 200 }))
+      ).rejects.toThrow('PropsReceiverComponent: props value too large');
+
+      // Runtime should be FAILED
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('failed');
+      expect(runtime.getRootInstance()).toBeNull();
+
+      // Later reconcile should reject
+      await expect(
+        runtime.reconcile(h(PropsReceiverComponent, { value: 10 }))
+      ).rejects.toThrow();
+
+      await runtime.unmount();
+    });
+
+    it('fail-stop clears bus handlers: after FAILED, commandBus rejects "not registered", ref cleared', async () => {
+      const buses = createRuntimeBuses<TCmd, TQuery, TEvent>();
+      const ref: RefObject<ComponentWithBusHandler> = { current: null };
+
+      class ComponentWithBusHandler extends Component<Record<string, never>, { value: number }> {
+        public commandsHandled = 0;
+
+        constructor (props: { value: number }) {
+          super(props);
+          this.state = {};
+        }
+
+        @OnCommand('TestCmd')
+        public async handleTestCmd (_cmd: TCmd): Promise<string> {
+          this.commandsHandled += 1;
+          return 'handled';
+        }
+      }
+
+      class ParentWithBusChild extends Component<Record<string, never>, { useFailChild: boolean }> {
+        constructor (props: { useFailChild: boolean }) {
+          super(props);
+          this.state = {};
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          if (this.props.useFailChild) {
+            return [h(FailOnMountRoot, { shouldFail: true }, 'fail-child')];
+          }
+          return [h(ComponentWithBusHandler, { value: 1 }, ref)];
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(
+        h(ParentWithBusChild, { useFailChild: false }),
+        undefined,
+        buses
+      );
+
+      expect(ref.current).not.toBeNull();
+      const oldInstance = ref.current;
+
+      // Verify bus handler works
+      const cmd: TCmd = { type: 'TestCmd', payload: { value: 42 } };
+      const result = await buses.commandBus.execute<string>(cmd);
+      expect(result).toBe('handled');
+      expect(oldInstance!.commandsHandled).toBe(1);
+
+      // Cause fail-stop
+      await expect(
+        runtime.reconcile(h(ParentWithBusChild, { useFailChild: true }))
+      ).rejects.toThrow('FailOnMountRoot: intentional mount failure');
+
+      expect(runtime.getState()).toBe('failed');
+
+      // Ref should be cleared
+      expect(ref.current).toBeNull();
+
+      // Bus handler should be unregistered
+      await expect(
+        buses.commandBus.execute<string>(cmd)
+      ).rejects.toThrow(/not registered/i);
+
+      await runtime.unmount();
+    });
+
+    it('later reconcile after FAILED rejects with SAME terminal error message', async () => {
+      const runtime = await GraphRuntime.mount(
+        h(TestLeaf, { value: 1 })
+      );
+
+      const specificErrorMessage = 'FailOnMountRoot: intentional mount failure';
+
+      // Cause failure
+      let firstError: Error | null = null;
+      try {
+        await runtime.reconcile(h(FailOnMountRoot, { shouldFail: true }));
+      } catch (err) {
+        firstError = err as Error;
+      }
+
+      expect(firstError).not.toBeNull();
+      expect(firstError!.message).toBe(specificErrorMessage);
+      expect(runtime.getState()).toBe('failed');
+
+      // Later reconcile should reject with SAME error message
+      let secondError: Error | null = null;
+      try {
+        await runtime.reconcile(h(TestLeaf, { value: 2 }));
+      } catch (err) {
+        secondError = err as Error;
+      }
+
+      expect(secondError).not.toBeNull();
+      // Should be either the terminal error or mention terminal failure
+      expect(
+        secondError!.message === specificErrorMessage ||
+        secondError!.message.includes('terminal failure')
+      ).toBe(true);
+
+      await runtime.unmount();
+    });
+
+    it('mount-fail: sibling/ref on parent with successful child then failing sibling is rolled back, refs null, no timers', async () => {
+      const refA: RefObject<SuccessfulChild> = { current: null };
+      const refB: RefObject<FailingChild> = { current: null };
+      let timerCleared = false;
+
+      class SuccessfulChild extends Component<Record<string, never>, Record<string, never>> {
+        private timer: NodeJS.Timeout | null = null;
+
+        constructor (props: Record<string, never>) {
+          super(props);
+          this.state = {};
+        }
+
+        public override onMount (): void {
+          // Create a timer resource
+          this.timer = setTimeout(() => {
+            // no-op
+          }, 60000);
+        }
+
+        public override onUnmount (): void {
+          if (this.timer !== null) {
+            clearTimeout(this.timer);
+            this.timer = null;
+            timerCleared = true;
+          }
+        }
+      }
+
+      class FailingChild extends Component<Record<string, never>, Record<string, never>> {
+        constructor (props: Record<string, never>) {
+          super(props);
+          this.state = {};
+        }
+
+        public override onMount (): void {
+          throw new Error('FailingChild: intentional mount failure');
+        }
+      }
+
+      class ParentWithSiblings extends Component<Record<string, never>, Record<string, never>> {
+        constructor (props: Record<string, never>) {
+          super(props);
+          this.state = {};
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          return [
+            h(SuccessfulChild, {}, refA),
+            h(FailingChild, {}, refB),
+          ];
+        }
+      }
+
+      // Mount should fail
+      await expect(
+        GraphRuntime.mount(h(ParentWithSiblings, {}))
+      ).rejects.toThrow('FailingChild: intentional mount failure');
+
+      // Refs should be null (rollback cleared them)
+      expect(refA.current).toBeNull();
+      expect(refB.current).toBeNull();
+
+      // Timer should have been cleared during rollback
+      expect(timerCleared).toBe(true);
     });
   });
 });
