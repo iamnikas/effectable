@@ -22,11 +22,11 @@ export type MapStateToProps<S, P = unknown, R = unknown> = (
 /**
  * mapDispatchToProps function: (dispatch, props) => object of callbacks merged into props.
  *
- * @template S - not used directly in the signature; kept for consistency with mapStateToProps
+ * @template _S - not used directly in the signature; kept for consistency with mapStateToProps
  * @template P - instance props type
  * @template A - store action union type
  */
-export type MapDispatchToPropsFunction<S, P, A extends Action = Action> = (
+export type MapDispatchToPropsFunction<_S, P, A extends Action = Action> = (
   dispatch: DispatchMethod<A>,
   props: P
 ) => unknown;
