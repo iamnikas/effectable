@@ -799,6 +799,223 @@ describe('GraphRuntime', () => {
       await runtime.unmount();
     });
 
+    it('issue #13: documented root usage — ContextProvider as root with explicit children', async () => {
+      // Test the exact contract from #13: h(ContextProvider, { value }, [h(Consumer)])
+      class DirectConsumer extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(NUMBER_TOKEN)
+        public injectedValue = -1;
+
+        public mountCalled = false;
+        public unmountCalled = false;
+        public receivedOnMount: number | undefined;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.mountCalled = true;
+          this.receivedOnMount = this.injectedValue;
+        }
+
+        public override onUnmount (): void {
+          this.unmountCalled = true;
+        }
+      }
+
+      // Direct mount: ContextProvider as root with child consumer
+      const consumerRef: RefObject<DirectConsumer> = { current: null };
+      const runtime = await GraphRuntime.mount(
+        h(ContextProvider, { value: [NUMBER_TOKEN, 123] }, [
+          h(DirectConsumer, {}, consumerRef),
+        ])
+      );
+
+      // Verify mount succeeded
+      expect(runtime.isActive()).toBe(true);
+      expect(consumerRef.current).not.toBeNull();
+
+      if (consumerRef.current === null) {
+        throw new Error('expected DirectConsumer to be mounted');
+      }
+
+      // Assert lifecycle: child onMount fired
+      expect(consumerRef.current.mountCalled).toBe(true);
+      // Assert value injection: child received provider value
+      expect(consumerRef.current.receivedOnMount).toBe(123);
+      expect(consumerRef.current.injectedValue).toBe(123);
+
+      await runtime.unmount();
+    });
+
+    it('issue #13: nested providers with different tokens — both consumers receive correct values', async () => {
+      const TOKEN_A = createContext<string>('TOKEN_A');
+      const TOKEN_B = createContext<number>('TOKEN_B');
+
+      class ConsumerA extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(TOKEN_A)
+        public injectedA!: string;
+
+        public receivedOnMount: string | undefined;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.receivedOnMount = this.injectedA;
+        }
+      }
+
+      class ConsumerB extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(TOKEN_B)
+        public injectedB!: number;
+
+        public receivedOnMount: number | undefined;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.receivedOnMount = this.injectedB;
+        }
+      }
+
+      const refA: RefObject<ConsumerA> = { current: null };
+      const refB: RefObject<ConsumerB> = { current: null };
+
+      // Nested providers: outer TOKEN_A, inner TOKEN_B
+      const runtime = await GraphRuntime.mount(
+        h(ContextProvider, { value: [TOKEN_A, 'outerValue'] }, [
+          h(ConsumerA, {}, refA),
+          h(ContextProvider, { value: [TOKEN_B, 999] }, [
+            h(ConsumerB, {}, refB),
+          ]),
+        ])
+      );
+
+      expect(refA.current).not.toBeNull();
+      expect(refB.current).not.toBeNull();
+
+      if (refA.current === null || refB.current === null) {
+        throw new Error('expected both consumers to be mounted');
+      }
+
+      // Consumer A receives TOKEN_A from outer provider
+      expect(refA.current.receivedOnMount).toBe('outerValue');
+      expect(refA.current.injectedA).toBe('outerValue');
+
+      // Consumer B receives TOKEN_B from inner provider
+      expect(refB.current.receivedOnMount).toBe(999);
+      expect(refB.current.injectedB).toBe(999);
+
+      await runtime.unmount();
+    });
+
+    it('issue #13: reconcile updates provider props — consumer retains initial injected value', async () => {
+      // Context injection happens once on mount, reconcile does not reinject
+      class ConsumerWithUpdate extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(NUMBER_TOKEN)
+        public injectedValue = -1;
+
+        public receivedOnMount: number | undefined;
+        public updateCalled = false;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.receivedOnMount = this.injectedValue;
+        }
+
+        public override onUpdate (): void {
+          this.updateCalled = true;
+        }
+      }
+
+      const consumerRef: RefObject<ConsumerWithUpdate> = { current: null };
+
+      // Mount with value 1
+      const runtime = await GraphRuntime.mount(
+        h(ContextProvider, { value: [NUMBER_TOKEN, 1] }, [
+          h(ConsumerWithUpdate, {}, consumerRef),
+        ])
+      );
+
+      expect(consumerRef.current).not.toBeNull();
+
+      if (consumerRef.current === null) {
+        throw new Error('expected ConsumerWithUpdate to be mounted');
+      }
+
+      expect(consumerRef.current.receivedOnMount).toBe(1);
+      expect(consumerRef.current.injectedValue).toBe(1);
+
+      // Reconcile with value 2
+      await runtime.reconcile(
+        h(ContextProvider, { value: [NUMBER_TOKEN, 2] }, [
+          h(ConsumerWithUpdate, {}, consumerRef),
+        ])
+      );
+
+      // Current behavior: context is injected once on mount, not updated on reconcile
+      // Consumer retains the initial value from mount
+      expect(consumerRef.current.injectedValue).toBe(1);
+      expect(consumerRef.current.receivedOnMount).toBe(1);
+
+      await runtime.unmount();
+    });
+
+    it('issue #13: unmount of provider tree — child onUnmount runs, ref cleared', async () => {
+      class ConsumerWithUnmount extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(NUMBER_TOKEN)
+        public injectedValue = -1;
+
+        public mountCalled = false;
+        public unmountCalled = false;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.mountCalled = true;
+        }
+
+        public override onUnmount (): void {
+          this.unmountCalled = true;
+        }
+      }
+
+      const consumerRef: RefObject<ConsumerWithUnmount> = { current: null };
+
+      const runtime = await GraphRuntime.mount(
+        h(ContextProvider, { value: [NUMBER_TOKEN, 456] }, [
+          h(ConsumerWithUnmount, {}, consumerRef),
+        ])
+      );
+
+      expect(consumerRef.current).not.toBeNull();
+
+      if (consumerRef.current === null) {
+        throw new Error('expected ConsumerWithUnmount to be mounted');
+      }
+
+      expect(consumerRef.current.mountCalled).toBe(true);
+      expect(consumerRef.current.unmountCalled).toBe(false);
+
+      // Store reference to verify unmount was called
+      const instance = consumerRef.current;
+
+      await runtime.unmount();
+
+      // After unmount: onUnmount was called, ref cleared
+      expect(instance.unmountCalled).toBe(true);
+      expect(consumerRef.current).toBeNull();
+    });
+
     it('ScopedConsumerParent: child NumberConsumer via ref receives the value from initialScope', async () => {
       const scope = extendScope(EMPTY_CONTEXT_SCOPE, NUMBER_TOKEN, 55);
 
