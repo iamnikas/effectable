@@ -1,6 +1,13 @@
 # https://lefthook.dev
 # Install hooks: npm run prepare  (or: npx lefthook install)
 
+pre-commit:
+  commands:
+    eslint:
+      glob: "*.{ts,tsx,js,cjs,mjs}"
+      run: npx --no -- eslint --fix {staged_files}
+      stage_fixed: true
+
 commit-msg:
   commands:
     commitlint:
