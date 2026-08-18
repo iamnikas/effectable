@@ -327,7 +327,7 @@ export function UseContext<T> (token: ContextToken<T>): PropertyDecorator {
  */
 export function getContextFields (
   componentClass: { [CONTEXT_FIELDS_META_KEY]?: ContextFieldMeta[] },
-): ContextFieldMeta[] {
+): readonly ContextFieldMeta[] {
   const fields = componentClass[CONTEXT_FIELDS_META_KEY];
   return fields === undefined ? [] : Object.freeze([...fields]);
 }

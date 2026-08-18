@@ -31,7 +31,7 @@ describe('Context decorator inheritance', () => {
         @UseContext(TEST_CONTEXT_A)
         protected contextA!: string;
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
@@ -41,8 +41,8 @@ describe('Context decorator inheritance', () => {
         protected contextB!: number;
       }
 
-      const baseFields = getContextFields(Base);
-      const derivedFields = getContextFields(Derived);
+      const baseFields = getContextFields(Base as any);
+      const derivedFields = getContextFields(Derived as any);
 
       expect(baseFields.length).toBe(1);
       expect(baseFields[0]?.propertyKey).toBe('contextA');
@@ -60,7 +60,7 @@ describe('Context decorator inheritance', () => {
         @UseContext(TEST_CONTEXT_A)
         public contextA!: string;
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
@@ -70,8 +70,8 @@ describe('Context decorator inheritance', () => {
         public contextB!: number;
       }
 
-      const baseFields = getContextFields(Base);
-      const derivedFields = getContextFields(Derived);
+      const baseFields = getContextFields(Base as any);
+      const derivedFields = getContextFields(Derived as any);
 
       expect(baseFields.length).toBe(1);
       expect(baseFields.find((f) => f.propertyKey === 'contextA')).toBeDefined();
@@ -86,7 +86,7 @@ describe('Context decorator inheritance', () => {
         @UseContext(TEST_CONTEXT_A)
         protected contextA!: string;
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
@@ -101,8 +101,8 @@ describe('Context decorator inheritance', () => {
         protected contextC!: boolean;
       }
 
-      const fieldsA = getContextFields(SiblingA);
-      const fieldsB = getContextFields(SiblingB);
+      const fieldsA = getContextFields(SiblingA as any);
+      const fieldsB = getContextFields(SiblingB as any);
 
       expect(fieldsA.length).toBe(2);
       expect(fieldsA.find((f) => f.propertyKey === 'contextA')).toBeDefined();
@@ -122,7 +122,7 @@ describe('Context decorator inheritance', () => {
         @UseContext(TEST_CONTEXT_A)
         public contextA!: string;
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
@@ -137,7 +137,7 @@ describe('Context decorator inheritance', () => {
         public contextC!: boolean;
       }
 
-      const fields = getContextFields(Child);
+      const fields = getContextFields(Child as any);
       expect(fields.length).toBe(3);
       expect(fields.find((f) => f.propertyKey === 'contextA')).toBeDefined();
       expect(fields.find((f) => f.propertyKey === 'contextB')).toBeDefined();
@@ -151,12 +151,12 @@ describe('Context decorator inheritance', () => {
         @UseContext(TEST_CONTEXT_A)
         public contextA!: string;
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
 
-      const fields = getContextFields(TestComponent);
+      const fields = getContextFields(TestComponent as any);
       expect(Object.isFrozen(fields)).toBe(true);
 
       expect(() => {
@@ -173,7 +173,7 @@ describe('Refs decorator inheritance', () => {
         @UseRef()
         public declare refA: RefObject<Component>;
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
@@ -183,8 +183,8 @@ describe('Refs decorator inheritance', () => {
         public declare refB: RefObject<Component>;
       }
 
-      const baseFields = getRefFields(Base);
-      const derivedFields = getRefFields(Derived);
+      const baseFields = getRefFields(Base as any);
+      const derivedFields = getRefFields(Derived as any);
 
       expect(baseFields.length).toBe(1);
       expect(baseFields[0]?.propertyKey).toBe('refA');
@@ -202,7 +202,7 @@ describe('Refs decorator inheritance', () => {
         @UseRef()
         public declare refBase: RefObject<Component>;
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
@@ -217,8 +217,8 @@ describe('Refs decorator inheritance', () => {
         public declare refB: RefObject<Component>;
       }
 
-      const fieldsA = getRefFields(SiblingA);
-      const fieldsB = getRefFields(SiblingB);
+      const fieldsA = getRefFields(SiblingA as any);
+      const fieldsB = getRefFields(SiblingB as any);
 
       expect(fieldsA.length).toBe(2);
       expect(fieldsA.find((f) => f.propertyKey === 'refBase')).toBeDefined();
@@ -240,7 +240,7 @@ describe('Refs decorator inheritance', () => {
           return 'a';
         }
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
@@ -252,8 +252,8 @@ describe('Refs decorator inheritance', () => {
         }
       }
 
-      const baseMethods = getImperativeHandleMethods(Base);
-      const derivedMethods = getImperativeHandleMethods(Derived);
+      const baseMethods = getImperativeHandleMethods(Base as any);
+      const derivedMethods = getImperativeHandleMethods(Derived as any);
 
       expect(baseMethods.length).toBe(1);
       expect(baseMethods[0]?.methodKey).toBe('methodA');
@@ -273,7 +273,7 @@ describe('Refs decorator inheritance', () => {
           return 'base';
         }
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
@@ -292,8 +292,8 @@ describe('Refs decorator inheritance', () => {
         }
       }
 
-      const methodsA = getImperativeHandleMethods(SiblingA);
-      const methodsB = getImperativeHandleMethods(SiblingB);
+      const methodsA = getImperativeHandleMethods(SiblingA as any);
+      const methodsB = getImperativeHandleMethods(SiblingB as any);
 
       expect(methodsA.length).toBe(2);
       expect(methodsA.find((m) => m.methodKey === 'baseMethod')).toBeDefined();
@@ -318,7 +318,7 @@ describe('Refs decorator inheritance', () => {
           return 'grandparent';
         }
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
@@ -343,13 +343,13 @@ describe('Refs decorator inheritance', () => {
         }
       }
 
-      const refs = getRefFields(Child);
+      const refs = getRefFields(Child as any);
       expect(refs.length).toBe(3);
       expect(refs.find((r) => r.propertyKey === 'refGrandParent')).toBeDefined();
       expect(refs.find((r) => r.propertyKey === 'refParent')).toBeDefined();
       expect(refs.find((r) => r.propertyKey === 'refChild')).toBeDefined();
 
-      const methods = getImperativeHandleMethods(Child);
+      const methods = getImperativeHandleMethods(Child as any);
       expect(methods.length).toBe(3);
       expect(methods.find((m) => m.methodKey === 'grandParentMethod')).toBeDefined();
       expect(methods.find((m) => m.methodKey === 'parentMethod')).toBeDefined();
@@ -363,12 +363,12 @@ describe('Refs decorator inheritance', () => {
         @UseRef()
         public declare ref: RefObject<Component>;
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
 
-      const fields = getRefFields(TestComponent);
+      const fields = getRefFields(TestComponent as any);
       expect(Object.isFrozen(fields)).toBe(true);
 
       expect(() => {
@@ -383,12 +383,12 @@ describe('Refs decorator inheritance', () => {
           // test method
         }
 
-        public compose (): null {
+        public override compose (): null {
           return null;
         }
       }
 
-      const methods = getImperativeHandleMethods(TestComponent);
+      const methods = getImperativeHandleMethods(TestComponent as any);
       expect(Object.isFrozen(methods)).toBe(true);
 
       expect(() => {

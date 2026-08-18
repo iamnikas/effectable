@@ -183,7 +183,7 @@ describe('BusDecorators metadata inheritance', () => {
       wireRuntimeBuses(derivedInstance, buses);
 
       expect(baseInstance.commandBus).toBe(buses.commandBus);
-      expect((baseInstance as Record<string, unknown>)['queryBus']).toBeUndefined();
+      expect((baseInstance as any)['queryBus']).toBeUndefined();
 
       expect(derivedInstance.commandBus).toBe(buses.commandBus);
       expect(derivedInstance.queryBus).toBe(buses.queryBus);
