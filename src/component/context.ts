@@ -286,19 +286,16 @@ export function UseContext<T> (token: ContextToken<T>): PropertyDecorator {
       [HAS_CONTEXT_FIELDS_KEY]?: true;
     };
 
-    if (!Array.isArray(constructor[CONTEXT_FIELDS_META_KEY])) {
-      constructor[CONTEXT_FIELDS_META_KEY] = [];
-    }
+    const current = constructor[CONTEXT_FIELDS_META_KEY];
+    const isInherited = current !== undefined && !Object.hasOwn(constructor, CONTEXT_FIELDS_META_KEY);
 
-    // Set the fast-path flag when registering the first field
+    const next = isInherited ? [...current] : (current ?? []);
+    next.push({ propertyKey, token: token as ContextToken<unknown> });
+
+    constructor[CONTEXT_FIELDS_META_KEY] = next;
+
     if (!constructor[HAS_CONTEXT_FIELDS_KEY]) {
       constructor[HAS_CONTEXT_FIELDS_KEY] = true;
-    }
-
-    const existing = constructor[CONTEXT_FIELDS_META_KEY];
-
-    if (existing !== undefined) {
-      existing.push({ propertyKey, token: token as ContextToken<unknown> });
     }
   };
 }
@@ -312,8 +309,9 @@ export function UseContext<T> (token: ContextToken<T>): PropertyDecorator {
  */
 export function getContextFields (
   componentClass: { [CONTEXT_FIELDS_META_KEY]?: ContextFieldMeta[] },
-): ContextFieldMeta[] {
-  return componentClass[CONTEXT_FIELDS_META_KEY] ?? [];
+): readonly ContextFieldMeta[] {
+  const fields = componentClass[CONTEXT_FIELDS_META_KEY];
+  return fields === undefined ? [] : [...fields];
 }
 
 /**
