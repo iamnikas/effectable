@@ -2724,7 +2724,7 @@ describe('GraphRuntime', () => {
 
       class PoolDepthNode extends Component<Record<string, never>, { depth: number; tick: number; path: string }> {
         @UseRef()
-        private declare childRef: RefObject<PoolDepthLeaf | PoolDepthNode>;
+        private declare childRef: RefObject<PoolDepthNode>;
 
         constructor (props: { depth: number; tick: number; path: string }) {
           super(props);
