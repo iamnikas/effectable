@@ -128,8 +128,12 @@ export interface BootstrapHandle<
   reconcile(): Promise<void>;
   /**
    * Idempotently shuts down the root runtime: unmounts the tree and clears owned buses.
+   * Issue #20: accepts optional `rejectOnCleanupError` to make teardown errors observable.
+   * Default behavior remains non-breaking: resolves even with cleanup errors.
    *
+   * @param {object} [options] - shutdown options
+   * @param {boolean} [options.rejectOnCleanupError=false] - reject on cleanup errors
    * @returns {Promise<void>}
    */
-  shutdown(): Promise<void>;
+  shutdown(options?: { rejectOnCleanupError?: boolean }): Promise<void>;
 }

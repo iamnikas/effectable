@@ -913,8 +913,8 @@ describe('GraphRuntime', () => {
       await runtime.unmount();
     });
 
-    it('issue #13: reconcile updates provider props — consumer retains initial injected value', async () => {
-      // Context injection happens once on mount, reconcile does not reinject
+    it('issue #13: reconcile updates provider props — consumer receives updated value (issue #15 fixed)', async () => {
+      // Context injection happens on mount AND on reconcile when provider value changes (issue #15)
       class ConsumerWithUpdate extends Component<Record<string, never>, Record<string, never>> {
         @UseContext(NUMBER_TOKEN)
         public injectedValue = -1;
@@ -960,10 +960,11 @@ describe('GraphRuntime', () => {
         ])
       );
 
-      // Current behavior: context is injected once on mount, not updated on reconcile
-      // Consumer retains the initial value from mount
-      expect(consumerRef.current.injectedValue).toBe(1);
+      // Fixed behavior (issue #15): context is re-injected on reconcile when provider value changes
+      // Consumer receives the updated value and onUpdate is called
+      expect(consumerRef.current.injectedValue).toBe(2);
       expect(consumerRef.current.receivedOnMount).toBe(1);
+      expect(consumerRef.current.updateCalled).toBe(true);
 
       await runtime.unmount();
     });
