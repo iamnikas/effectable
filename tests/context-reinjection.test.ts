@@ -596,4 +596,273 @@ describe('Issue #15: context re-injection on update', () => {
 
     await runtime.unmount();
   });
+
+  it('same-scope skip: props-only update does not re-resolve context', async () => {
+    class Consumer extends Component<Record<string, never>, { label: string }> {
+      @UseContext(TEST_CONTEXT)
+      public contextValue = -1;
+
+      public onUpdateCallCount = 0;
+      public lastPropsLabel: string | undefined;
+
+      constructor (props: { label: string }) {
+        super(props);
+      }
+
+      public override onUpdate (): void {
+        this.onUpdateCallCount += 1;
+        this.lastPropsLabel = this.props.label;
+      }
+    }
+
+    class Root extends Component<Record<string, never>, { consumerLabel: string }> {
+      @UseRef()
+      private declare consumerRef: RefObject<Consumer>;
+
+      constructor (props: { consumerLabel: string }) {
+        super(props);
+      }
+
+      public getConsumerRef (): RefObject<Consumer> {
+        return this.consumerRef;
+      }
+
+      public override compose (): VirtualServiceNode[] {
+        return [
+          h(ContextProvider, { value: [TEST_CONTEXT, 100] }, [
+            h(Consumer, { label: this.props.consumerLabel }, this.consumerRef),
+          ]),
+        ];
+      }
+    }
+
+    const runtime = await GraphRuntime.mount(h(Root, { consumerLabel: 'a' }));
+
+    const root = runtime.getRootInstance() as Root | null;
+    expect(root).not.toBeNull();
+
+    const consumerRef = root!.getConsumerRef();
+    expect(consumerRef.current).not.toBeNull();
+
+    const initialContextValue = consumerRef.current!.contextValue;
+    expect(initialContextValue).toBe(100);
+    expect(consumerRef.current!.onUpdateCallCount).toBe(0);
+
+    await runtime.reconcile(h(Root, { consumerLabel: 'b' }));
+
+    expect(consumerRef.current!.contextValue).toBe(initialContextValue);
+    expect(consumerRef.current!.lastPropsLabel).toBe('b');
+    expect(consumerRef.current!.onUpdateCallCount).toBe(1);
+
+    await runtime.unmount();
+  });
+
+  it('same-scope skip: local setState does not re-resolve context', async () => {
+    class Consumer extends Component<{ count: number }, Record<string, never>> {
+      @UseContext(TEST_CONTEXT)
+      public contextValue = -1;
+
+      public onUpdateCallCount = 0;
+
+      constructor (props: Record<string, never>) {
+        super(props, { count: 0 });
+      }
+
+      public increment (): void {
+        this.setState({ count: this.state.count + 1 });
+      }
+
+      public override onUpdate (): void {
+        this.onUpdateCallCount += 1;
+      }
+    }
+
+    class Root extends Component<Record<string, never>, Record<string, never>> {
+      @UseRef()
+      private declare consumerRef: RefObject<Consumer>;
+
+      constructor () {
+        super({});
+      }
+
+      public getConsumerRef (): RefObject<Consumer> {
+        return this.consumerRef;
+      }
+
+      public override compose (): VirtualServiceNode[] {
+        return [
+          h(ContextProvider, { value: [TEST_CONTEXT, 100] }, [
+            h(Consumer, {}, this.consumerRef),
+          ]),
+        ];
+      }
+    }
+
+    const runtime = await GraphRuntime.mount(h(Root, {}));
+
+    const root = runtime.getRootInstance() as Root | null;
+    expect(root).not.toBeNull();
+
+    const consumerRef = root!.getConsumerRef();
+    expect(consumerRef.current).not.toBeNull();
+
+    const initialContextValue = consumerRef.current!.contextValue;
+    expect(initialContextValue).toBe(100);
+    expect(consumerRef.current!.state.count).toBe(0);
+
+    consumerRef.current!.increment();
+    await new Promise((resolve) => queueMicrotask(resolve));
+
+    expect(consumerRef.current!.state.count).toBe(1);
+    expect(consumerRef.current!.contextValue).toBe(initialContextValue);
+    expect(consumerRef.current!.onUpdateCallCount).toBe(1);
+
+    await runtime.unmount();
+  });
+
+  it('consumer deleted in same reconcile as provider value change', async () => {
+    class Consumer extends Component<Record<string, never>, { id: string }> {
+      @UseContext(TEST_CONTEXT)
+      public contextValue = -1;
+
+      public mountCount = 0;
+
+      constructor (props: { id: string }) {
+        super(props);
+      }
+
+      public override onMount (): void {
+        this.mountCount += 1;
+      }
+    }
+
+    class Root extends Component<Record<string, never>, { consumerIds: string[]; providerValue: number }> {
+      @UseRef()
+      private declare consumer1Ref: RefObject<Consumer>;
+
+      @UseRef()
+      private declare consumer2Ref: RefObject<Consumer>;
+
+      constructor (props: { consumerIds: string[]; providerValue: number }) {
+        super(props);
+      }
+
+      public getConsumer1Ref (): RefObject<Consumer> {
+        return this.consumer1Ref;
+      }
+
+      public getConsumer2Ref (): RefObject<Consumer> {
+        return this.consumer2Ref;
+      }
+
+      public override compose (): VirtualServiceNode[] {
+        const consumers: VirtualServiceNode[] = [];
+
+        if (this.props.consumerIds.includes('c1')) {
+          consumers.push(h(Consumer, { id: 'c1' }, this.consumer1Ref, 'c1'));
+        }
+
+        if (this.props.consumerIds.includes('c2')) {
+          consumers.push(h(Consumer, { id: 'c2' }, this.consumer2Ref, 'c2'));
+        }
+
+        return [
+          h(ContextProvider, { value: [TEST_CONTEXT, this.props.providerValue] }, consumers),
+        ];
+      }
+    }
+
+    const runtime = await GraphRuntime.mount(h(Root, { consumerIds: ['c1', 'c2'], providerValue: 10 }));
+
+    const root = runtime.getRootInstance() as Root | null;
+    expect(root).not.toBeNull();
+
+    const consumer1Ref = root!.getConsumer1Ref();
+    const consumer2Ref = root!.getConsumer2Ref();
+    expect(consumer1Ref.current).not.toBeNull();
+    expect(consumer2Ref.current).not.toBeNull();
+
+    expect(consumer1Ref.current!.contextValue).toBe(10);
+    expect(consumer2Ref.current!.contextValue).toBe(10);
+    expect(consumer1Ref.current!.mountCount).toBe(1);
+    expect(consumer2Ref.current!.mountCount).toBe(1);
+
+    await runtime.reconcile(h(Root, { consumerIds: ['c1'], providerValue: 20 }));
+
+    expect(consumer1Ref.current).not.toBeNull();
+    expect(consumer1Ref.current!.contextValue).toBe(20);
+    expect(consumer1Ref.current!.mountCount).toBe(1);
+
+    expect(consumer2Ref.current).toBeNull();
+
+    await runtime.unmount();
+  });
+
+  it('same token value identity after scope change does not extra-fire context onUpdate', async () => {
+    const sharedValue = { id: 42 };
+
+    class Consumer extends Component<Record<string, never>, { key: string }> {
+      @UseContext(TEST_CONTEXT_A)
+      public contextValue: unknown = null;
+
+      public onUpdateCallCount = 0;
+      public mountCount = 0;
+
+      constructor (props: { key: string }) {
+        super(props);
+      }
+
+      public override onMount (): void {
+        this.mountCount += 1;
+      }
+
+      public override onUpdate (): void {
+        this.onUpdateCallCount += 1;
+      }
+    }
+
+    const stableProps = { key: 'stable' };
+    const stableValue = [TEST_CONTEXT_A, sharedValue] as [typeof TEST_CONTEXT_A, typeof sharedValue];
+
+    class Root extends Component<Record<string, never>, { dummyProp: number }> {
+      @UseRef()
+      private declare consumerRef: RefObject<Consumer>;
+
+      constructor (props: { dummyProp: number }) {
+        super(props);
+      }
+
+      public getConsumerRef (): RefObject<Consumer> {
+        return this.consumerRef;
+      }
+
+      public override compose (): VirtualServiceNode[] {
+        return [
+          h(ContextProvider, { value: stableValue }, [
+            h(Consumer, stableProps, this.consumerRef),
+          ]),
+        ];
+      }
+    }
+
+    const runtime = await GraphRuntime.mount(h(Root, { dummyProp: 1 }));
+
+    const root = runtime.getRootInstance() as Root | null;
+    expect(root).not.toBeNull();
+
+    const consumerRef = root!.getConsumerRef();
+    expect(consumerRef.current).not.toBeNull();
+
+    expect(consumerRef.current!.contextValue).toBe(sharedValue);
+    expect(consumerRef.current!.mountCount).toBe(1);
+    expect(consumerRef.current!.onUpdateCallCount).toBe(0);
+
+    await runtime.reconcile(h(Root, { dummyProp: 2 }));
+
+    expect(consumerRef.current!.contextValue).toBe(sharedValue);
+    expect(consumerRef.current!.mountCount).toBe(1);
+    expect(consumerRef.current!.onUpdateCallCount).toBe(0);
+
+    await runtime.unmount();
+  });
 });
