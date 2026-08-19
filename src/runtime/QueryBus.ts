@@ -17,7 +17,7 @@ export class QueryBus<TQuery extends RuntimeQuery = RuntimeQuery> {
    *
    * @param {TQuery['type']} queryType - query type
    * @param {QueryHandler<TQuery, TResult>} handler - query handler
-   * @returns {() => void} unregister function
+   * @returns {() => void} unregister function; no-op if a different handler is now registered for the type
    * @throws {Error} if a handler is already registered
    */
   public register<TResult> (
@@ -28,9 +28,12 @@ export class QueryBus<TQuery extends RuntimeQuery = RuntimeQuery> {
       throw new Error(`Query handler is already registered: ${queryType}`);
     }
 
-    this.handlers.set(queryType, handler as QueryHandler<TQuery, unknown>);
+    const registered = handler as QueryHandler<TQuery, unknown>;
+    this.handlers.set(queryType, registered);
     return () => {
-      this.unregister(queryType);
+      if (this.handlers.get(queryType) === registered) {
+        this.handlers.delete(queryType);
+      }
     };
   }
 
