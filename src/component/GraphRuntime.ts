@@ -351,7 +351,7 @@ export class GraphRuntime {
   /**
    * Identity-safe ref clearing: clears ref.current only if it still points to the expected owner.
    * Prevents an old rollback from clearing a ref that a newer materialization already reused.
-   * Partial foundation for #17 (complete decorator-backed ref storage is out of scope for #12).
+   * Issue #17: No cast required (Component | null → unknown | null is assignable).
    *
    * @param {RefObject<unknown>} ref - ref object
    * @param {Component<unknown, unknown>} expectedOwner - expected current owner
@@ -364,9 +364,46 @@ export class GraphRuntime {
   }
 
   /**
+   * Centralized ref ownership transition (issue #17).
+   * Handles every ref binding/clearing operation: add, remove, replace.
+   * 
+   * Rules:
+   * - Clear previousRef only if it still points to expectedPreviousOwner (identity-safe).
+   * - Bind nextRef to instance if nextRef is provided.
+   * - previousRef and nextRef can be the same object (ref reuse) or different (ref swap).
+   * - Do not let an old disposer clear a newer owner.
+   * 
+   * No casts: Component | null → unknown | null is assignable (widening).
+   * 
+   * @param {RefObject<unknown> | undefined} previousRef - ref to clear (can be undefined if no previous ref)
+   * @param {Component<unknown, unknown> | null} expectedPreviousOwner - expected owner of previousRef (null if unknown)
+   * @param {RefObject<unknown> | undefined} nextRef - ref to bind to instance (can be undefined if removing ref)
+   * @param {Component<unknown, unknown> | null} instance - instance to bind nextRef to (null when clearing only)
+   * @returns {void}
+   */
+  private commitRef (
+    previousRef: RefObject<unknown> | undefined,
+    expectedPreviousOwner: Component<unknown, unknown> | null,
+    nextRef: RefObject<unknown> | undefined,
+    instance: Component<unknown, unknown> | null,
+  ): void {
+    // Clear previous ref if it's different from next (ref swap) or if next is undefined (ref removal)
+    if (previousRef !== undefined && previousRef !== nextRef && expectedPreviousOwner !== null) {
+      this.clearRefSafe(previousRef, expectedPreviousOwner);
+    }
+    
+    // Bind next ref to instance (Component | null → unknown | null, no cast)
+    if (nextRef !== undefined) {
+      nextRef.current = instance;
+    }
+  }
+
+  /**
    * Finalize fiber destroy: dispose wiring, clear ref, update status.
    * Collects errors when collectErrors is provided (best-effort cleanup).
    * When collectErrors is null, errors are thrown immediately.
+   * 
+   * Issue #17: Uses commitRef for identity-safe ref clearing.
    *
    * @param {RuntimeFiber<unknown>} fiber - fiber being finalized
    * @param {Error[] | null} collectErrors - array to collect errors (null to throw)
@@ -384,17 +421,18 @@ export class GraphRuntime {
       this.disposeEffectableRuntimeBusWiring(fiber);
     }
 
-    // Clear ref
+    // Clear ref via commitRef (issue #17: identity-safe clearing)
     const ref = fiber.vnode.ref;
-    if (ref !== undefined) {
+    const instance = fiber.instance;
+    if (ref !== undefined && instance !== null) {
       if (collectErrors !== null) {
         try {
-          ref.current = null;
+          this.commitRef(ref, instance, undefined, null);
         } catch (err: unknown) {
           collectErrors.push(err instanceof Error ? err : new Error(String(err)));
         }
       } else {
-        ref.current = null;
+        this.commitRef(ref, instance, undefined, null);
       }
     }
 
@@ -451,10 +489,10 @@ export class GraphRuntime {
       }
     }
 
-    // 3. Clear bound ref (identity-safe)
+    // 3. Clear bound ref (identity-safe, issue #17)
     if (journal.refBound === true && fiber.vnode.ref !== undefined && journal.refOwner !== undefined) {
       try {
-        this.clearRefSafe(fiber.vnode.ref, journal.refOwner);
+        this.commitRef(fiber.vnode.ref, journal.refOwner, undefined, null);
       } catch (err: unknown) {
         cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
       }
@@ -1311,10 +1349,10 @@ export class GraphRuntime {
 
     fiber.children = fiber.constructionJournal!.mountedChildren as Fiber[];
 
-    // Bind ref to the instance
+    // Bind ref to the instance (issue #17: centralized via commitRef)
     if (vnode.ref !== undefined) {
       try {
-        (vnode.ref as RefObject<typeof instance>).current = instance;
+        this.commitRef(undefined, null, vnode.ref, instance);
         fiber.constructionJournal!.refBound = true;
         fiber.constructionJournal!.refOwner = instance;
       } catch (err: unknown) {
@@ -1432,7 +1470,7 @@ export class GraphRuntime {
 
     if (vnode.ref !== undefined) {
       try {
-        (vnode.ref as RefObject<typeof instance>).current = instance;
+        this.commitRef(undefined, null, vnode.ref, instance);
         journal.refBound = true;
         journal.refOwner = instance;
       } catch (err: unknown) {
@@ -1625,10 +1663,8 @@ export class GraphRuntime {
       }
     }
 
-    // Update ref
-    if (nextVnode.ref !== undefined) {
-      (nextVnode.ref as RefObject<typeof instance>).current = instance;
-    }
+    // Commit ref transition: clear old ref if changed, bind new ref (issue #17)
+    this.commitRef(current.vnode.ref, instance, nextVnode.ref, instance);
 
     // Reconcile child nodes (sync fast-path if all children are sync).
     let nextChildVnodes: VirtualServiceNode[];
@@ -2154,6 +2190,7 @@ export class GraphRuntime {
     }
 
     // Always finalize the fiber even if shutdown failed (best-effort cleanup)
+    // Issue #17: finalizeFiberDestroy uses commitRef for identity-safe ref clearing
     this.finalizeFiberDestroy(fiber, collectErrors);
   }
 
@@ -2224,6 +2261,7 @@ export class GraphRuntime {
     }
 
     // Always finalize even if shutdown failed
+    // Issue #17: finalizeFiberDestroy uses commitRef for identity-safe ref clearing
     this.finalizeFiberDestroy(fiber, collectErrors);
   }
 
@@ -2252,6 +2290,7 @@ export class GraphRuntime {
     }
 
     // Always finalize even if shutdown failed
+    // Issue #17: finalizeFiberDestroy uses commitRef for identity-safe ref clearing
     this.finalizeFiberDestroy(fiber, collectErrors);
   }
 

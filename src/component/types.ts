@@ -64,6 +64,10 @@ export interface Disposable {
 /**
  * Typed ref object for accessing a component instance from a parent.
  * Filled by GraphRuntime when the node mounts.
+ *
+ * Covariant in practice (writable data property). Do not add `in out T` — that would
+ * reject `RefObject<Child>` at every `h(..., childRef)` unless `h` is generic in the
+ * same change; we are not branding {@link RefObject}.
  */
 export interface RefObject<T> {
   /** Current component instance (null before mount or after unmount). */
@@ -72,8 +76,15 @@ export interface RefObject<T> {
 
 /**
  * Typed component constructor.
+ *
+ * Optional second type parameter `C` carries the instance type (for `h()` ref checking).
+ * Default keeps `ComponentConstructor<P>` meaning `new (props: P) => Component<unknown, P>`
+ * so GraphRuntime / mount signatures stay unchanged.
  */
-export type ComponentConstructor<P = unknown> = new (props: P) => Component<unknown, P>;
+export type ComponentConstructor<
+  P = unknown,
+  C extends Component<unknown, P> = Component<unknown, P>,
+> = new (props: P) => C;
 
 /**
  * Virtual service-tree node — a declarative component description for GraphRuntime.
