@@ -163,6 +163,9 @@ export class ContextProvider extends Component<
   Record<string, unknown>,
   ContextProviderProps
 > {
+  private lastParentScope: ContextScope | undefined = undefined;
+  private lastChildScope: ContextScope | undefined = undefined;
+
   /**
    * @param {ContextProviderProps} props - token–value pairs for the subtree
    */
@@ -178,6 +181,9 @@ export class ContextProvider extends Component<
    * build a fresh `Map` without `new Map(parentScope)` (avoids an extra entry walk).
    * A single pair in array form — delegates to {@link extendScope} (same path as one pair in props).
    *
+   * Optimization (issue #40): when the parent scope identity is unchanged and all token/value pairs
+   * are identical, return the cached child scope to enable the #15 skip (current.scope === parentScope).
+   *
    * @param {ContextScope} parentScope - scope inherited from ancestors
    * @returns {ContextScope} scope for this provider's child components
    */
@@ -191,34 +197,79 @@ export class ContextProvider extends Component<
       );
     }
 
+    // Fast path: if parent scope ref is the same and all pairs are identical, return cached child scope
+    if (
+      this.lastChildScope !== undefined &&
+      this.lastParentScope === parentScope &&
+      this.arePairsIdentical(value, this.lastChildScope)
+    ) {
+      return this.lastChildScope;
+    }
+
+    let next: ContextScope;
+
     if (Array.isArray(value) && Array.isArray(value[0])) {
       const pairs = value as Array<[ContextToken<unknown>, unknown]>;
       const n = pairs.length;
 
       if (n === 1) {
         const p = pairs[0] as [ContextToken<unknown>, unknown];
-        return extendScope(parentScope, p[0], p[1]);
-      }
-
-      let next: Map<symbol, unknown>;
-
-      if (parentScope.size === 0) {
-        next = new Map();
+        next = extendScope(parentScope, p[0], p[1]);
       } else {
-        next = new Map(parentScope);
-      }
+        let nextMap: Map<symbol, unknown>;
 
-      for (let i = 0; i < n; i += 1) {
-        const p = pairs[i] as [ContextToken<unknown>, unknown];
-        next.set(p[0].key, p[1]);
-      }
+        if (parentScope.size === 0) {
+          nextMap = new Map();
+        } else {
+          nextMap = new Map(parentScope);
+        }
 
-      return next;
+        for (let i = 0; i < n; i += 1) {
+          const p = pairs[i] as [ContextToken<unknown>, unknown];
+          nextMap.set(p[0].key, p[1]);
+        }
+
+        next = nextMap;
+      }
+    } else {
+      // Single pair: [token, value]
+      const [token, val] = value as [ContextToken<unknown>, unknown];
+      next = extendScope(parentScope, token, val);
+    }
+
+    this.lastParentScope = parentScope;
+    this.lastChildScope = next;
+    return next;
+  }
+
+  /**
+   * Checks if all token/value pairs in `value` match the entries in `cachedScope`.
+   * Compares both token.key presence and value identity (===).
+   *
+   * @param {ContextProviderProps['value']} value - current props.value
+   * @param {ContextScope} cachedScope - last returned child scope
+   * @returns {boolean} true if all pairs match
+   */
+  private arePairsIdentical (
+    value: ContextProviderProps['value'],
+    cachedScope: ContextScope,
+  ): boolean {
+    if (Array.isArray(value) && Array.isArray(value[0])) {
+      const pairs = value as Array<[ContextToken<unknown>, unknown]>;
+      for (let i = 0; i < pairs.length; i += 1) {
+        const [token, val] = pairs[i] as [ContextToken<unknown>, unknown];
+        const key = token.key;
+        if (!cachedScope.has(key) || cachedScope.get(key) !== val) {
+          return false;
+        }
+      }
+      return true;
     }
 
     // Single pair: [token, value]
     const [token, val] = value as [ContextToken<unknown>, unknown];
-    return extendScope(parentScope, token, val);
+    const key = token.key;
+    return cachedScope.has(key) && cachedScope.get(key) === val;
   }
 }
 

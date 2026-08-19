@@ -807,3 +807,260 @@ describe('Issue #15: context re-injection on update', () => {
     await runtime.unmount();
   });
 });
+
+describe('Issue #40: ContextProvider scope identity caching', () => {
+  it('applyToScope returns same Map identity when parent and pairs are unchanged', () => {
+    const TOKEN = createContext<number>('test');
+    const VALUE = 42;
+    const parentScope = new Map<symbol, unknown>();
+
+    const provider = new ContextProvider({ value: [TOKEN, VALUE] });
+
+    const childScope1 = provider.applyToScope(parentScope);
+    const childScope2 = provider.applyToScope(parentScope);
+
+    expect(childScope1).toBe(childScope2);
+  });
+
+  it('applyToScope returns new Map when parent scope changes', () => {
+    const TOKEN = createContext<number>('test');
+    const VALUE = 42;
+    const parentScope1 = new Map<symbol, unknown>();
+    const parentScope2 = new Map<symbol, unknown>();
+
+    const provider = new ContextProvider({ value: [TOKEN, VALUE] });
+
+    const childScope1 = provider.applyToScope(parentScope1);
+    const childScope2 = provider.applyToScope(parentScope2);
+
+    expect(childScope1).not.toBe(childScope2);
+  });
+
+  it('applyToScope returns new Map when value changes', () => {
+    const TOKEN = createContext<number>('test');
+    const parentScope = new Map<symbol, unknown>();
+
+    const provider1 = new ContextProvider({ value: [TOKEN, 42] });
+
+    const childScope1 = provider1.applyToScope(parentScope);
+    
+    // Simulate UPDATE by changing props
+    (provider1 as unknown as { props: { value: [typeof TOKEN, number] } }).props = { value: [TOKEN, 43] };
+    const childScope2 = provider1.applyToScope(parentScope);
+
+    expect(childScope1).not.toBe(childScope2);
+  });
+
+  it('applyToScope with multiple pairs returns same Map when unchanged', () => {
+    const TOKEN_A = createContext<string>('token_a');
+    const TOKEN_B = createContext<number>('token_b');
+    const VALUE_A = 'hello';
+    const VALUE_B = 42;
+    const parentScope = new Map<symbol, unknown>();
+
+    const provider = new ContextProvider({
+      value: [
+        [TOKEN_A, VALUE_A],
+        [TOKEN_B, VALUE_B],
+      ],
+    });
+
+    const childScope1 = provider.applyToScope(parentScope);
+    const childScope2 = provider.applyToScope(parentScope);
+
+    expect(childScope1).toBe(childScope2);
+  });
+
+  it('same-value reconcile does not trigger consumer onUpdate (duplicate check)', async () => {
+    const sharedValue = { id: 100 };
+
+    class Consumer extends Component<Record<string, never>, { key: string }> {
+      @UseContext(TEST_CONTEXT_A)
+      public contextValue: unknown = null;
+
+      public onUpdateCallCount = 0;
+      public mountCount = 0;
+
+      constructor (props: { key: string }) {
+        super(props);
+      }
+
+      public override onMount (): void {
+        this.mountCount += 1;
+      }
+
+      public override onUpdate (): void {
+        this.onUpdateCallCount += 1;
+      }
+    }
+
+    const stableProps = { key: 'stable-test' };
+    const stableValue = [TEST_CONTEXT_A, sharedValue] as [typeof TEST_CONTEXT_A, typeof sharedValue];
+
+    class Root extends Component<Record<string, never>, { dummyProp: number }> {
+      @UseRef()
+      private declare consumerRef: RefObject<Consumer>;
+
+      constructor (props: { dummyProp: number }) {
+        super(props);
+      }
+
+      public getConsumerRef (): RefObject<Consumer> {
+        return this.consumerRef;
+      }
+
+      public override compose (): VirtualServiceNode[] {
+        return [
+          h(ContextProvider, { value: stableValue }, [
+            h(Consumer, stableProps, this.consumerRef),
+          ]),
+        ];
+      }
+    }
+
+    const runtime = await GraphRuntime.mount(h(Root, { dummyProp: 1 }));
+
+    const root = runtime.getRootInstance() as Root | null;
+    expect(root).not.toBeNull();
+
+    const consumerRef = root!.getConsumerRef();
+    expect(consumerRef.current).not.toBeNull();
+
+    expect(consumerRef.current!.contextValue).toBe(sharedValue);
+    expect(consumerRef.current!.mountCount).toBe(1);
+    expect(consumerRef.current!.onUpdateCallCount).toBe(0);
+
+    await runtime.reconcile(h(Root, { dummyProp: 2 }));
+
+    expect(consumerRef.current!.contextValue).toBe(sharedValue);
+    expect(consumerRef.current!.mountCount).toBe(1);
+    expect(consumerRef.current!.onUpdateCallCount).toBe(0);
+
+    await runtime.unmount();
+  });
+
+  it('value change still triggers consumer onUpdate', async () => {
+    const TOKEN = createContext<number>('token');
+    const stableConsumerProps = {};
+
+    class Consumer extends Component<Record<string, never>, Record<string, never>> {
+      @UseContext(TOKEN)
+      public contextValue = -1;
+
+      public onUpdateCallCount = 0;
+
+      constructor () {
+        super({});
+      }
+
+      public override onUpdate (): void {
+        this.onUpdateCallCount += 1;
+      }
+    }
+
+    class Root extends Component<Record<string, never>, { contextValue: number }> {
+      @UseRef()
+      private declare consumerRef: RefObject<Consumer>;
+
+      constructor (props: { contextValue: number }) {
+        super(props);
+      }
+
+      public getConsumerRef (): RefObject<Consumer> {
+        return this.consumerRef;
+      }
+
+      public override compose (): VirtualServiceNode[] {
+        return [
+          h(ContextProvider, { value: [TOKEN, this.props.contextValue] }, [
+            h(Consumer, stableConsumerProps, this.consumerRef),
+          ]),
+        ];
+      }
+    }
+
+    const runtime = await GraphRuntime.mount(h(Root, { contextValue: 10 }));
+
+    const root = runtime.getRootInstance() as Root | null;
+    expect(root).not.toBeNull();
+
+    const consumerRef = root!.getConsumerRef();
+    expect(consumerRef.current).not.toBeNull();
+    expect(consumerRef.current!.contextValue).toBe(10);
+    expect(consumerRef.current!.onUpdateCallCount).toBe(0);
+
+    await runtime.reconcile(h(Root, { contextValue: 20 }));
+
+    expect(consumerRef.current!.contextValue).toBe(20);
+    expect(consumerRef.current!.onUpdateCallCount).toBe(1);
+
+    await runtime.unmount();
+  });
+
+  it('parent scope change forces new child scope even with same pairs', async () => {
+    const OUTER_TOKEN = createContext<string>('outer');
+    const INNER_TOKEN = createContext<number>('inner');
+    const stableConsumerProps = {};
+    const stableInnerValue = [INNER_TOKEN, 100] as [typeof INNER_TOKEN, number];
+
+    class Consumer extends Component<Record<string, never>, Record<string, never>> {
+      @UseContext(INNER_TOKEN)
+      public innerValue = -1;
+
+      @UseContext(OUTER_TOKEN)
+      public outerValue = '';
+
+      public onUpdateCallCount = 0;
+
+      constructor () {
+        super({});
+      }
+
+      public override onUpdate (): void {
+        this.onUpdateCallCount += 1;
+      }
+    }
+
+    class Root extends Component<Record<string, never>, { outerValue: string }> {
+      @UseRef()
+      private declare consumerRef: RefObject<Consumer>;
+
+      constructor (props: { outerValue: string }) {
+        super(props);
+      }
+
+      public getConsumerRef (): RefObject<Consumer> {
+        return this.consumerRef;
+      }
+
+      public override compose (): VirtualServiceNode[] {
+        return [
+          h(ContextProvider, { value: [OUTER_TOKEN, this.props.outerValue] }, [
+            h(ContextProvider, { value: stableInnerValue }, [
+              h(Consumer, stableConsumerProps, this.consumerRef),
+            ]),
+          ]),
+        ];
+      }
+    }
+
+    const runtime = await GraphRuntime.mount(h(Root, { outerValue: 'a' }));
+
+    const root = runtime.getRootInstance() as Root | null;
+    expect(root).not.toBeNull();
+
+    const consumerRef = root!.getConsumerRef();
+    expect(consumerRef.current).not.toBeNull();
+    expect(consumerRef.current!.innerValue).toBe(100);
+    expect(consumerRef.current!.outerValue).toBe('a');
+    expect(consumerRef.current!.onUpdateCallCount).toBe(0);
+
+    await runtime.reconcile(h(Root, { outerValue: 'b' }));
+
+    expect(consumerRef.current!.innerValue).toBe(100);
+    expect(consumerRef.current!.outerValue).toBe('b');
+    expect(consumerRef.current!.onUpdateCallCount).toBe(1);
+
+    await runtime.unmount();
+  });
+});

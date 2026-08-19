@@ -953,4 +953,149 @@ describe('Benchmark: #15 updateFiber scope-identity skip', () => {
   });
 });
 
+describe('Benchmark: #40 same-value vs value-change reconcile', () => {
+  const BENCH_CONTEXT_TOKEN = createContext<number>('bench_context_40');
+
+  class BenchConsumer extends Component<{ count: number }, Record<string, never>> {
+    @UseContext(BENCH_CONTEXT_TOKEN)
+    public contextValue = -1;
+
+    constructor () {
+      super({}, { count: 0 });
+    }
+
+    public override onUpdate (): void {
+      void this.state.count;
+    }
+  }
+
+  const N_CONSUMERS = 32;
+  const STABLE_CONSUMER_PROPS = {};
+  const STABLE_CONTEXT_VALUE = 100;
+  const STABLE_PROVIDER_VALUE = [BENCH_CONTEXT_TOKEN, STABLE_CONTEXT_VALUE] as [typeof BENCH_CONTEXT_TOKEN, number];
+
+  class SameValueRoot extends Component<Record<string, never>, { dummyProp: number }> {
+    constructor (props: { dummyProp: number }) {
+      super(props);
+    }
+
+    public override compose (): VirtualServiceNode[] {
+      const consumers: VirtualServiceNode[] = [];
+      for (let i = 0; i < N_CONSUMERS; i++) {
+        consumers.push(h(BenchConsumer, STABLE_CONSUMER_PROPS, `consumer-${String(i)}`));
+      }
+
+      return [
+        h(ContextProvider, { value: STABLE_PROVIDER_VALUE }, consumers),
+      ];
+    }
+  }
+
+  class ValueChangeRoot extends Component<Record<string, never>, { contextValue: number }> {
+    constructor (props: { contextValue: number }) {
+      super(props);
+    }
+
+    public override compose (): VirtualServiceNode[] {
+      const consumers: VirtualServiceNode[] = [];
+      for (let i = 0; i < N_CONSUMERS; i++) {
+        consumers.push(h(BenchConsumer, STABLE_CONSUMER_PROPS, `consumer-${String(i)}`));
+      }
+
+      return [
+        h(ContextProvider, { value: [BENCH_CONTEXT_TOKEN, this.props.contextValue] }, consumers),
+      ];
+    }
+  }
+
+  it('A: same-value reconcile (stable token+value, dummy prop change)', async () => {
+    console.log('\n=== Benchmark: #40 same-value vs value-change reconcile ===');
+
+    const runtime = await GraphRuntime.mount(
+      h(SameValueRoot, { dummyProp: 0 })
+    );
+
+    let nextDummy = 1;
+    const nsA = await benchAvgAsyncNs(
+      async () => {
+        await runtime.reconcile(h(SameValueRoot, { dummyProp: nextDummy }));
+        nextDummy += 1;
+      },
+      500,
+      { warmupIterations: 50 }
+    );
+
+    console.log(`  A: same-value reconcile (${N_CONSUMERS} consumers): ${nsA.toFixed(2)} ns/op`);
+
+    await runtime.unmount();
+
+    expect(nsA).toBeGreaterThan(0);
+    expect(Number.isFinite(nsA)).toBe(true);
+  });
+
+  it('B: value-change reconcile (provider value changes, consumers reused)', async () => {
+    const runtime = await GraphRuntime.mount(
+      h(ValueChangeRoot, { contextValue: 100 })
+    );
+
+    let nextValue = 101;
+    const nsB = await benchAvgAsyncNs(
+      async () => {
+        await runtime.reconcile(h(ValueChangeRoot, { contextValue: nextValue }));
+        nextValue += 1;
+      },
+      500,
+      { warmupIterations: 50 }
+    );
+
+    console.log(`  B: value-change reconcile (${N_CONSUMERS} consumers): ${nsB.toFixed(2)} ns/op`);
+
+    await runtime.unmount();
+
+    expect(nsB).toBeGreaterThan(0);
+    expect(Number.isFinite(nsB)).toBe(true);
+  });
+
+  it('C: compare A vs B (A should be cheaper)', async () => {
+    const runtimeA = await GraphRuntime.mount(
+      h(SameValueRoot, { dummyProp: 0 })
+    );
+
+    let nextDummy = 1;
+    const nsA = await benchAvgAsyncNs(
+      async () => {
+        await runtimeA.reconcile(h(SameValueRoot, { dummyProp: nextDummy }));
+        nextDummy += 1;
+      },
+      500,
+      { warmupIterations: 50 }
+    );
+
+    await runtimeA.unmount();
+
+    const runtimeB = await GraphRuntime.mount(
+      h(ValueChangeRoot, { contextValue: 100 })
+    );
+
+    let nextValue = 101;
+    const nsB = await benchAvgAsyncNs(
+      async () => {
+        await runtimeB.reconcile(h(ValueChangeRoot, { contextValue: nextValue }));
+        nextValue += 1;
+      },
+      500,
+      { warmupIterations: 50 }
+    );
+
+    await runtimeB.unmount();
+
+    const ratio = nsB / nsA;
+    console.log(`  Ratio B/A: ${ratio.toFixed(2)}x (B should be more expensive, ratio > 1.0)`);
+
+    expect(ratio).toBeGreaterThan(1.0);
+    expect(nsA).toBeGreaterThan(0);
+    expect(nsB).toBeGreaterThan(0);
+  });
+});
+
 jest.setTimeout(120_000);
