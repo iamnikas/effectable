@@ -152,7 +152,7 @@ describe('bootstrap teardown observability (issue #20)', () => {
       }
     }
 
-    it('concurrent shutdown() calls await the same promise', async () => {
+    it('concurrent shutdown() calls await the same promise and join in-flight shutdown', async () => {
       const handle = await bootstrap<Record<string, never>, SlowUnmountRoot>(
         SlowUnmountRoot,
         {},
@@ -161,15 +161,50 @@ describe('bootstrap teardown observability (issue #20)', () => {
 
       expect(handle.isRunning()).toBe(true);
 
-      // Start two shutdown calls concurrently
+      // Start first shutdown
       const shutdown1 = handle.shutdown();
+
+      // Wait a bit to ensure first shutdown has started and flipped running = false
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+
+      // At this point: running = false, but unmountCompleted should still be false
+      expect(handle.isRunning()).toBe(false);
+      expect(handle.rootInstance.unmountCompleted).toBe(false);
+
+      // Start second shutdown - it must join the in-flight shutdown, not return early
       const shutdown2 = handle.shutdown();
 
+      // Wait for both to complete
       await Promise.all([shutdown1, shutdown2]);
 
+      // Now unmount should be completed
       expect(handle.isRunning()).toBe(false);
       expect(handle.rootInstance.unmountStarted).toBe(true);
       expect(handle.rootInstance.unmountCompleted).toBe(true);
+    });
+
+    it('third shutdown() call after completion returns immediately', async () => {
+      const handle = await bootstrap<Record<string, never>, SlowUnmountRoot>(
+        SlowUnmountRoot,
+        {},
+        { name: 'boot-20-third-call' },
+      );
+
+      expect(handle.isRunning()).toBe(true);
+
+      // First shutdown
+      await handle.shutdown();
+
+      expect(handle.isRunning()).toBe(false);
+      expect(handle.rootInstance.unmountCompleted).toBe(true);
+
+      // Second shutdown after completion should return immediately (no-op)
+      const shutdown2Start = Date.now();
+      await handle.shutdown();
+      const shutdown2Duration = Date.now() - shutdown2Start;
+
+      // Should be essentially instant (< 5ms)
+      expect(shutdown2Duration).toBeLessThan(5);
     });
   });
 

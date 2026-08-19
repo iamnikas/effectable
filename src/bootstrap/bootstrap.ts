@@ -249,13 +249,13 @@ export async function bootstrap<
       await activeGraphRuntime.reconcile(h(type, props));
     },
     async shutdown (options?: { rejectOnCleanupError?: boolean }): Promise<void> {
-      if (!running) {
-        return;
-      }
-
-      // Issue #20: concurrent shutdowns await the same promise
+      // Issue #20: concurrent shutdowns await the same promise (check cache first)
       if (cachedShutdownPromise !== null) {
         return cachedShutdownPromise;
+      }
+
+      if (!running) {
+        return;
       }
 
       running = false;
