@@ -44,6 +44,14 @@ const REF_STORAGE_SYMBOL_PREFIX = 'effectable:ref_storage:';
 const refStorageSymbols = new WeakMap<object, Map<string | symbol, symbol>>();
 
 /**
+ * Type for objects that can hold ref storage via symbol-indexed properties.
+ * Issue #17: Typed interface to eliminate 'as symbol' casts in property access.
+ */
+interface RefStorageHost {
+  [storage: symbol]: RefObject<unknown> | undefined;
+}
+
+/**
  * Record for a field registered by the {@link UseRef} decorator.
  *
  * Used by the runtime to bind a child component instance to the parent's ref.
@@ -111,13 +119,14 @@ export function UseRef (): PropertyDecorator {
     }
 
     Object.defineProperty(target, propertyKey, {
-      get (this: Record<string | symbol, unknown>) {
-        if (this[refStorageSymbol as symbol] === undefined) {
-          const ref: RefObject<unknown> = { current: null };
-          this[refStorageSymbol as symbol] = ref;
+      get (this: RefStorageHost): RefObject<unknown> {
+        const existing = this[refStorageSymbol];
+        if (existing === undefined) {
+          const created: RefObject<unknown> = { current: null };
+          this[refStorageSymbol] = created;
+          return created;
         }
-
-        return this[refStorageSymbol as symbol];
+        return existing;
       },
       enumerable: true,
       configurable: true,
