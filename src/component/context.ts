@@ -184,6 +184,13 @@ export class ContextProvider extends Component<
   public applyToScope (parentScope: ContextScope): ContextScope {
     const { value } = this.props;
 
+    if (Array.isArray(value) && value.length === 0) {
+      throw new Error(
+        '[Effectable] ContextProvider: empty value array is invalid. ' +
+        'Provide at least one [token, value] pair, or remove the ContextProvider node.',
+      );
+    }
+
     if (Array.isArray(value) && Array.isArray(value[0])) {
       const pairs = value as Array<[ContextToken<unknown>, unknown]>;
       const n = pairs.length;
@@ -354,3 +361,4 @@ export function injectContextFields (
     }
   }
 }
+
