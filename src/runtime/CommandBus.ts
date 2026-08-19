@@ -17,7 +17,7 @@ export class CommandBus<TCommand extends RuntimeCommand = RuntimeCommand> {
    *
    * @param {TCommand['type']} commandType - command type
    * @param {CommandHandler<TCommand, TResult>} handler - command handler
-   * @returns {() => void} unregister function
+   * @returns {() => void} unregister function; no-op if a different handler is now registered for the type
    * @throws {Error} if a handler is already registered
    */
   public register<TResult> (
@@ -28,9 +28,12 @@ export class CommandBus<TCommand extends RuntimeCommand = RuntimeCommand> {
       throw new Error(`Command handler is already registered: ${commandType}`);
     }
 
-    this.handlers.set(commandType, handler as CommandHandler<TCommand, unknown>);
+    const registered = handler as CommandHandler<TCommand, unknown>;
+    this.handlers.set(commandType, registered);
     return () => {
-      this.unregister(commandType);
+      if (this.handlers.get(commandType) === registered) {
+        this.handlers.delete(commandType);
+      }
     };
   }
 
