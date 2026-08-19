@@ -237,7 +237,7 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
     });
 
     it('child reconcile failure tears down live tree resources (refs, handlers)', async () => {
-      const ref: { current: Component<unknown, unknown> | null } = { current: null };
+      const ref: RefObject<ResourceLeaf> = { current: null };
       let unmountCount = 0;
 
       class ResourceLeaf extends Component<Record<string, never>, { value: number }> {

@@ -32,6 +32,26 @@ export const REF_FIELDS_META_KEY = Symbol('effectable:ref_fields');
 export const IMPERATIVE_HANDLE_META_KEY = Symbol('effectable:imperative_handle');
 
 /**
+ * Symbol prefix for ref storage keys (issue #17).
+ * Each @UseRef property gets a unique symbol for collision-safe storage.
+ */
+const REF_STORAGE_SYMBOL_PREFIX = 'effectable:ref_storage:';
+
+/**
+ * Map of propertyKey -> storage symbol for ref objects.
+ * Ensures each @UseRef property has a unique, collision-free storage location.
+ */
+const refStorageSymbols = new WeakMap<object, Map<string | symbol, symbol>>();
+
+/**
+ * Type for objects that can hold ref storage via symbol-indexed properties.
+ * Issue #17: Typed interface to eliminate 'as symbol' casts in property access.
+ */
+interface RefStorageHost {
+  [storage: symbol]: RefObject<unknown> | undefined;
+}
+
+/**
  * Record for a field registered by the {@link UseRef} decorator.
  *
  * Used by the runtime to bind a child component instance to the parent's ref.
@@ -56,6 +76,8 @@ export interface ImperativeHandleMeta {
  *
  * On first getter access, one `RefObject` is created per instance; the same ref is passed to `h(Child, {}, this.childRef)`.
  * GraphRuntime fills `current` when the child node mounts.
+ * 
+ * Issue #17: Uses symbol-based storage to prevent collisions with user properties.
  *
  * @returns {PropertyDecorator} property decorator: getter returns a stable `RefObject` for the child node
  * @example
@@ -82,15 +104,29 @@ export function UseRef (): PropertyDecorator {
 
     constructor[REF_FIELDS_META_KEY] = next;
 
-    const refKey = `__ref_${String(propertyKey)}`;
+    // Get or create the symbol map for this constructor
+    let symbolMap = refStorageSymbols.get(constructor);
+    if (symbolMap === undefined) {
+      symbolMap = new Map();
+      refStorageSymbols.set(constructor, symbolMap);
+    }
+
+    // Get or create a unique symbol for this property
+    let refStorageSymbol = symbolMap.get(propertyKey);
+    if (refStorageSymbol === undefined) {
+      refStorageSymbol = Symbol(`${REF_STORAGE_SYMBOL_PREFIX}${String(propertyKey)}`);
+      symbolMap.set(propertyKey, refStorageSymbol);
+    }
 
     Object.defineProperty(target, propertyKey, {
-      get (this: Record<string | symbol, unknown>) {
-        if (this[refKey] === undefined) {
-          this[refKey] = { current: null } as RefObject<unknown>;
+      get (this: RefStorageHost): RefObject<unknown> {
+        const existing = this[refStorageSymbol];
+        if (existing === undefined) {
+          const created: RefObject<unknown> = { current: null };
+          this[refStorageSymbol] = created;
+          return created;
         }
-
-        return this[refKey];
+        return existing;
       },
       enumerable: true,
       configurable: true,
