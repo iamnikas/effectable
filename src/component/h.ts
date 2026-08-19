@@ -8,6 +8,7 @@
  * @module Effectable/component/h
  */
 
+import type { Component } from './Component';
 import type { ComponentConstructor, RefObject, VirtualServiceNode } from './types';
 
 /**
@@ -22,6 +23,21 @@ const EMPTY_CHILDREN: readonly VirtualServiceNode[] = Object.freeze([]) as reado
 type EmptyProps = Record<string, never>;
 
 /**
+ * Erase a concrete `RefObject<C>` to the heterogeneous vnode store type `RefObject<unknown>`.
+ *
+ * Centralized widening next to the existing `type as ComponentConstructor<unknown>` erase in
+ * {@link h}. Call sites keep `RefObject<Child>`; {@link VirtualServiceNode.ref} stays erased
+ * for heterogeneous trees. No assertion needed: mutable property checking allows this return.
+ *
+ * @template C Concrete instance type carried by the caller’s ref
+ * @param {RefObject<C>} ref - typed ref from the caller
+ * @returns {RefObject<unknown>} same object, typed for {@link VirtualServiceNode.ref}
+ */
+function eraseRef<C> (ref: RefObject<C>): RefObject<unknown> {
+  return ref;
+}
+
+/**
  * Creates a VirtualServiceNode — a declarative node description for GraphRuntime.
  *
  * Overloads:
@@ -30,7 +46,7 @@ type EmptyProps = Record<string, never>;
  * - h(type, props, key) — node with key only (for dynamic lists)
  * - h(type, props, children) — node with children
  * - h(type, props, children, key) — node with children and key
- * - h(type, props, ref) — node with ref
+ * - h(type, props, ref) — node with ref (`RefObject<C>` matching the instance)
  * - h(type, props, ref, key) — node with ref and key
  * - h(type, props, ref, children) — node with ref and children
  * - h(type, props, ref, children, key) — node with ref, children, and key
@@ -38,9 +54,15 @@ type EmptyProps = Record<string, never>;
  * `key` — stable identity key for diffing dynamic lists.
  * Detected via `typeof === 'string'` in any free positional slot.
  *
- * @param {new (props: P) => Component<unknown, P>} type - component class
+ * Generic over instance type `C` so `h(Child, props, childRef)` type-checks when
+ * `childRef: RefObject<Child>` under `strict` / `strictFunctionTypes`, while
+ * `RefObject<Other>` is rejected. `props` uses {@link NoInfer} so `P` is inferred from
+ * the constructor (same as before), not narrowed from a props literal.
+ * {@link VirtualServiceNode.ref} stays `RefObject<unknown>`; widening is {@link eraseRef}.
+ *
+ * @param {new (props: P) => C} type - component class
  * @param {P} [props] - component props; omit for empty props
- * @param {RefObject<unknown> | VirtualServiceNode[] | string | undefined} refOrChildrenOrKey - ref, children, or key
+ * @param {RefObject<C> | VirtualServiceNode[] | string | undefined} refOrChildrenOrKey - ref, children, or key
  * @param {VirtualServiceNode[] | string | undefined} childrenOrKey - children or key
  * @param {string | undefined} maybeKey - explicit key (when ref and children slots are already used)
  * @returns {VirtualServiceNode<P>} virtual node
@@ -53,20 +75,20 @@ type EmptyProps = Record<string, never>;
  * h(PairMonitor, { pair: 'BTCUSDT' }, 'btc')
  * h(PairMonitor, { pair: 'BTCUSDT' }, parentRef, [h(Child)], 'btc')
  */
-export function h (
-  type: ComponentConstructor<EmptyProps>,
+export function h<C extends Component<unknown, EmptyProps>> (
+  type: new (props: EmptyProps) => C,
 ): VirtualServiceNode<EmptyProps>;
-export function h<P> (
-  type: ComponentConstructor<P>,
-  props: P,
-  refOrChildrenOrKey?: RefObject<unknown> | VirtualServiceNode[] | string,
+export function h<P, C extends Component<unknown, P>> (
+  type: new (props: P) => C,
+  props: NoInfer<P>,
+  refOrChildrenOrKey?: RefObject<C> | VirtualServiceNode[] | string,
   childrenOrKey?: VirtualServiceNode[] | string,
   maybeKey?: string,
 ): VirtualServiceNode<P>;
-export function h<P> (
-  type: ComponentConstructor<P>,
-  props?: P,
-  refOrChildrenOrKey?: RefObject<unknown> | VirtualServiceNode[] | string,
+export function h<P, C extends Component<unknown, P>> (
+  type: new (props: P) => C,
+  props?: NoInfer<P>,
+  refOrChildrenOrKey?: RefObject<C> | VirtualServiceNode[] | string,
   childrenOrKey?: VirtualServiceNode[] | string,
   maybeKey?: string,
 ): VirtualServiceNode<P> {
@@ -96,7 +118,7 @@ export function h<P> (
     resolvedChildren = refOrChildrenOrKey;
     resolvedKey = typeof childrenOrKey === 'string' ? childrenOrKey : undefined;
   } else {
-    resolvedRef = refOrChildrenOrKey;
+    resolvedRef = eraseRef(refOrChildrenOrKey);
     if (typeof childrenOrKey === 'string') {
       resolvedChildren = EMPTY_CHILDREN as VirtualServiceNode[];
       resolvedKey = childrenOrKey;

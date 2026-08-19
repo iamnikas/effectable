@@ -40,7 +40,7 @@ describe('h()', () => {
   });
 
   it('accepts ref as the third argument and empty children by default', () => {
-    const ref: RefObject<EmptyProps> = { current: null };
+    const ref: RefObject<WithProps> = { current: null };
     const node = h(WithProps, { id: 1 }, ref);
 
     expect(node.ref).toBe(ref);
@@ -48,7 +48,7 @@ describe('h()', () => {
   });
 
   it('accepts ref and a children array as the fourth argument', () => {
-    const ref: RefObject<EmptyProps> = { current: null };
+    const ref: RefObject<WithProps> = { current: null };
     const child = h(EmptyProps, {});
     const node = h(WithProps, { id: 2 }, ref, [child]);
 
@@ -80,7 +80,7 @@ describe('h()', () => {
   });
 
   it('accepts ref + key (third is ref, fourth is string)', () => {
-    const ref: RefObject<EmptyProps> = { current: null };
+    const ref: RefObject<WithProps> = { current: null };
     const node = h(WithProps, { id: 9 }, ref, 'with-ref');
 
     expect(node.key).toBe('with-ref');
@@ -89,7 +89,7 @@ describe('h()', () => {
   });
 
   it('accepts ref + children + key (third is ref, fourth is array, fifth is string)', () => {
-    const ref: RefObject<EmptyProps> = { current: null };
+    const ref: RefObject<WithProps> = { current: null };
     const child = h(EmptyProps, {});
     const node = h(WithProps, { id: 10 }, ref, [child], 'stable-key');
 
