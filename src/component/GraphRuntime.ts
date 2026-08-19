@@ -975,10 +975,15 @@ export class GraphRuntime {
    *
    * Issue #11: unmount is serialized, cached promise returned for concurrent callers.
    * Issue #10: safe and joinable even when runtime is FAILED.
+   * Issue #20: collects cleanup errors when `rejectOnCleanupError: true` is passed.
    *
+   * @param {object} [options] - unmount options
+   * @param {boolean} [options.rejectOnCleanupError=false] - reject on cleanup errors
    * @returns {Promise<void>}
    */
-  public async unmount (): Promise<void> {
+  public async unmount (options?: { rejectOnCleanupError?: boolean }): Promise<void> {
+    const rejectOnCleanupError = options?.rejectOnCleanupError === true;
+
     // If unmount already completed, return immediately
     if (this.state === RUNTIME_STATE.UNMOUNTED) {
       return;
@@ -1018,11 +1023,21 @@ export class GraphRuntime {
       this.state = RUNTIME_STATE.UNMOUNTED;
 
       if (this.currentRoot !== null) {
-        const d = this.destroyFiber(this.currentRoot);
+        // Issue #20: collect cleanup errors during unmount
+        const cleanupErrors: Error[] = [];
+        const d = this.destroyFiber(this.currentRoot, cleanupErrors);
         if (isThenable(d)) {
           await d;
         }
         this.currentRoot = null;
+
+        // Issue #20: reject with cleanup errors when requested
+        if (rejectOnCleanupError && cleanupErrors.length > 0) {
+          if (cleanupErrors.length === 1) {
+            throw cleanupErrors[0];
+          }
+          throw new AggregateError(cleanupErrors, 'Cleanup errors during unmount');
+        }
       }
     });
 
@@ -1964,7 +1979,10 @@ export class GraphRuntime {
    * Returns `void` synchronously if the whole subtree is sync (up to 266x speedup
    * on an 85-node tree); otherwise a Promise. `await` works correctly with either union branch.
    *
+   * Issue #20: collects cleanup errors via `collectErrors` parameter (best-effort cleanup).
+   *
    * @param {RuntimeFiber} fiber - fiber to destroy
+   * @param {Error[] | null} collectErrors - array to collect cleanup errors (null to throw immediately)
    * @returns {void | Promise<void>}
    */
   private destroyFiber (fiber: RuntimeFiber<unknown>, collectErrors: Error[] | null = null): void | Promise<void> {
@@ -1973,9 +1991,18 @@ export class GraphRuntime {
 
     // Sync recursion over children until the first async
     for (let i = 0; i < n; i++) {
-      const childRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, collectErrors);
-      if (isThenable(childRes)) {
-        return this.continueDestroyAsync(fiber, children, i, childRes, collectErrors);
+      try {
+        const childRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, collectErrors);
+        if (isThenable(childRes)) {
+          return this.continueDestroyAsync(fiber, children, i, childRes, collectErrors);
+        }
+      } catch (err: unknown) {
+        // Issue #20: best-effort cleanup — collect error and continue
+        if (collectErrors !== null) {
+          collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+        } else {
+          throw err;
+        }
       }
     }
 
@@ -1992,25 +2019,15 @@ export class GraphRuntime {
       return this.finalizeDestroyAsync(fiber, shutdownRes, collectErrors);
     }
 
-    // Check for shutdown errors (issue #12: cleanup errors must be visible during fail-stop)
+    // Issue #20: collect shutdown errors for observability
     if (!shutdownRes.ok) {
       if (collectErrors !== null) {
-        // Fail-stop mode: collect cleanup errors, don't throw
         collectErrors.push(shutdownRes.error instanceof Error ? shutdownRes.error : new Error(String(shutdownRes.error)));
       }
-      // Still finalize the fiber even if shutdown failed
-      this.disposeEffectableRuntimeBusWiring(fiber);
-      const ref = fiber.vnode.ref;
-      if (ref !== undefined) {
-        ref.current = null;
-      }
-      fiber.lifecycleStatus = fiber.engine.getStatus();
-      return;
     }
 
+    // Always finalize the fiber even if shutdown failed (best-effort cleanup)
     this.disposeEffectableRuntimeBusWiring(fiber);
-
-    // Clear ref after unmount
     const ref = fiber.vnode.ref;
     if (ref !== undefined) {
       ref.current = null;
@@ -2025,6 +2042,7 @@ export class GraphRuntime {
    * @param {Fiber[]} children - children list
    * @param {number} pendingIdx - index of the pending child
    * @param {PromiseLike<void>} pending - Promise from destroying the child
+   * @param {Error[] | null} collectErrors - array to collect cleanup errors
    * @returns {Promise<void>}
    */
   private async continueDestroyAsync (
@@ -2034,12 +2052,30 @@ export class GraphRuntime {
     pending: PromiseLike<void>,
     collectErrors: Error[] | null = null,
   ): Promise<void> {
-    await pending;
+    // Issue #20: best-effort cleanup — await pending child
+    try {
+      await pending;
+    } catch (err: unknown) {
+      if (collectErrors !== null) {
+        collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+      } else {
+        throw err;
+      }
+    }
 
+    // Issue #20: continue destroying remaining children even if previous failed
     for (let i = pendingIdx + 1; i < children.length; i++) {
-      const r = this.destroyFiber(children[i] as RuntimeFiber<unknown>, collectErrors);
-      if (isThenable(r)) {
-        await r;
+      try {
+        const r = this.destroyFiber(children[i] as RuntimeFiber<unknown>, collectErrors);
+        if (isThenable(r)) {
+          await r;
+        }
+      } catch (err: unknown) {
+        if (collectErrors !== null) {
+          collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+        } else {
+          throw err;
+        }
       }
     }
 
@@ -2065,8 +2101,8 @@ export class GraphRuntime {
       }
     }
 
+    // Always finalize even if shutdown failed
     this.disposeEffectableRuntimeBusWiring(fiber);
-
     const ref = fiber.vnode.ref;
     if (ref !== undefined) {
       ref.current = null;
@@ -2080,6 +2116,7 @@ export class GraphRuntime {
    *
    * @param {RuntimeFiber<unknown>} fiber
    * @param {PromiseLike<unknown>} pendingShutdown
+   * @param {Error[] | null} collectErrors - array to collect cleanup errors
    * @returns {Promise<void>}
    */
   private async finalizeDestroyAsync (
@@ -2089,25 +2126,16 @@ export class GraphRuntime {
   ): Promise<void> {
     const shutdownRes = await pendingShutdown;
 
-    // Check for shutdown errors (issue #12: cleanup errors must be visible during fail-stop)
+    // Issue #20: collect shutdown errors for observability
     if (typeof shutdownRes === 'object' && shutdownRes !== null && 'ok' in shutdownRes && !shutdownRes.ok) {
       if (collectErrors !== null) {
-        // Fail-stop mode: collect cleanup errors, don't throw
         const err = (shutdownRes as { ok: false; error: unknown }).error;
         collectErrors.push(err instanceof Error ? err : new Error(String(err)));
       }
-      // Still finalize the fiber even if shutdown failed
-      this.disposeEffectableRuntimeBusWiring(fiber);
-      const ref = fiber.vnode.ref;
-      if (ref !== undefined) {
-        ref.current = null;
-      }
-      fiber.lifecycleStatus = fiber.engine.getStatus();
-      return;
     }
 
+    // Always finalize even if shutdown failed
     this.disposeEffectableRuntimeBusWiring(fiber);
-
     const ref = fiber.vnode.ref;
     if (ref !== undefined) {
       ref.current = null;
