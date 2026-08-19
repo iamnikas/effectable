@@ -113,7 +113,8 @@ export function UseRef (): PropertyDecorator {
     Object.defineProperty(target, propertyKey, {
       get (this: Record<string | symbol, unknown>) {
         if (this[refStorageSymbol as symbol] === undefined) {
-          this[refStorageSymbol as symbol] = { current: null } as RefObject<unknown>;
+          const ref: RefObject<unknown> = { current: null };
+          this[refStorageSymbol as symbol] = ref;
         }
 
         return this[refStorageSymbol as symbol];

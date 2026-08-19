@@ -163,8 +163,22 @@ export class GraphRuntime {
    * Runtime state machine (issue #10).
    * IDLE → ACTIVE (on mount) → FAILED | UNMOUNTING → UNMOUNTED.
    * FAILED is terminal: subsequent reconcile rejects, unmount is safe.
+   * Private backing field; accessed via this._runtimeState() to prevent control-flow narrowing
+   * across async boundaries (TS limitation: after `await`, this.state can change but TS narrows anyway).
    */
   private state: RuntimeState = RUNTIME_STATE.IDLE;
+
+  /**
+   * Runtime state accessor. Prevents TypeScript control-flow narrowing across async boundaries.
+   * After early-return guards (e.g. `if (state === FAILED) return`), TS narrows this.state
+   * to the remaining values, but async code (await) can change state from another context.
+   * Accessing via method prevents incorrect narrowing.
+   *
+   * @returns {RuntimeState} current state
+   */
+  private _runtimeState (): RuntimeState {
+    return this.state;
+  }
 
   /**
    * Terminal error captured by failStop() (issue #10).
@@ -351,13 +365,14 @@ export class GraphRuntime {
   /**
    * Identity-safe ref clearing: clears ref.current only if it still points to the expected owner.
    * Prevents an old rollback from clearing a ref that a newer materialization already reused.
-   * Partial foundation for #17 (complete decorator-backed ref storage is out of scope for #12).
+   * Issue #17: Generic signature for type-safe ownership checks.
    *
-   * @param {RefObject<unknown>} ref - ref object
-   * @param {Component<unknown, unknown>} expectedOwner - expected current owner
+   * @template T - Component instance type
+   * @param {RefObject<T>} ref - ref object
+   * @param {T} expectedOwner - expected current owner
    * @returns {void}
    */
-  private clearRefSafe (ref: RefObject<unknown>, expectedOwner: Component<unknown, unknown>): void {
+  private clearRefSafe<T extends Component<unknown, unknown>> (ref: RefObject<T>, expectedOwner: T): void {
     if (ref.current === expectedOwner) {
       ref.current = null;
     }
@@ -373,17 +388,20 @@ export class GraphRuntime {
    * - previousRef and nextRef can be the same object (ref reuse) or different (ref swap).
    * - Do not let an old disposer clear a newer owner.
    * 
-   * @param {RefObject<unknown> | undefined} previousRef - ref to clear (can be undefined if no previous ref)
-   * @param {Component<unknown, unknown> | null} expectedPreviousOwner - expected owner of previousRef (null if unknown)
-   * @param {RefObject<unknown> | undefined} nextRef - ref to bind to instance (can be undefined if removing ref)
-   * @param {Component<unknown, unknown> | null} instance - instance to bind nextRef to (null when clearing only)
+   * Generic signature ensures type safety without casts at call sites.
+   * 
+   * @template T - Component instance type
+   * @param {RefObject<T> | undefined} previousRef - ref to clear (can be undefined if no previous ref)
+   * @param {T | null} expectedPreviousOwner - expected owner of previousRef (null if unknown)
+   * @param {RefObject<T> | undefined} nextRef - ref to bind to instance (can be undefined if removing ref)
+   * @param {T | null} instance - instance to bind nextRef to (null when clearing only)
    * @returns {void}
    */
-  private commitRef (
-    previousRef: RefObject<unknown> | undefined,
-    expectedPreviousOwner: Component<unknown, unknown> | null,
-    nextRef: RefObject<unknown> | undefined,
-    instance: Component<unknown, unknown> | null,
+  private commitRef<T extends Component<unknown, unknown>> (
+    previousRef: RefObject<T> | undefined,
+    expectedPreviousOwner: T | null,
+    nextRef: RefObject<T> | undefined,
+    instance: T | null,
   ): void {
     // Clear previous ref if it's different from next (ref swap) or if next is undefined (ref removal)
     if (previousRef !== undefined && previousRef !== nextRef && expectedPreviousOwner !== null) {
@@ -392,7 +410,7 @@ export class GraphRuntime {
     
     // Bind next ref to instance
     if (nextRef !== undefined) {
-      (nextRef as RefObject<typeof instance>).current = instance;
+      nextRef.current = instance;
     }
   }
 
@@ -814,7 +832,8 @@ export class GraphRuntime {
 
     try {
       for (const fiber of snapshot) {
-        if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
+        // Check via _runtimeState() to avoid TypeScript control-flow narrowing after await
+        if (this._runtimeState() === RUNTIME_STATE.FAILED || this._runtimeState() === RUNTIME_STATE.UNMOUNTING || this._runtimeState() === RUNTIME_STATE.UNMOUNTED) {
           break;
         }
         const res = this.reconcileDirtyFiber(fiber);
@@ -1000,12 +1019,12 @@ export class GraphRuntime {
 
     // Serialize via operation queue
     await this.enqueueOperation(async () => {
-      // Double-check after queue wait
-      if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
+      // Double-check after queue wait (use _runtimeState() to avoid control-flow narrowing after await)
+      if (this._runtimeState() === RUNTIME_STATE.UNMOUNTING || this._runtimeState() === RUNTIME_STATE.UNMOUNTED) {
         throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
       }
 
-      if (this.state === RUNTIME_STATE.FAILED) {
+      if (this._runtimeState() === RUNTIME_STATE.FAILED) {
         throw this.terminalError || new Error('[Effectable] GraphRuntime: reconcile attempted after terminal failure.');
       }
 
@@ -1019,11 +1038,12 @@ export class GraphRuntime {
         await this.activeFlush;
       }
 
-      if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
+      // Re-check after activeFlush await (use _runtimeState() to avoid control-flow narrowing)
+      if (this._runtimeState() === RUNTIME_STATE.UNMOUNTING || this._runtimeState() === RUNTIME_STATE.UNMOUNTED) {
         throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
       }
 
-      if (this.state === RUNTIME_STATE.FAILED) {
+      if (this._runtimeState() === RUNTIME_STATE.FAILED) {
         throw this.terminalError || new Error('[Effectable] GraphRuntime: reconcile attempted after terminal failure.');
       }
 

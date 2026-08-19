@@ -96,8 +96,11 @@ export interface VirtualServiceNode<P = unknown> {
    * Required in dynamic lists — without a key the reconciler cannot correctly reuse nodes.
    */
   key?: string;
-  /** Ref for accessing the instance from the parent component. */
-  ref?: RefObject<unknown>;
+  /**
+   * Ref for accessing the instance from the parent component.
+   * Issue #17: Typed as Component instance (the runtime materialization result of vnode.type).
+   */
+  ref?: RefObject<Component<unknown, unknown>>;
   /** Child nodes in declaration order. */
   children: VirtualServiceNode[];
 }
