@@ -131,20 +131,47 @@ describe('bootstrap teardown observability (issue #20)', () => {
   });
 
   describe('concurrent shutdown joins one promise', () => {
-    class SlowUnmountRoot extends Component<Record<string, never>, Record<string, never>> {
+    interface LatchedUnmountProps {
+      release?: () => void;
+    }
+
+    class LatchedUnmountRoot extends Component<
+      Record<string, never>,
+      LatchedUnmountProps
+    > {
       public unmountStarted = false;
 
       public unmountCompleted = false;
 
-      constructor (props: Record<string, never>) {
+      public unmountCalls = 0;
+
+      private release: (() => void) | null = null;
+
+      constructor (props: LatchedUnmountProps) {
         super(props);
         this.state = {};
       }
 
       public override async onUnmount (): Promise<void> {
+        this.unmountCalls += 1;
         this.unmountStarted = true;
-        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+        await new Promise<void>((resolve) => {
+          this.release = () => {
+            resolve();
+          };
+          if (this.props.release) {
+            this.props.release();
+          }
+        });
+
         this.unmountCompleted = true;
+      }
+
+      public releaseUnmount (): void {
+        if (this.release) {
+          this.release();
+        }
       }
 
       public override compose (): null {
@@ -153,9 +180,14 @@ describe('bootstrap teardown observability (issue #20)', () => {
     }
 
     it('concurrent shutdown() calls await the same promise and join in-flight shutdown', async () => {
-      const handle = await bootstrap<Record<string, never>, SlowUnmountRoot>(
-        SlowUnmountRoot,
-        {},
+      let releaseCalled = false;
+      const handle = await bootstrap<LatchedUnmountProps, LatchedUnmountRoot>(
+        LatchedUnmountRoot,
+        {
+          release: () => {
+            releaseCalled = true;
+          },
+        },
         { name: 'boot-20-concurrent' },
       );
 
@@ -164,47 +196,230 @@ describe('bootstrap teardown observability (issue #20)', () => {
       // Start first shutdown
       const shutdown1 = handle.shutdown();
 
-      // Wait a bit to ensure first shutdown has started and flipped running = false
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      // Wait until shutdown has started (onUnmount called release callback)
+      while (!releaseCalled) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      }
 
-      // At this point: running = false, but unmountCompleted should still be false
+      // At this point: onUnmount is in-flight, but not completed
       expect(handle.isRunning()).toBe(false);
+      expect(handle.rootInstance.unmountStarted).toBe(true);
       expect(handle.rootInstance.unmountCompleted).toBe(false);
 
-      // Start second shutdown - it must join the in-flight shutdown, not return early
+      // Start second shutdown - it must join the in-flight shutdown
       const shutdown2 = handle.shutdown();
+
+      // Release the latch
+      handle.rootInstance.releaseUnmount();
 
       // Wait for both to complete
       await Promise.all([shutdown1, shutdown2]);
 
-      // Now unmount should be completed
+      // Now shutdown should be completed, and onUnmount called only once
       expect(handle.isRunning()).toBe(false);
       expect(handle.rootInstance.unmountStarted).toBe(true);
       expect(handle.rootInstance.unmountCompleted).toBe(true);
+      expect(handle.rootInstance.unmountCalls).toBe(1);
     });
 
-    it('third shutdown() call after completion returns immediately', async () => {
-      const handle = await bootstrap<Record<string, never>, SlowUnmountRoot>(
-        SlowUnmountRoot,
-        {},
+    it('third shutdown() call after completion does not call onUnmount again', async () => {
+      let releaseCalled = false;
+      const handle = await bootstrap<LatchedUnmountProps, LatchedUnmountRoot>(
+        LatchedUnmountRoot,
+        {
+          release: () => {
+            releaseCalled = true;
+          },
+        },
         { name: 'boot-20-third-call' },
       );
 
       expect(handle.isRunning()).toBe(true);
 
-      // First shutdown
-      await handle.shutdown();
+      // Start first shutdown
+      const shutdown1 = handle.shutdown();
+
+      // Wait until shutdown has started
+      while (!releaseCalled) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      }
+
+      // Release the latch to let shutdown complete
+      handle.rootInstance.releaseUnmount();
+      await shutdown1;
 
       expect(handle.isRunning()).toBe(false);
       expect(handle.rootInstance.unmountCompleted).toBe(true);
+      expect(handle.rootInstance.unmountCalls).toBe(1);
 
-      // Second shutdown after completion should return immediately (no-op)
-      const shutdown2Start = Date.now();
+      // Second shutdown after completion should be a no-op
       await handle.shutdown();
-      const shutdown2Duration = Date.now() - shutdown2Start;
 
-      // Should be essentially instant (< 5ms)
-      expect(shutdown2Duration).toBeLessThan(5);
+      // onUnmount should not have been called again
+      expect(handle.rootInstance.unmountCalls).toBe(1);
+
+      // Third shutdown also a no-op
+      await handle.shutdown();
+      expect(handle.rootInstance.unmountCalls).toBe(1);
+    });
+
+    it('third shutdown() call after completion does not clear owned buses again', async () => {
+      let releaseCalled = false;
+      const handle = await bootstrap<LatchedUnmountProps, LatchedUnmountRoot>(
+        LatchedUnmountRoot,
+        {
+          release: () => {
+            releaseCalled = true;
+          },
+        },
+        { name: 'boot-20-third-clear' },
+      );
+
+      const commandClearSpy = jest.spyOn(handle.runtime.commandBus, 'clear');
+      const queryClearSpy = jest.spyOn(handle.runtime.queryBus, 'clear');
+      const eventClearSpy = jest.spyOn(handle.runtime.eventBus, 'clear');
+      const registryClearSpy = jest.spyOn(handle.runtime.handleRegistry, 'clear');
+
+      expect(handle.isRunning()).toBe(true);
+
+      // Start first shutdown
+      const shutdown1 = handle.shutdown();
+
+      // Wait until shutdown has started
+      while (!releaseCalled) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      }
+
+      // Release the latch to let shutdown complete
+      handle.rootInstance.releaseUnmount();
+      await shutdown1;
+
+      expect(handle.isRunning()).toBe(false);
+      expect(commandClearSpy).toHaveBeenCalledTimes(1);
+      expect(queryClearSpy).toHaveBeenCalledTimes(1);
+      expect(eventClearSpy).toHaveBeenCalledTimes(1);
+      expect(registryClearSpy).toHaveBeenCalledTimes(1);
+
+      // Second shutdown should not call clear() again
+      await handle.shutdown();
+      expect(commandClearSpy).toHaveBeenCalledTimes(1);
+      expect(queryClearSpy).toHaveBeenCalledTimes(1);
+      expect(eventClearSpy).toHaveBeenCalledTimes(1);
+      expect(registryClearSpy).toHaveBeenCalledTimes(1);
+
+      commandClearSpy.mockRestore();
+      queryClearSpy.mockRestore();
+      eventClearSpy.mockRestore();
+      registryClearSpy.mockRestore();
+    });
+
+    it('concurrent join follows the first caller\'s options (mixed rejectOnCleanupError)', async () => {
+      interface FailingUnmountProps {
+        release?: () => void;
+      }
+
+      class FailingLatchedRoot extends Component<
+        Record<string, never>,
+        FailingUnmountProps
+      > {
+        public unmountStarted = false;
+
+        public unmountCompleted = false;
+
+        public unmountCalls = 0;
+
+        private release: (() => void) | null = null;
+
+        constructor (props: FailingUnmountProps) {
+          super(props);
+          this.state = {};
+        }
+
+        public override async onUnmount (): Promise<void> {
+          this.unmountCalls += 1;
+          this.unmountStarted = true;
+
+          await new Promise<void>((resolve) => {
+            this.release = () => {
+              resolve();
+            };
+            if (this.props.release) {
+              this.props.release();
+            }
+          });
+
+          this.unmountCompleted = true;
+          throw new Error('onUnmount cleanup error');
+        }
+
+        public releaseUnmount (): void {
+          if (this.release) {
+            this.release();
+          }
+        }
+
+        public override compose (): null {
+          return null;
+        }
+      }
+
+      let releaseCalled = false;
+      const handle = await bootstrap<FailingUnmountProps, FailingLatchedRoot>(
+        FailingLatchedRoot,
+        {
+          release: () => {
+            releaseCalled = true;
+          },
+        },
+        { name: 'boot-20-mixed-options' },
+      );
+
+      const commandClearSpy = jest.spyOn(handle.runtime.commandBus, 'clear');
+      const queryClearSpy = jest.spyOn(handle.runtime.queryBus, 'clear');
+      const eventClearSpy = jest.spyOn(handle.runtime.eventBus, 'clear');
+      const registryClearSpy = jest.spyOn(handle.runtime.handleRegistry, 'clear');
+
+      expect(handle.isRunning()).toBe(true);
+
+      // First caller: default (swallow errors)
+      const shutdown1 = handle.shutdown();
+
+      // Wait until shutdown has started
+      while (!releaseCalled) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      }
+
+      expect(handle.rootInstance.unmountStarted).toBe(true);
+      expect(handle.rootInstance.unmountCompleted).toBe(false);
+
+      // Second caller: opt-in to rejection
+      // But it should still RESOLVE because it joins the first caller's promise
+      const shutdown2 = handle.shutdown({ rejectOnCleanupError: true });
+
+      // Release the latch
+      handle.rootInstance.releaseUnmount();
+
+      // First caller resolves (swallows error)
+      await expect(shutdown1).resolves.toBeUndefined();
+
+      // Second caller also resolves (follows first caller's options)
+      // This documents current contract: concurrent join uses the first caller's options
+      await expect(shutdown2).resolves.toBeUndefined();
+
+      // Cleanup still ran
+      expect(handle.rootInstance.unmountCalls).toBe(1);
+      expect(handle.isRunning()).toBe(false);
+
+      // Owned buses were still cleared
+      expect(commandClearSpy).toHaveBeenCalledTimes(1);
+      expect(queryClearSpy).toHaveBeenCalledTimes(1);
+      expect(eventClearSpy).toHaveBeenCalledTimes(1);
+      expect(registryClearSpy).toHaveBeenCalledTimes(1);
+
+      commandClearSpy.mockRestore();
+      queryClearSpy.mockRestore();
+      eventClearSpy.mockRestore();
+      registryClearSpy.mockRestore();
     });
   });
 
