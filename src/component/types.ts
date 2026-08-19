@@ -64,6 +64,10 @@ export interface Disposable {
 /**
  * Typed ref object for accessing a component instance from a parent.
  * Filled by GraphRuntime when the node mounts.
+ *
+ * Covariant in practice (writable data property). Do not add `in out T` — that would
+ * reject `RefObject<Child>` at every `h(..., childRef)` unless `h` is generic in the
+ * same change; we are not branding {@link RefObject}.
  */
 export interface RefObject<T> {
   /** Current component instance (null before mount or after unmount). */
