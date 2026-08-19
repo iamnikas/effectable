@@ -318,13 +318,13 @@ export function getContextFields (
  *
  * @param {object} instance - already created component instance
  * @param {ContextScope} scope - scope computed for this node (including ancestor providers)
- * @returns {void}
+ * @returns {boolean} `true` if any field identity changed (`!==`), `false` if no fields or no changes
  * @throws {Error} see {@link readFromScope} — required token missing from scope
  */
 export function injectContextFields (
   instance: object,
   scope: ContextScope,
-): void {
+): boolean {
   const constructor = instance.constructor as {
     [CONTEXT_FIELDS_META_KEY]?: ContextFieldMeta[];
     [HAS_CONTEXT_FIELDS_KEY]?: true;
@@ -332,33 +332,45 @@ export function injectContextFields (
 
   // Fast-path: most HFT components do not use @UseContext (1.68x at 80% pure)
   if (!constructor[HAS_CONTEXT_FIELDS_KEY]) {
-    return;
+    return false;
   }
 
   const fields = constructor[CONTEXT_FIELDS_META_KEY] as ContextFieldMeta[];
   const target = instance as Record<string | symbol, unknown>;
   const n = fields.length;
 
+  let anyChanged = false;
+
   // Tight for-index loop without iterator allocation + inline single Map.get
   // (13_EXP4 / P010, 1.37x incremental — part of the overall sync fast-path stack).
   for (let i = 0; i < n; i++) {
     const meta = fields[i] as ContextFieldMeta;
     const token = meta.token;
+    const prevValue = target[meta.propertyKey];
     const v = scope.get(token.key);
 
+    let nextValue: unknown;
+
     if (v !== undefined) {
-      target[meta.propertyKey] = v;
+      nextValue = v;
     } else if (scope.has(token.key)) {
       // Rare case: token is actually present with value undefined.
-      target[meta.propertyKey] = undefined;
+      nextValue = undefined;
     } else if (token.defaultValue !== undefined) {
-      target[meta.propertyKey] = token.defaultValue;
+      nextValue = token.defaultValue;
     } else {
       throw new Error(
         `[Effectable] Context token "${token.displayName}" is not provided. ` +
         'Make sure that a ContextProvider with this token exists higher in the component tree.',
       );
     }
+
+    if (prevValue !== nextValue) {
+      anyChanged = true;
+      target[meta.propertyKey] = nextValue;
+    }
   }
+
+  return anyChanged;
 }
 
