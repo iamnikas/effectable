@@ -365,14 +365,13 @@ export class GraphRuntime {
   /**
    * Identity-safe ref clearing: clears ref.current only if it still points to the expected owner.
    * Prevents an old rollback from clearing a ref that a newer materialization already reused.
-   * Issue #17: Generic signature for type-safe ownership checks.
+   * Issue #17: No cast required (Component | null → unknown | null is assignable).
    *
-   * @template T - Component instance type
-   * @param {RefObject<T>} ref - ref object
-   * @param {T} expectedOwner - expected current owner
+   * @param {RefObject<unknown>} ref - ref object
+   * @param {Component<unknown, unknown>} expectedOwner - expected current owner
    * @returns {void}
    */
-  private clearRefSafe<T extends Component<unknown, unknown>> (ref: RefObject<T>, expectedOwner: T): void {
+  private clearRefSafe (ref: RefObject<unknown>, expectedOwner: Component<unknown, unknown>): void {
     if (ref.current === expectedOwner) {
       ref.current = null;
     }
@@ -388,27 +387,26 @@ export class GraphRuntime {
    * - previousRef and nextRef can be the same object (ref reuse) or different (ref swap).
    * - Do not let an old disposer clear a newer owner.
    * 
-   * Generic signature ensures type safety without casts at call sites.
+   * No casts: Component | null → unknown | null is assignable (widening).
    * 
-   * @template T - Component instance type
-   * @param {RefObject<T> | undefined} previousRef - ref to clear (can be undefined if no previous ref)
-   * @param {T | null} expectedPreviousOwner - expected owner of previousRef (null if unknown)
-   * @param {RefObject<T> | undefined} nextRef - ref to bind to instance (can be undefined if removing ref)
-   * @param {T | null} instance - instance to bind nextRef to (null when clearing only)
+   * @param {RefObject<unknown> | undefined} previousRef - ref to clear (can be undefined if no previous ref)
+   * @param {Component<unknown, unknown> | null} expectedPreviousOwner - expected owner of previousRef (null if unknown)
+   * @param {RefObject<unknown> | undefined} nextRef - ref to bind to instance (can be undefined if removing ref)
+   * @param {Component<unknown, unknown> | null} instance - instance to bind nextRef to (null when clearing only)
    * @returns {void}
    */
-  private commitRef<T extends Component<unknown, unknown>> (
-    previousRef: RefObject<T> | undefined,
-    expectedPreviousOwner: T | null,
-    nextRef: RefObject<T> | undefined,
-    instance: T | null,
+  private commitRef (
+    previousRef: RefObject<unknown> | undefined,
+    expectedPreviousOwner: Component<unknown, unknown> | null,
+    nextRef: RefObject<unknown> | undefined,
+    instance: Component<unknown, unknown> | null,
   ): void {
     // Clear previous ref if it's different from next (ref swap) or if next is undefined (ref removal)
     if (previousRef !== undefined && previousRef !== nextRef && expectedPreviousOwner !== null) {
       this.clearRefSafe(previousRef, expectedPreviousOwner);
     }
     
-    // Bind next ref to instance
+    // Bind next ref to instance (Component | null → unknown | null, no cast)
     if (nextRef !== undefined) {
       nextRef.current = instance;
     }

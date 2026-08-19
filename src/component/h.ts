@@ -8,7 +8,6 @@
  * @module Effectable/component/h
  */
 
-import type { Component } from './Component';
 import type { ComponentConstructor, RefObject, VirtualServiceNode } from './types';
 
 /**
@@ -39,11 +38,9 @@ type EmptyProps = Record<string, never>;
  * `key` — stable identity key for diffing dynamic lists.
  * Detected via `typeof === 'string'` in any free positional slot.
  *
- * Issue #17: ref parameter typed as RefObject<Component<unknown, unknown>> to match vnode.ref type.
- *
  * @param {new (props: P) => Component<unknown, P>} type - component class
  * @param {P} [props] - component props; omit for empty props
- * @param {RefObject<Component<unknown, unknown>> | VirtualServiceNode[] | string | undefined} refOrChildrenOrKey - ref, children, or key
+ * @param {RefObject<unknown> | VirtualServiceNode[] | string | undefined} refOrChildrenOrKey - ref, children, or key
  * @param {VirtualServiceNode[] | string | undefined} childrenOrKey - children or key
  * @param {string | undefined} maybeKey - explicit key (when ref and children slots are already used)
  * @returns {VirtualServiceNode<P>} virtual node
@@ -62,14 +59,14 @@ export function h (
 export function h<P> (
   type: ComponentConstructor<P>,
   props: P,
-  refOrChildrenOrKey?: RefObject<Component<unknown, unknown>> | VirtualServiceNode[] | string,
+  refOrChildrenOrKey?: RefObject<unknown> | VirtualServiceNode[] | string,
   childrenOrKey?: VirtualServiceNode[] | string,
   maybeKey?: string,
 ): VirtualServiceNode<P>;
 export function h<P> (
   type: ComponentConstructor<P>,
   props?: P,
-  refOrChildrenOrKey?: RefObject<Component<unknown, unknown>> | VirtualServiceNode[] | string,
+  refOrChildrenOrKey?: RefObject<unknown> | VirtualServiceNode[] | string,
   childrenOrKey?: VirtualServiceNode[] | string,
   maybeKey?: string,
 ): VirtualServiceNode<P> {
@@ -86,7 +83,7 @@ export function h<P> (
     };
   }
 
-  let resolvedRef: RefObject<Component<unknown, unknown>> | undefined;
+  let resolvedRef: RefObject<unknown> | undefined;
   let resolvedChildren: VirtualServiceNode[];
   let resolvedKey: string | undefined;
 
