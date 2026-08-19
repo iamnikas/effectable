@@ -188,20 +188,47 @@ describe('GraphRuntime teardown observability (issue #20)', () => {
   });
 
   describe('concurrent shutdown joins one promise', () => {
-    class SlowUnmountRoot extends Component<Record<string, never>, Record<string, never>> {
+    interface LatchedUnmountProps {
+      release?: () => void;
+    }
+
+    class LatchedUnmountRoot extends Component<
+      Record<string, never>,
+      LatchedUnmountProps
+    > {
       public unmountStarted = false;
 
       public unmountCompleted = false;
 
-      constructor (props: Record<string, never>) {
+      public unmountCalls = 0;
+
+      private release: (() => void) | null = null;
+
+      constructor (props: LatchedUnmountProps) {
         super(props);
         this.state = {};
       }
 
       public override async onUnmount (): Promise<void> {
+        this.unmountCalls += 1;
         this.unmountStarted = true;
-        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+        await new Promise<void>((resolve) => {
+          this.release = () => {
+            resolve();
+          };
+          if (this.props.release) {
+            this.props.release();
+          }
+        });
+
         this.unmountCompleted = true;
+      }
+
+      public releaseUnmount (): void {
+        if (this.release) {
+          this.release();
+        }
       }
 
       public override compose (): null {
@@ -210,61 +237,190 @@ describe('GraphRuntime teardown observability (issue #20)', () => {
     }
 
     it('concurrent unmount() calls await the same promise and join in-flight unmount', async () => {
-      const runtime = await GraphRuntime.mount(h(SlowUnmountRoot, {}));
-      const root = runtime.getRootInstance() as SlowUnmountRoot | null;
+      let releaseCalled = false;
+      const runtime = await GraphRuntime.mount(
+        h(LatchedUnmountRoot, {
+          release: () => {
+            releaseCalled = true;
+          },
+        }),
+      );
+      const root = runtime.getRootInstance() as LatchedUnmountRoot | null;
 
       expect(root).not.toBeNull();
       expect(runtime.isActive()).toBe(true);
 
       if (root === null) {
-        throw new Error('expected SlowUnmountRoot instance');
+        throw new Error('expected LatchedUnmountRoot instance');
       }
 
       // Start first unmount
       const unmount1 = runtime.unmount();
 
-      // Wait a bit to ensure first unmount has started and changed state
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      // Wait until unmount has started (onUnmount called release callback)
+      while (!releaseCalled) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      }
 
-      // At this point: runtime is UNMOUNTING/UNMOUNTED, but unmountCompleted should still be false
+      // At this point: onUnmount is in-flight, but not completed
+      expect(root.unmountStarted).toBe(true);
       expect(root.unmountCompleted).toBe(false);
 
       // Start second unmount - it must join the in-flight unmount
       const unmount2 = runtime.unmount();
 
+      // Release the latch
+      root.releaseUnmount();
+
       // Wait for both to complete
       await Promise.all([unmount1, unmount2]);
 
-      // Now unmount should be completed
+      // Now unmount should be completed, and onUnmount called only once
       expect(runtime.isActive()).toBe(false);
       expect(root.unmountStarted).toBe(true);
       expect(root.unmountCompleted).toBe(true);
+      expect(root.unmountCalls).toBe(1);
     });
 
-    it('third unmount() call after completion returns immediately', async () => {
-      const runtime = await GraphRuntime.mount(h(SlowUnmountRoot, {}));
-      const root = runtime.getRootInstance() as SlowUnmountRoot | null;
+    it('third unmount() call after completion does not call onUnmount again', async () => {
+      let releaseCalled = false;
+      const runtime = await GraphRuntime.mount(
+        h(LatchedUnmountRoot, {
+          release: () => {
+            releaseCalled = true;
+          },
+        }),
+      );
+      const root = runtime.getRootInstance() as LatchedUnmountRoot | null;
 
       expect(root).not.toBeNull();
       expect(runtime.isActive()).toBe(true);
 
       if (root === null) {
-        throw new Error('expected SlowUnmountRoot instance');
+        throw new Error('expected LatchedUnmountRoot instance');
       }
 
-      // First unmount
-      await runtime.unmount();
+      // Start first unmount
+      const unmount1 = runtime.unmount();
+
+      // Wait until unmount has started
+      while (!releaseCalled) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      }
+
+      // Release the latch to let unmount complete
+      root.releaseUnmount();
+      await unmount1;
 
       expect(runtime.isActive()).toBe(false);
       expect(root.unmountCompleted).toBe(true);
+      expect(root.unmountCalls).toBe(1);
 
-      // Second unmount after completion should return immediately (no-op)
-      const unmount2Start = Date.now();
+      // Second unmount after completion should be a no-op
       await runtime.unmount();
-      const unmount2Duration = Date.now() - unmount2Start;
 
-      // Should be essentially instant (< 5ms)
-      expect(unmount2Duration).toBeLessThan(5);
+      // onUnmount should not have been called again
+      expect(root.unmountCalls).toBe(1);
+
+      // Third unmount also a no-op
+      await runtime.unmount();
+      expect(root.unmountCalls).toBe(1);
+    });
+
+    it('concurrent join follows the first caller\'s options (mixed rejectOnCleanupError)', async () => {
+      interface FailingUnmountProps {
+        release?: () => void;
+      }
+
+      class FailingLatchedRoot extends Component<
+        Record<string, never>,
+        FailingUnmountProps
+      > {
+        public unmountStarted = false;
+
+        public unmountCompleted = false;
+
+        public unmountCalls = 0;
+
+        private release: (() => void) | null = null;
+
+        constructor (props: FailingUnmountProps) {
+          super(props);
+          this.state = {};
+        }
+
+        public override async onUnmount (): Promise<void> {
+          this.unmountCalls += 1;
+          this.unmountStarted = true;
+
+          await new Promise<void>((resolve) => {
+            this.release = () => {
+              resolve();
+            };
+            if (this.props.release) {
+              this.props.release();
+            }
+          });
+
+          this.unmountCompleted = true;
+          throw new Error('onUnmount cleanup error');
+        }
+
+        public releaseUnmount (): void {
+          if (this.release) {
+            this.release();
+          }
+        }
+
+        public override compose (): null {
+          return null;
+        }
+      }
+
+      let releaseCalled = false;
+      const runtime = await GraphRuntime.mount(
+        h(FailingLatchedRoot, {
+          release: () => {
+            releaseCalled = true;
+          },
+        }),
+      );
+      const root = runtime.getRootInstance() as FailingLatchedRoot | null;
+
+      expect(root).not.toBeNull();
+
+      if (root === null) {
+        throw new Error('expected FailingLatchedRoot instance');
+      }
+
+      // First caller: default (swallow errors)
+      const unmount1 = runtime.unmount();
+
+      // Wait until unmount has started
+      while (!releaseCalled) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      }
+
+      expect(root.unmountStarted).toBe(true);
+      expect(root.unmountCompleted).toBe(false);
+
+      // Second caller: opt-in to rejection
+      // But it should still RESOLVE because it joins the first caller's promise
+      const unmount2 = runtime.unmount({ rejectOnCleanupError: true });
+
+      // Release the latch
+      root.releaseUnmount();
+
+      // First caller resolves (swallows error)
+      await expect(unmount1).resolves.toBeUndefined();
+
+      // Second caller also resolves (follows first caller's options)
+      // This documents current contract: concurrent join uses the first caller's options
+      await expect(unmount2).resolves.toBeUndefined();
+
+      // Cleanup still ran
+      expect(root.unmountCalls).toBe(1);
+      expect(runtime.isActive()).toBe(false);
     });
   });
 
@@ -272,18 +428,27 @@ describe('GraphRuntime teardown observability (issue #20)', () => {
     interface DeepFailProps {
       depth: number;
       failAt: number;
+      tracker: Map<number, { unmountCalls: number; unmountOrder: number }>;
     }
 
-    class DeepFailNode extends Component<Record<string, never>, DeepFailProps> {
-      public unmountCalls = 0;
+    let unmountOrderCounter = 0;
 
+    class DeepFailNode extends Component<Record<string, never>, DeepFailProps> {
       constructor (props: DeepFailProps) {
         super(props);
         this.state = {};
+        this.props.tracker.set(this.props.depth, { unmountCalls: 0, unmountOrder: -1 });
       }
 
       public override onUnmount (): void {
-        this.unmountCalls += 1;
+        const entry = this.props.tracker.get(this.props.depth);
+        if (entry) {
+          entry.unmountCalls += 1;
+          if (entry.unmountOrder === -1) {
+            entry.unmountOrder = unmountOrderCounter++;
+          }
+        }
+
         if (this.props.depth === this.props.failAt) {
           throw new Error(`deep unmount fail at depth ${String(this.props.depth)}`);
         }
@@ -298,6 +463,7 @@ describe('GraphRuntime teardown observability (issue #20)', () => {
           h(DeepFailNode, {
             depth: this.props.depth - 1,
             failAt: this.props.failAt,
+            tracker: this.props.tracker,
           }),
         ];
       }
@@ -306,19 +472,46 @@ describe('GraphRuntime teardown observability (issue #20)', () => {
     it('deep tree cleanup continues despite mid-depth failure', async () => {
       const depth = 8;
       const failAt = 4;
-      const runtime = await GraphRuntime.mount(h(DeepFailNode, { depth, failAt }));
+      const tracker = new Map<number, { unmountCalls: number; unmountOrder: number }>();
+      unmountOrderCounter = 0;
+
+      const runtime = await GraphRuntime.mount(
+        h(DeepFailNode, { depth, failAt, tracker }),
+      );
 
       expect(runtime.isActive()).toBe(true);
 
       // Default unmount swallows the error
       await expect(runtime.unmount()).resolves.toBeUndefined();
       expect(runtime.isActive()).toBe(false);
+
+      // Every depth 0..8 must have been unmounted exactly once
+      for (let d = 0; d <= depth; d++) {
+        const entry = tracker.get(d);
+        expect(entry).toBeDefined();
+        expect(entry!.unmountCalls).toBe(1);
+      }
+
+      // Children-before-parent order: depth 0 should unmount before depth 8
+      const order0 = tracker.get(0)!.unmountOrder;
+      const order8 = tracker.get(depth)!.unmountOrder;
+      expect(order0).toBeLessThan(order8);
+
+      // The failing node (depth 4) should also have been unmounted
+      const failEntry = tracker.get(failAt);
+      expect(failEntry).toBeDefined();
+      expect(failEntry!.unmountCalls).toBe(1);
     });
 
     it('deep tree cleanup error is observable with opt-in', async () => {
       const depth = 8;
       const failAt = 4;
-      const runtime = await GraphRuntime.mount(h(DeepFailNode, { depth, failAt }));
+      const tracker = new Map<number, { unmountCalls: number; unmountOrder: number }>();
+      unmountOrderCounter = 0;
+
+      const runtime = await GraphRuntime.mount(
+        h(DeepFailNode, { depth, failAt, tracker }),
+      );
 
       expect(runtime.isActive()).toBe(true);
 
@@ -327,6 +520,23 @@ describe('GraphRuntime teardown observability (issue #20)', () => {
       );
 
       expect(runtime.isActive()).toBe(false);
+
+      // Even with opt-in rejection, all depths must have been unmounted exactly once
+      for (let d = 0; d <= depth; d++) {
+        const entry = tracker.get(d);
+        expect(entry).toBeDefined();
+        expect(entry!.unmountCalls).toBe(1);
+      }
+
+      // Children-before-parent order still enforced
+      const order0 = tracker.get(0)!.unmountOrder;
+      const order8 = tracker.get(depth)!.unmountOrder;
+      expect(order0).toBeLessThan(order8);
+
+      // The failing node was unmounted and threw
+      const failEntry = tracker.get(failAt);
+      expect(failEntry).toBeDefined();
+      expect(failEntry!.unmountCalls).toBe(1);
     });
   });
 });
