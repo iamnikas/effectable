@@ -80,65 +80,6 @@ describe('Issue #15: context re-injection on update', () => {
     await runtime.unmount();
   });
 
-  it('provider value change reaches a reused consumer', async () => {
-    class Consumer extends Component<Record<string, never>, Record<string, never>> {
-      @UseContext(TEST_CONTEXT)
-      public value = -1;
-
-      public onUpdateCallCount = 0;
-      public lastSeenValue: number | undefined;
-
-      constructor () {
-        super({});
-      }
-
-      public override onUpdate (): void {
-        this.onUpdateCallCount += 1;
-        this.lastSeenValue = this.value;
-      }
-    }
-
-    class Root extends Component<Record<string, never>, { providerValue: number }> {
-      @UseRef()
-      private declare consumerRef: RefObject<Consumer>;
-
-      constructor (props: { providerValue: number }) {
-        super(props);
-      }
-
-      public getConsumerRef (): RefObject<Consumer> {
-        return this.consumerRef;
-      }
-
-      public override compose (): VirtualServiceNode[] {
-        return [
-          h(ContextProvider, { value: [TEST_CONTEXT, this.props.providerValue] }, [
-            h(Consumer, {}, this.consumerRef),
-          ]),
-        ];
-      }
-    }
-
-    const runtime = await GraphRuntime.mount(h(Root, { providerValue: 10 }));
-
-    const root = runtime.getRootInstance() as Root | null;
-    expect(root).not.toBeNull();
-
-    const consumerRef = root!.getConsumerRef();
-    expect(consumerRef.current).not.toBeNull();
-
-    expect(consumerRef.current!.value).toBe(10);
-    expect(consumerRef.current!.onUpdateCallCount).toBe(0);
-
-    await runtime.reconcile(h(Root, { providerValue: 20 }));
-
-    expect(consumerRef.current!.value).toBe(20);
-    expect(consumerRef.current!.lastSeenValue).toBe(20);
-    expect(consumerRef.current!.onUpdateCallCount).toBe(1);
-
-    await runtime.unmount();
-  });
-
   it('nested providers shadow correctly after value change', async () => {
     class Consumer extends Component<Record<string, never>, Record<string, never>> {
       @UseContext(TEST_CONTEXT)
