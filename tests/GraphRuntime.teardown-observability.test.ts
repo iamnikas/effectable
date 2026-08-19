@@ -539,4 +539,325 @@ describe('GraphRuntime teardown observability (issue #20)', () => {
       expect(failEntry!.unmountCalls).toBe(1);
     });
   });
+
+  describe('RED LOCKS: teardown holes that must be fixed', () => {
+    // Hole 1: concurrent unmount must stay pending until destroy finishes
+    it('HOLE 1: concurrent unmount stays pending while onUnmount executes (not just state check)', async () => {
+      class LatchedUnmountRoot extends Component<
+        Record<string, never>,
+        { release?: () => void }
+      > {
+        public unmountStarted = false;
+
+        public unmountCompleted = false;
+
+        public unmountCalls = 0;
+
+        private release: (() => void) | null = null;
+
+        constructor (props: { release?: () => void }) {
+          super(props);
+          this.state = {};
+        }
+
+        public override async onUnmount (): Promise<void> {
+          this.unmountCalls += 1;
+          this.unmountStarted = true;
+
+          await new Promise<void>((resolve) => {
+            this.release = () => {
+              resolve();
+            };
+            if (this.props.release) {
+              this.props.release();
+            }
+          });
+
+          this.unmountCompleted = true;
+        }
+
+        public releaseUnmount (): void {
+          if (this.release) {
+            this.release();
+          }
+        }
+
+        public override compose (): null {
+          return null;
+        }
+      }
+
+      let releaseCalled = false;
+      const runtime = await GraphRuntime.mount(
+        h(LatchedUnmountRoot, {
+          release: () => {
+            releaseCalled = true;
+          },
+        }),
+      );
+      const root = runtime.getRootInstance() as LatchedUnmountRoot | null;
+
+      if (root === null) {
+        throw new Error('expected LatchedUnmountRoot instance');
+      }
+
+      // 1. Start first unmount
+      const p1 = runtime.unmount();
+
+      // 2. Wait until onUnmount started (latch released)
+      while (!releaseCalled) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      }
+
+      // 3. At this point: onUnmount is in-flight but not completed
+      expect(root.unmountStarted).toBe(true);
+      expect(root.unmountCompleted).toBe(false);
+
+      // 4. Start second unmount
+      const p2 = runtime.unmount();
+
+      // 5. Track if p2 settles
+      let p2Settled = false;
+      void p2.then(
+        () => {
+          p2Settled = true;
+        },
+        () => {
+          p2Settled = true;
+        },
+      );
+
+      // 6. Flush microtasks
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // 7. THE LOCK: p2 must NOT have settled yet while latch is held
+      // This will FAIL because current code settles p2 immediately on state check
+      expect(p2Settled).toBe(false);
+      expect(root.unmountCompleted).toBe(false);
+
+      // 8. Now release latch and verify both resolve, onUnmount called once
+      root.releaseUnmount();
+      await Promise.all([p1, p2]);
+
+      expect(root.unmountCompleted).toBe(true);
+      expect(root.unmountCalls).toBe(1);
+    });
+
+    // Hole 2: reconcile DELETE with throw in destroyFiber must not skip remaining orphans
+    it('HOLE 2: reconcile DELETE orphans continues even if one ref.current=null throws', async () => {
+      // Helper to create a ref that throws when cleared
+      function throwingClearRef<T> (label: string) {
+        let value: T | null = null;
+        return {
+          get current () {
+            return value;
+          },
+          set current (next: T | null) {
+            if (next === null && value !== null) {
+              throw new Error(`ref clear failed: ${label}`);
+            }
+            value = next;
+          },
+        };
+      }
+
+      interface CountingLeafProps {
+        label: string;
+      }
+
+      class CountingLeaf extends Component<Record<string, never>, CountingLeafProps> {
+        public onMountCalls = 0;
+
+        public onUnmountCalls = 0;
+
+        constructor (props: CountingLeafProps) {
+          super(props);
+          this.state = {};
+        }
+
+        public override onMount (): void {
+          this.onMountCalls += 1;
+        }
+
+        public override onUnmount (): void {
+          this.onUnmountCalls += 1;
+        }
+
+        public override compose (): null {
+          return null;
+        }
+      }
+
+      interface HostProps {
+        keys: string[];
+      }
+
+      const refA = { current: null as CountingLeaf | null };
+      const refB = { current: null as CountingLeaf | null };
+      const refC = throwingClearRef<CountingLeaf>('C');
+      const refD = { current: null as CountingLeaf | null };
+      const refE = { current: null as CountingLeaf | null };
+
+      class Host extends Component<Record<string, never>, HostProps> {
+        constructor (props: HostProps) {
+          super(props);
+          this.state = {};
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          const refs: Array<{ current: CountingLeaf | null }> = [
+            refA,
+            refB,
+            refC,
+            refD,
+            refE,
+          ];
+          return this.props.keys.map((key, idx) => {
+            const node = h(CountingLeaf, { label: key }, key);
+            if (idx < refs.length) {
+              node.ref = refs[idx];
+            }
+            return node;
+          });
+        }
+      }
+
+      // Mount with 5 children: a,b,c,d,e
+      const runtime = await GraphRuntime.mount(h(Host, { keys: ['a', 'b', 'c', 'd', 'e'] }));
+
+      expect(refA.current).not.toBeNull();
+      expect(refB.current).not.toBeNull();
+      expect(refC.current).not.toBeNull();
+      expect(refD.current).not.toBeNull();
+      expect(refE.current).not.toBeNull();
+
+      const instanceB = refB.current!;
+      const instanceC = refC.current!;
+      const instanceD = refD.current!;
+      const instanceE = refE.current!;
+
+      // Reconcile to only child 'a' (orphans b,c,d,e)
+      // This will trigger DELETE operations, and c's ref will throw during destroyFiber
+      try {
+        await runtime.reconcile(h(Host, { keys: ['a'] }));
+      } catch {
+        // Expected: ref clear for 'c' throws
+      }
+
+      // THE LOCK: ALL orphans must have run onUnmount, even though c's destroy threw
+      // This will FAIL because current code fail-stops on c's throw and skips d,e
+      expect(instanceB.onUnmountCalls).toBe(1);
+      expect(instanceC.onUnmountCalls).toBe(1);
+      expect(instanceD.onUnmountCalls).toBe(1);
+      expect(instanceE.onUnmountCalls).toBe(1);
+
+      // Child 'a' should still be mounted or cleaned consistently
+      // (not testing 'a' survival requirement per spec, just that d/e were cleaned)
+    });
+
+    // Hole 3: partial PLACE then throw: newly materialized nodes must be unmounted
+    it('HOLE 3: reconcile PLACE with mid-flight throw cleans up previously placed new nodes', async () => {
+      interface LeafProps {
+        key: string;
+        shouldThrow: boolean;
+      }
+
+      const tracker = new Map<
+        string,
+        { onMountCalls: number; onUnmountCalls: number; instance: Component<any, any> }
+      >();
+
+      class TrackingLeaf extends Component<Record<string, never>, LeafProps> {
+        constructor (props: LeafProps) {
+          super(props);
+          this.state = {};
+          tracker.set(props.key, { onMountCalls: 0, onUnmountCalls: 0, instance: this });
+        }
+
+        public override onMount (): void {
+          const entry = tracker.get(this.props.key)!;
+          entry.onMountCalls += 1;
+
+          if (this.props.shouldThrow) {
+            throw new Error(`onMount throw: ${this.props.key}`);
+          }
+        }
+
+        public override onUnmount (): void {
+          const entry = tracker.get(this.props.key);
+          if (entry) {
+            entry.onUnmountCalls += 1;
+          }
+        }
+
+        public override compose (): null {
+          return null;
+        }
+      }
+
+      interface HostProps {
+        count: number;
+        throwAt: number;
+      }
+
+      class Host extends Component<Record<string, never>, HostProps> {
+        constructor (props: HostProps) {
+          super(props);
+          this.state = {};
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          const result: VirtualServiceNode[] = [];
+          for (let i = 0; i < this.props.count; i++) {
+            const key = `k${String(i)}`;
+            const shouldThrow = i === this.props.throwAt;
+            result.push(h(TrackingLeaf, { key, shouldThrow }, key));
+          }
+          return result;
+        }
+      }
+
+      tracker.clear();
+
+      // Mount with 2 children: k0, k1
+      const runtime = await GraphRuntime.mount(h(Host, { count: 2, throwAt: -1 }));
+
+      expect(tracker.get('k0')!.onMountCalls).toBe(1);
+      expect(tracker.get('k1')!.onMountCalls).toBe(1);
+
+      // Reconcile to 8 children: k0..k7, with k5 throwing in onMount
+      try {
+        await runtime.reconcile(h(Host, { count: 8, throwAt: 5 }));
+      } catch {
+        // Expected: k5 throws during onMount
+      }
+
+      // THE LOCK: newly PLACE'd children that mounted BEFORE k5 (k2, k3, k4)
+      // must have been cleaned up (onUnmount === 1)
+      // This will FAIL because current code does not clean up k2-k4
+      const k0 = tracker.get('k0')!;
+      const k1 = tracker.get('k1')!;
+      const k2 = tracker.get('k2')!;
+      const k3 = tracker.get('k3')!;
+      const k4 = tracker.get('k4')!;
+      const k5 = tracker.get('k5')!;
+
+      // Old tree (k0, k1) should be cleaned by fail-stop
+      expect(k0.onUnmountCalls).toBe(1);
+      expect(k1.onUnmountCalls).toBe(1);
+
+      // Newly placed k2-k4 must be cleaned
+      expect(k2.onUnmountCalls).toBe(1);
+      expect(k3.onUnmountCalls).toBe(1);
+      expect(k4.onUnmountCalls).toBe(1);
+
+      // k5 may have onUnmount 0 or 1 depending on engine (accept either, but not left ready)
+      // We only care that k2-k4 are cleaned
+      expect(k5.onMountCalls).toBe(1); // It tried to mount and threw
+
+      // Later unmount should not be needed to rescue k2-k4
+      // (runtime should be inactive or reconcile should have cleaned them)
+    });
+  });
 });
