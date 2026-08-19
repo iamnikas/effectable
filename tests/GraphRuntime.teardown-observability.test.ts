@@ -859,5 +859,283 @@ describe('GraphRuntime teardown observability (issue #20)', () => {
       // Later unmount should not be needed to rescue k2-k4
       // (runtime should be inactive or reconcile should have cleaned them)
     });
+
+    // Hole A: failStop destroy is not joinable
+    it('HOLE A: unmount() awaits in-flight fail-stop teardown before concluding', async () => {
+      class LatchedUnmountRoot extends Component<
+        Record<string, never>,
+        { shouldThrow?: boolean }
+      > {
+        public onUnmountCalls = 0;
+
+        private release: (() => void) | null = null;
+
+        constructor (props: { shouldThrow?: boolean }) {
+          super(props);
+          this.state = {};
+        }
+
+        public override async onUnmount (): Promise<void> {
+          this.onUnmountCalls += 1;
+
+          // Latch: wait for external release
+          await new Promise<void>((resolve) => {
+            this.release = resolve;
+          });
+        }
+
+        public releaseUnmount (): void {
+          if (this.release) {
+            this.release();
+          }
+        }
+
+        public override compose (): null {
+          if (this.props.shouldThrow === true) {
+            throw new Error('compose throw for fail-stop');
+          }
+          return null;
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(h(LatchedUnmountRoot, { shouldThrow: false }));
+      const root = runtime.getRootInstance() as LatchedUnmountRoot | null;
+
+      if (root === null) {
+        throw new Error('expected LatchedUnmountRoot instance');
+      }
+
+      // Trigger fail-stop by reconciling to a tree that throws in compose
+      let failStopTriggered = false;
+      const failStopPromise = runtime
+        .reconcile(h(LatchedUnmountRoot, { shouldThrow: true }))
+        .catch(() => {
+          failStopTriggered = true;
+        });
+
+      // Wait until fail-stop starts destroy (onUnmount latch is pending)
+      while (root.onUnmountCalls === 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      }
+
+      // At this point: fail-stop has nulled currentRoot, destroy (onUnmount) is in flight
+      expect(failStopTriggered).toBe(false);
+      expect(root.onUnmountCalls).toBe(1);
+
+      // Call unmount() while fail-stop destroy is in flight
+      const unmountPromise = runtime.unmount();
+
+      // Track if unmount settles
+      let unmountSettled = false;
+      void unmountPromise.then(
+        () => {
+          unmountSettled = true;
+        },
+        () => {
+          unmountSettled = true;
+        },
+      );
+
+      // Flush microtasks
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // THE LOCK: unmount() must NOT have settled yet while latch is held
+      expect(unmountSettled).toBe(false);
+
+      // Release latch and verify both promises resolve, onUnmount called once
+      root.releaseUnmount();
+      await Promise.all([failStopPromise, unmountPromise]);
+
+      expect(root.onUnmountCalls).toBe(1);
+      expect(runtime.getState()).toBe('unmounted');
+    });
+
+    // Hole B: finalize dispose / ref.current = null can reject default unmount
+    it('HOLE B.1: root throwing-clear ref, default unmount resolves, onUnmount === 1', async () => {
+      function throwingClearRef<T> (label: string) {
+        let value: T | null = null;
+        return {
+          get current () {
+            return value;
+          },
+          set current (next: T | null) {
+            if (next === null && value !== null) {
+              throw new Error(`ref clear failed: ${label}`);
+            }
+            value = next;
+          },
+        };
+      }
+
+      class TrackingRoot extends Component<Record<string, never>, Record<string, never>> {
+        public onUnmountCalls = 0;
+
+        constructor (props: Record<string, never>) {
+          super(props);
+          this.state = {};
+        }
+
+        public override onUnmount (): void {
+          this.onUnmountCalls += 1;
+        }
+
+        public override compose (): null {
+          return null;
+        }
+      }
+
+      const throwingRef = throwingClearRef<TrackingRoot>('root');
+      const rootNode = h(TrackingRoot, {});
+      rootNode.ref = throwingRef;
+      const runtime = await GraphRuntime.mount(rootNode);
+      const root = throwingRef.current;
+
+      if (root === null) {
+        throw new Error('expected TrackingRoot instance');
+      }
+
+      // Default unmount (rejectOnCleanupError: false) must resolve even if ref throws
+      await expect(runtime.unmount()).resolves.toBeUndefined();
+
+      expect(root.onUnmountCalls).toBe(1);
+      expect(runtime.getState()).toBe('unmounted');
+    });
+
+    it('HOLE B.2: root throwing-clear ref, rejectOnCleanupError rejects mentioning ref clear', async () => {
+      function throwingClearRef<T> (label: string) {
+        let value: T | null = null;
+        return {
+          get current () {
+            return value;
+          },
+          set current (next: T | null) {
+            if (next === null && value !== null) {
+              throw new Error(`ref clear failed: ${label}`);
+            }
+            value = next;
+          },
+        };
+      }
+
+      class TrackingRoot extends Component<Record<string, never>, Record<string, never>> {
+        public onUnmountCalls = 0;
+
+        constructor (props: Record<string, never>) {
+          super(props);
+          this.state = {};
+        }
+
+        public override onUnmount (): void {
+          this.onUnmountCalls += 1;
+        }
+
+        public override compose (): null {
+          return null;
+        }
+      }
+
+      const throwingRef = throwingClearRef<TrackingRoot>('root');
+      const rootNode = h(TrackingRoot, {});
+      rootNode.ref = throwingRef;
+      const runtime = await GraphRuntime.mount(rootNode);
+      const root = throwingRef.current;
+
+      if (root === null) {
+        throw new Error('expected TrackingRoot instance');
+      }
+
+      // rejectOnCleanupError: true must reject with the ref clear error
+      await expect(runtime.unmount({ rejectOnCleanupError: true })).rejects.toThrow('ref clear failed: root');
+
+      expect(root.onUnmountCalls).toBe(1);
+      expect(runtime.getState()).toBe('unmounted');
+    });
+
+    it('HOLE B.3: wide tree, middle child throwing ref, default unmount resolves, all onUnmount === 1', async () => {
+      function throwingClearRef<T> (label: string) {
+        let value: T | null = null;
+        return {
+          get current () {
+            return value;
+          },
+          set current (next: T | null) {
+            if (next === null && value !== null) {
+              throw new Error(`ref clear failed: ${label}`);
+            }
+            value = next;
+          },
+        };
+      }
+
+      class TrackingLeaf extends Component<Record<string, never>, { label: string }> {
+        public onUnmountCalls = 0;
+
+        constructor (props: { label: string }) {
+          super(props);
+          this.state = {};
+        }
+
+        public override onUnmount (): void {
+          this.onUnmountCalls += 1;
+        }
+
+        public override compose (): null {
+          return null;
+        }
+      }
+
+      const refA = { current: null as TrackingLeaf | null };
+      const refB = throwingClearRef<TrackingLeaf>('b');
+      const refC = { current: null as TrackingLeaf | null };
+
+      class TrackingParent extends Component<Record<string, never>, Record<string, never>> {
+        public onUnmountCalls = 0;
+
+        constructor (props: Record<string, never>) {
+          super(props);
+          this.state = {};
+        }
+
+        public override onUnmount (): void {
+          this.onUnmountCalls += 1;
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          const nodeA = h(TrackingLeaf, { label: 'a' }, 'a');
+          nodeA.ref = refA;
+          const nodeB = h(TrackingLeaf, { label: 'b' }, 'b');
+          nodeB.ref = refB;
+          const nodeC = h(TrackingLeaf, { label: 'c' }, 'c');
+          nodeC.ref = refC;
+          return [nodeA, nodeB, nodeC];
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(h(TrackingParent, {}));
+      const parent = runtime.getRootInstance() as TrackingParent | null;
+
+      if (parent === null) {
+        throw new Error('expected TrackingParent instance');
+      }
+
+      const leafA = refA.current;
+      const leafB = refB.current;
+      const leafC = refC.current;
+
+      if (leafA === null || leafB === null || leafC === null) {
+        throw new Error('expected all leaf instances');
+      }
+
+      // Default unmount must resolve even if middle child ref throws
+      await expect(runtime.unmount()).resolves.toBeUndefined();
+
+      // All siblings and parent must have run onUnmount
+      expect(leafA.onUnmountCalls).toBe(1);
+      expect(leafB.onUnmountCalls).toBe(1);
+      expect(leafC.onUnmountCalls).toBe(1);
+      expect(parent.onUnmountCalls).toBe(1);
+      expect(runtime.getState()).toBe('unmounted');
+    });
   });
 });

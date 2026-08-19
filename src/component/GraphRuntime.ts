@@ -241,6 +241,13 @@ export class GraphRuntime {
   private cachedUnmountPromise: Promise<void> | null = null;
 
   /**
+   * Pending fail-stop teardown work.
+   * When failStop nulls currentRoot but destroy is async, this tracks the in-flight cleanup.
+   * unmount() must await this before concluding teardown is finished.
+   */
+  private pendingTeardown: Promise<void> | null = null;
+
+  /**
    * Instances are created only via {@link GraphRuntime.mount}; direct `new GraphRuntime()` is unavailable externally.
    */
   private constructor () {}
@@ -284,12 +291,17 @@ export class GraphRuntime {
       const destroyRes = this.destroyFiber(root, cleanupErrors);
       
       if (isThenable(destroyRes)) {
-        // Async path: attach cleanup errors after completion
-        return destroyRes.then(() => {
-          if (cleanupErrors.length > 0) {
-            (error as Error & { rollbackErrors?: Error[] }).rollbackErrors = cleanupErrors;
-          }
-        });
+        // Async path: track pending teardown so unmount() can join
+        this.pendingTeardown = destroyRes
+          .then(() => {
+            if (cleanupErrors.length > 0) {
+              (error as Error & { rollbackErrors?: Error[] }).rollbackErrors = cleanupErrors;
+            }
+          })
+          .finally(() => {
+            this.pendingTeardown = null;
+          });
+        return this.pendingTeardown;
       }
       
       // Sync path: attach cleanup errors immediately
@@ -349,6 +361,45 @@ export class GraphRuntime {
     if (ref.current === expectedOwner) {
       ref.current = null;
     }
+  }
+
+  /**
+   * Finalize fiber destroy: dispose wiring, clear ref, update status.
+   * Collects errors when collectErrors is provided (best-effort cleanup).
+   * When collectErrors is null, errors are thrown immediately.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber being finalized
+   * @param {Error[] | null} collectErrors - array to collect errors (null to throw)
+   * @returns {void}
+   */
+  private finalizeFiberDestroy (fiber: RuntimeFiber<unknown>, collectErrors: Error[] | null): void {
+    // Dispose runtime bus wiring
+    if (collectErrors !== null) {
+      try {
+        this.disposeEffectableRuntimeBusWiring(fiber);
+      } catch (err: unknown) {
+        collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    } else {
+      this.disposeEffectableRuntimeBusWiring(fiber);
+    }
+
+    // Clear ref
+    const ref = fiber.vnode.ref;
+    if (ref !== undefined) {
+      if (collectErrors !== null) {
+        try {
+          ref.current = null;
+        } catch (err: unknown) {
+          collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+        }
+      } else {
+        ref.current = null;
+      }
+    }
+
+    // Update lifecycle status
+    fiber.lifecycleStatus = fiber.engine.getStatus();
   }
 
   /**
@@ -1024,6 +1075,15 @@ export class GraphRuntime {
       // Issue #20 HOLE 1: stay UNMOUNTING during destroy (not UNMOUNTED)
       // If already FAILED, keep FAILED state through destroy
       // State transition to UNMOUNTED happens AFTER destroy completes
+
+      // If pendingTeardown is active (fail-stop in progress), await it first
+      if (this.pendingTeardown !== null) {
+        try {
+          await this.pendingTeardown;
+        } catch {
+          // Ignore errors — they are already attached to the fail-stop primary error
+        }
+      }
 
       if (this.currentRoot !== null) {
         // Issue #20: collect cleanup errors during unmount
@@ -2094,12 +2154,7 @@ export class GraphRuntime {
     }
 
     // Always finalize the fiber even if shutdown failed (best-effort cleanup)
-    this.disposeEffectableRuntimeBusWiring(fiber);
-    const ref = fiber.vnode.ref;
-    if (ref !== undefined) {
-      ref.current = null;
-    }
-    fiber.lifecycleStatus = fiber.engine.getStatus();
+    this.finalizeFiberDestroy(fiber, collectErrors);
   }
 
   /**
@@ -2169,12 +2224,7 @@ export class GraphRuntime {
     }
 
     // Always finalize even if shutdown failed
-    this.disposeEffectableRuntimeBusWiring(fiber);
-    const ref = fiber.vnode.ref;
-    if (ref !== undefined) {
-      ref.current = null;
-    }
-    fiber.lifecycleStatus = fiber.engine.getStatus();
+    this.finalizeFiberDestroy(fiber, collectErrors);
   }
 
   /**
@@ -2202,12 +2252,7 @@ export class GraphRuntime {
     }
 
     // Always finalize even if shutdown failed
-    this.disposeEffectableRuntimeBusWiring(fiber);
-    const ref = fiber.vnode.ref;
-    if (ref !== undefined) {
-      ref.current = null;
-    }
-    fiber.lifecycleStatus = fiber.engine.getStatus();
+    this.finalizeFiberDestroy(fiber, collectErrors);
   }
 
   // ---------------------------------------------------------------------------
