@@ -105,6 +105,9 @@ const HookBit = {
   Mount: 1 << 0,
   Update: 1 << 1,
   Unmount: 1 << 2,
+  StateUpdate: 1 << 3,
+  PropsUpdate: 1 << 4,
+  ContextUpdate: 1 << 5,
 } as const;
 
 /**
@@ -177,9 +180,12 @@ export class LifecycleEngine {
    */
   public initHookFlags (instance: Component<unknown, unknown>): void {
     this.hookFlags =
-      (typeof instance.onMount   === 'function' ? HookBit.Mount   : 0) |
-      (typeof instance.onUpdate  === 'function' ? HookBit.Update  : 0) |
-      (typeof instance.onUnmount === 'function' ? HookBit.Unmount : 0);
+      (typeof instance.onMount         === 'function' ? HookBit.Mount         : 0) |
+      (typeof instance.onUpdate        === 'function' ? HookBit.Update        : 0) |
+      (typeof instance.onUnmount       === 'function' ? HookBit.Unmount       : 0) |
+      (typeof instance.onStateUpdate   === 'function' ? HookBit.StateUpdate   : 0) |
+      (typeof instance.onPropsUpdate   === 'function' ? HookBit.PropsUpdate   : 0) |
+      (typeof instance.onContextUpdate === 'function' ? HookBit.ContextUpdate : 0);
 
     this.hookFlagsInitialized = true;
   }
@@ -394,12 +400,39 @@ export class LifecycleEngine {
   }
 
   /**
-   * Whether the node can accept an update pass (`onUpdate`): only stage `ready`.
+   * Whether the node can accept an update pass (`onUpdate`, `onStateUpdate`, `onPropsUpdate`, `onContextUpdate`): only stage `ready`.
    *
    * @returns {boolean} `true` if an update-pass may be called
    */
   public canUpdate (): boolean {
     return this.currentStage === STAGE.Ready;
+  }
+
+  /**
+   * Whether the instance has the `onStateUpdate` hook.
+   *
+   * @returns {boolean} `true` if `onStateUpdate` is present
+   */
+  public hasStateUpdate (): boolean {
+    return (this.hookFlags & HookBit.StateUpdate) !== 0;
+  }
+
+  /**
+   * Whether the instance has the `onPropsUpdate` hook.
+   *
+   * @returns {boolean} `true` if `onPropsUpdate` is present
+   */
+  public hasPropsUpdate (): boolean {
+    return (this.hookFlags & HookBit.PropsUpdate) !== 0;
+  }
+
+  /**
+   * Whether the instance has the `onContextUpdate` hook.
+   *
+   * @returns {boolean} `true` if `onContextUpdate` is present
+   */
+  public hasContextUpdate (): boolean {
+    return (this.hookFlags & HookBit.ContextUpdate) !== 0;
   }
 
   /**

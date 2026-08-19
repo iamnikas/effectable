@@ -113,19 +113,40 @@ implements Lifecycle {
       for (const k in src) {
         target[k] = src[k];
       }
-      this.onUpdate(prev, prev);
-      (this as unknown as { [SCHEDULE_UPDATE_HOOK]?: () => void })[SCHEDULE_UPDATE_HOOK]?.();
+      // Call onStateUpdate if available, otherwise fall back to onUpdate for backward compatibility
+      // Ensure SCHEDULE_UPDATE_HOOK is called even if the hook throws (issue #16)
+      try {
+        if (typeof this.onStateUpdate === 'function') {
+          this.onStateUpdate(prev, prev);
+        } else {
+          this.onUpdate(prev, prev);
+        }
+      } finally {
+        (this as unknown as { [SCHEDULE_UPDATE_HOOK]?: () => void })[SCHEDULE_UPDATE_HOOK]?.();
+      }
       return;
     }
 
     // Shallow-copy previous state and delta to avoid mutating the original state
     const next = { ...prev, ...delta };
     this.state = next as S;
-    this.onUpdate(prev, next);
-    (this as unknown as { [SCHEDULE_UPDATE_HOOK]?: () => void })[SCHEDULE_UPDATE_HOOK]?.();
+    // Call onStateUpdate if available, otherwise fall back to onUpdate for backward compatibility
+    // Ensure SCHEDULE_UPDATE_HOOK is called even if the hook throws (issue #16)
+    try {
+      if (typeof this.onStateUpdate === 'function') {
+        this.onStateUpdate(prev, next);
+      } else {
+        this.onUpdate(prev, next);
+      }
+    } finally {
+      (this as unknown as { [SCHEDULE_UPDATE_HOOK]?: () => void })[SCHEDULE_UPDATE_HOOK]?.();
+    }
   }
 
   /**
+   * @deprecated Use {@link onStateUpdate}, {@link onPropsUpdate}, or {@link onContextUpdate} instead.
+   * This method will be removed in the next major release.
+   * 
    * Called on every `state` change (from {@link Component.setState} or from connect-HOC
    * via `setState({})` after merging mapped props).
    * In standalone — immediately after `setState`. In mounted mode — only after a successful
@@ -138,6 +159,39 @@ implements Lifecycle {
   public onUpdate (_prev: S, _next: S): void {
     // Empty by default; subclass overrides as needed.
   }
+
+  /**
+   * Called after state changes via {@link Component.setState}.
+   * In standalone — immediately after `setState`. In mounted mode — only after a successful
+   * {@link Component.onMount} (decided by GraphRuntime). Override in subclasses.
+   *
+   * @param {S} _prev State before the update was applied.
+   * @param {S} _next State after the update was applied.
+   * @returns {void | Promise<void>}
+   */
+  onStateUpdate? (_prev: S, _next: S): void | Promise<void>;
+
+  /**
+   * Called after props change during reconcile (GraphRuntime only).
+   * Only called in mounted mode after a successful {@link Component.onMount}.
+   * Override in subclasses.
+   *
+   * @param {P} _prev Props before the update was applied.
+   * @param {P} _next Props after the update was applied.
+   * @returns {void | Promise<void>}
+   */
+  onPropsUpdate? (_prev: P, _next: P): void | Promise<void>;
+
+  /**
+   * Called after context values change (GraphRuntime only).
+   * Only called in mounted mode after a successful {@link Component.onMount}.
+   * Override in subclasses.
+   *
+   * @param {unknown} _prev Context before the update was applied.
+   * @param {unknown} _next Context after the update was applied.
+   * @returns {void | Promise<void>}
+   */
+  onContextUpdate? (_prev: unknown, _next: unknown): void | Promise<void>;
 
   /**
    * Optional: node mount in GraphRuntime. Typically used to start subscriptions,

@@ -1508,18 +1508,22 @@ export class GraphRuntime {
     // Build scope for child nodes (ContextProvider may have updated values)
     const childScope = this.buildChildScope(instance, parentScope);
 
-    // Call onUpdate if props changed
+    // Call onPropsUpdate if props changed (or onUpdate for backward compatibility)
     if (prevProps !== instance.props && current.engine.canUpdate()) {
-      try {
-        instance.onUpdate(prevProps, instance.props);
-      } catch (error: unknown) {
-        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>);
-        if (isThenable(cleanupResult)) {
-          return cleanupResult.then(() => {
+      const propsUpdateResult = this.invokePropsUpdate(instance, prevProps, instance.props);
+      if (isThenable(propsUpdateResult)) {
+        return propsUpdateResult.then(
+          () => this.continueUpdateFiberAfterPropsUpdate(current, nextVnode, parentFiber, parentScope, childScope),
+          (error: unknown) => {
+            const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>);
+            if (isThenable(cleanupResult)) {
+              return cleanupResult.then(() => {
+                throw error;
+              });
+            }
             throw error;
-          });
-        }
-        throw error;
+          },
+        );
       }
     }
 
@@ -2165,6 +2169,97 @@ export class GraphRuntime {
     }
 
     return parentScope;
+  }
+
+  /**
+   * Invokes onPropsUpdate if available, otherwise falls back to onUpdate for backward compatibility.
+   * Returns synchronously if the hook is sync, otherwise a Promise.
+   *
+   * @param {Component<unknown, unknown>} instance - component instance
+   * @param {unknown} prevProps - previous props
+   * @param {unknown} nextProps - next props
+   * @returns {void | Promise<void>}
+   */
+  private invokePropsUpdate (
+    instance: Component<unknown, unknown>,
+    prevProps: unknown,
+    nextProps: unknown,
+  ): void | Promise<void> {
+    if (typeof instance.onPropsUpdate === 'function') {
+      const result = instance.onPropsUpdate(prevProps, nextProps);
+      if (isThenable(result)) {
+        return result;
+      }
+      return;
+    }
+
+    // Fallback to onUpdate for backward compatibility
+    if (typeof instance.onUpdate === 'function') {
+      const result = instance.onUpdate(prevProps, nextProps);
+      if (isThenable(result)) {
+        return result;
+      }
+      return;
+    }
+  }
+
+  /**
+   * Continuation of {@link updateFiber} after async onPropsUpdate completes.
+   *
+   * @param {RuntimeFiber<P>} current - current fiber
+   * @param {VirtualServiceNode<P>} nextVnode - new virtual node
+   * @param {RuntimeFiber<unknown> | null} parentFiber - parent fiber
+   * @param {ContextScope} parentScope - parent scope
+   * @param {ContextScope} childScope - child scope for children
+   * @returns {RuntimeFiber<P> | Promise<RuntimeFiber<P>>}
+   */
+  private continueUpdateFiberAfterPropsUpdate<P> (
+    current: RuntimeFiber<P>,
+    nextVnode: VirtualServiceNode<P>,
+    parentFiber: RuntimeFiber<unknown> | null,
+    parentScope: ContextScope,
+    childScope: ContextScope,
+  ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    const instance = current.instance;
+    if (instance === null) {
+      throw new Error('[Effectable] GraphRuntime: instance is null after props update.');
+    }
+
+    // Update ref
+    if (nextVnode.ref !== undefined) {
+      (nextVnode.ref as RefObject<typeof instance>).current = instance;
+    }
+
+    // Reconcile child nodes (sync fast-path if all children are sync).
+    let nextChildVnodes: VirtualServiceNode[];
+    try {
+      nextChildVnodes = this.getChildVnodes(instance, nextVnode.children);
+    } catch (error: unknown) {
+      const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>);
+      if (isThenable(cleanupResult)) {
+        return cleanupResult.then(() => {
+          throw error;
+        });
+      }
+      throw error;
+    }
+
+    const childrenRes = this.reconcileChildren(
+      current.children as RuntimeFiber<unknown>[],
+      nextChildVnodes,
+      current as RuntimeFiber<unknown>,
+      childScope,
+    );
+
+    if (isThenable(childrenRes)) {
+      return childrenRes.then((nextChildren) => {
+        this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
+        return current;
+      });
+    }
+
+    this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, childrenRes);
+    return current;
   }
 }
 

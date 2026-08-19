@@ -10,13 +10,25 @@ import type { Component } from './Component';
 
 /**
  * Lifecycle interface for a GraphRuntime / connect-HOC component instance.
- * Methods are called in order: onMount -> onUpdate* -> onUnmount.
+ * Methods are called in order: onMount -> onStateUpdate/onPropsUpdate/onContextUpdate* -> onUnmount.
  */
 export interface Lifecycle {
   /** Mount: start subscriptions, timers, and background work. */
   onMount?(): void | Promise<void>;
-  /** On every state/props update (prev/next). */
+  /**
+   * @deprecated Use {@link onStateUpdate}, {@link onPropsUpdate}, or {@link onContextUpdate} instead.
+   * onUpdate will be removed in the next major release.
+   * 
+   * On every state/props update (prev/next).
+   * ISSUE: This hook was ambiguous — GraphRuntime called it with props, but Component.setState called it with state.
+   */
   onUpdate?(prev: unknown, next: unknown): void | Promise<void>;
+  /** Called after state changes via setState. Receives previous and next state. */
+  onStateUpdate?(prev: unknown, next: unknown): void | Promise<void>;
+  /** Called after props change during reconcile. Receives previous and next props. */
+  onPropsUpdate?(prev: unknown, next: unknown): void | Promise<void>;
+  /** Called after context values change. Receives previous and next context. */
+  onContextUpdate?(prev: unknown, next: unknown): void | Promise<void>;
   /** Unmount: drop subscriptions and stop side effects. */
   onUnmount?(): void | Promise<void>;
 }
