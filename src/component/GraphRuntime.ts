@@ -1505,11 +1505,28 @@ export class GraphRuntime {
       instance.props = nextVnode.props;
     }
 
+    // Re-inject context fields when parent scope changed (issue #15)
+    let contextChanged = false;
+    if (current.scope !== parentScope) {
+      try {
+        contextChanged = injectContextFields(instance, parentScope);
+      } catch (error: unknown) {
+        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>);
+        if (isThenable(cleanupResult)) {
+          return cleanupResult.then(() => {
+            throw error;
+          });
+        }
+        throw error;
+      }
+    }
+
     // Build scope for child nodes (ContextProvider may have updated values)
     const childScope = this.buildChildScope(instance, parentScope);
 
-    // Call onUpdate if props changed
-    if (prevProps !== instance.props && current.engine.canUpdate()) {
+    // Call onUpdate if props or context changed (React 16.5 class-component style: one hook)
+    const propsChanged = prevProps !== instance.props;
+    if ((propsChanged || contextChanged) && current.engine.canUpdate()) {
       try {
         instance.onUpdate(prevProps, instance.props);
       } catch (error: unknown) {
