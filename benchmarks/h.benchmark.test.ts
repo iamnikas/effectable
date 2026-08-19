@@ -29,7 +29,7 @@ class HParentComponent extends Component<Record<string, never>, BenchProps> {
   }
 }
 
-function createRef (): RefObject<Component<unknown, unknown>> {
+function createRef (): RefObject<unknown> {
   return { current: null };
 }
 
