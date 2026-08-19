@@ -23,11 +23,15 @@ const EMPTY_CHILDREN: readonly VirtualServiceNode[] = Object.freeze([]) as reado
 type EmptyProps = Record<string, never>;
 
 /**
- * Erase a concrete `RefObject<C>` to the heterogeneous vnode store type `RefObject<unknown>`.
+ * Named erase of a concrete `RefObject<C>` into the vnode store type `RefObject<unknown>`.
  *
- * Centralized widening next to the existing `type as ComponentConstructor<unknown>` erase in
- * {@link h}. Call sites keep `RefObject<Child>`; {@link VirtualServiceNode.ref} stays erased
- * for heterogeneous trees. No assertion needed: mutable property checking allows this return.
+ * `RefObject<T>` is covariant in practice (writable data property, no `in out T`), so
+ * `RefObject<Child>` → `RefObject<unknown>` already type-checks — no assertion and no
+ * branding. This helper only centralizes the store-boundary widening next to the existing
+ * `type as ComponentConstructor<unknown>` erase. Do not add `in out T` to {@link RefObject}.
+ *
+ * The reason {@link h} is generic over `C` is **call-site matching** (reject `Other` /
+ * wide `Component` / `unknown` refs), not to make Child assignable to the store.
  *
  * @template C Concrete instance type carried by the caller’s ref
  * @param {RefObject<C>} ref - typed ref from the caller
@@ -54,11 +58,12 @@ function eraseRef<C> (ref: RefObject<C>): RefObject<unknown> {
  * `key` — stable identity key for diffing dynamic lists.
  * Detected via `typeof === 'string'` in any free positional slot.
  *
- * Generic over instance type `C` so `h(Child, props, childRef)` type-checks when
- * `childRef: RefObject<Child>` under `strict` / `strictFunctionTypes`, while
- * `RefObject<Other>` is rejected. `props` uses {@link NoInfer} so `P` is inferred from
- * the constructor (same as before), not narrowed from a props literal.
- * {@link VirtualServiceNode.ref} stays `RefObject<unknown>`; widening is {@link eraseRef}.
+ * Generic over instance type `C` for **call-site matching**: `h(Child, props, childRef)`
+ * stays OK while `otherRef` / wide `Component` / `unknown` refs are type errors.
+ * `type` is `new (props: P) => C` (not `ComponentConstructor<P>`) so `C` does not collapse
+ * to `Component<unknown, P>`. `NoInfer` on `props` and on `RefObject<C>` keeps `P`/`C`
+ * inferred from the constructor, not from the props literal or the ref argument.
+ * {@link VirtualServiceNode.ref} stays `RefObject<unknown>`; store widening is {@link eraseRef}.
  *
  * @param {new (props: P) => C} type - component class
  * @param {P} [props] - component props; omit for empty props
@@ -81,14 +86,14 @@ export function h<C extends Component<unknown, EmptyProps>> (
 export function h<P, C extends Component<unknown, P>> (
   type: new (props: P) => C,
   props: NoInfer<P>,
-  refOrChildrenOrKey?: RefObject<C> | VirtualServiceNode[] | string,
+  refOrChildrenOrKey?: RefObject<NoInfer<C>> | VirtualServiceNode[] | string,
   childrenOrKey?: VirtualServiceNode[] | string,
   maybeKey?: string,
 ): VirtualServiceNode<P>;
 export function h<P, C extends Component<unknown, P>> (
   type: new (props: P) => C,
   props?: NoInfer<P>,
-  refOrChildrenOrKey?: RefObject<C> | VirtualServiceNode[] | string,
+  refOrChildrenOrKey?: RefObject<NoInfer<C>> | VirtualServiceNode[] | string,
   childrenOrKey?: VirtualServiceNode[] | string,
   maybeKey?: string,
 ): VirtualServiceNode<P> {
