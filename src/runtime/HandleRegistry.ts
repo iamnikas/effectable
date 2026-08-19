@@ -221,12 +221,14 @@ export class HandleRegistry {
    *
    * @param {string} key - handle key
    * @param {THandle} handle - imperative API object
-   * @returns {() => void} unregister function
+   * @returns {() => void} unregister function; no-op if a different handle is now registered under the same key
    */
   public register<THandle> (key: string, handle: THandle): () => void {
     this.handles.set(key, handle);
     return () => {
-      this.unregister(key);
+      if (this.handles.get(key) === handle) {
+        this.handles.delete(key);
+      }
     };
   }
 

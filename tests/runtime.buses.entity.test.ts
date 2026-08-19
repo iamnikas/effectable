@@ -101,6 +101,48 @@ describe('CommandBus', () => {
     });
     await expect(busReject.execute(cmd)).rejects.toThrow('command async reject');
   });
+
+  it('stale command disposer after clear() + re-register does not remove the new handler', async () => {
+    const bus = new CommandBus<TestCommand>();
+    const handlerA = async (): Promise<string> => 'A';
+    const handlerB = async (): Promise<string> => 'B';
+    const cmd: TestCommand = { type: 'CMD_A', payload: { v: 0 } };
+
+    const disposeA = bus.register('CMD_A', handlerA);
+    bus.clear();
+    bus.register('CMD_A', handlerB);
+
+    disposeA();
+
+    expect(await bus.execute<string>(cmd)).toBe('B');
+  });
+
+  it('repeated command disposal is a no-op and does not remove a re-registered handler', async () => {
+    const bus = new CommandBus<TestCommand>();
+    const handlerA = async (): Promise<string> => 'A';
+    const handlerB = async (): Promise<string> => 'B';
+    const cmd: TestCommand = { type: 'CMD_A', payload: { v: 0 } };
+
+    const disposeA = bus.register('CMD_A', handlerA);
+    disposeA();
+    disposeA();
+
+    bus.register('CMD_A', handlerB);
+    disposeA();
+
+    expect(await bus.execute<string>(cmd)).toBe('B');
+  });
+
+  it('disposal after command bus clear is a no-op before re-register', async () => {
+    const bus = new CommandBus<TestCommand>();
+    const disposeA = bus.register('CMD_A', async () => 'A');
+    bus.clear();
+    disposeA();
+
+    await expect(bus.execute({ type: 'CMD_A', payload: { v: 0 } })).rejects.toThrow(
+      'Command handler is not registered: CMD_A'
+    );
+  });
 });
 
 describe('QueryBus', () => {
@@ -155,6 +197,52 @@ describe('QueryBus', () => {
     });
     const q: TestQuery = { type: 'QRY_B', payload: { s: 'z' } };
     await expect(bus.execute(q)).rejects.toThrow('query async fail');
+  });
+
+  it('stale query disposer after unregister/re-register does not remove the new handler', async () => {
+    const bus = new QueryBus<TestQuery>();
+    const handlerA = (): number => 1;
+    const handlerB = (): number => 2;
+    const q: TestQuery = { type: 'QRY_B', payload: { s: 'x' } };
+
+    const disposeA = bus.register('QRY_B', handlerA);
+    bus.unregister('QRY_B');
+    bus.register('QRY_B', handlerB);
+
+    disposeA();
+
+    expect(await bus.execute<number>(q)).toBe(2);
+  });
+
+  it('repeated query disposal is a no-op and does not remove a re-registered handler', async () => {
+    const bus = new QueryBus<TestQuery>();
+    const handlerA = (): number => 1;
+    const handlerB = (): number => 2;
+    const q: TestQuery = { type: 'QRY_B', payload: { s: 'x' } };
+
+    const disposeA = bus.register('QRY_B', handlerA);
+    disposeA();
+    disposeA();
+
+    bus.register('QRY_B', handlerB);
+    disposeA();
+
+    expect(await bus.execute<number>(q)).toBe(2);
+  });
+
+  it('disposal after query bus clear does not delete a later re-registration', async () => {
+    const bus = new QueryBus<TestQuery>();
+    const handlerA = (): number => 1;
+    const handlerB = (): number => 2;
+    const q: TestQuery = { type: 'QRY_B', payload: { s: 'x' } };
+
+    const disposeA = bus.register('QRY_B', handlerA);
+    bus.clear();
+    bus.register('QRY_B', handlerB);
+
+    disposeA();
+
+    expect(await bus.execute<number>(q)).toBe(2);
   });
 });
 
