@@ -38,8 +38,10 @@ import {
   EMPTY_CONTEXT_SCOPE,
   injectContextFields,
   IS_CONTEXT_PROVIDER,
+  CONTEXT_FIELDS_META_KEY,
+  HAS_CONTEXT_FIELDS_KEY,
 } from './context';
-import type { ContextScope } from './context';
+import type { ContextScope, ContextFieldMeta } from './context';
 import type {
   RuntimeCommand,
   RuntimeEvent,
@@ -1505,11 +1507,52 @@ export class GraphRuntime {
       instance.props = nextVnode.props;
     }
 
+    // Re-inject context fields when parent scope changed (issue #15)
+    let contextChanged = false;
+    if (current.scope !== parentScope) {
+      const constructor = instance.constructor as {
+        [CONTEXT_FIELDS_META_KEY]?: ContextFieldMeta[];
+        [HAS_CONTEXT_FIELDS_KEY]?: true;
+      };
+
+      if (constructor[HAS_CONTEXT_FIELDS_KEY]) {
+        const fields = constructor[CONTEXT_FIELDS_META_KEY] as ContextFieldMeta[];
+        const target = instance as unknown as Record<string | symbol, unknown>;
+        const prevValues: unknown[] = [];
+
+        for (let i = 0; i < fields.length; i++) {
+          const meta = fields[i] as ContextFieldMeta;
+          prevValues.push(target[meta.propertyKey]);
+        }
+
+        try {
+          injectContextFields(instance, parentScope);
+        } catch (error: unknown) {
+          const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>);
+          if (isThenable(cleanupResult)) {
+            return cleanupResult.then(() => {
+              throw error;
+            });
+          }
+          throw error;
+        }
+
+        for (let i = 0; i < fields.length; i++) {
+          const meta = fields[i] as ContextFieldMeta;
+          if (target[meta.propertyKey] !== prevValues[i]) {
+            contextChanged = true;
+            break;
+          }
+        }
+      }
+    }
+
     // Build scope for child nodes (ContextProvider may have updated values)
     const childScope = this.buildChildScope(instance, parentScope);
 
-    // Call onUpdate if props changed
-    if (prevProps !== instance.props && current.engine.canUpdate()) {
+    // Call onUpdate if props or context changed (React 16.5 class-component style: one hook)
+    const propsChanged = prevProps !== instance.props;
+    if ((propsChanged || contextChanged) && current.engine.canUpdate()) {
       try {
         instance.onUpdate(prevProps, instance.props);
       } catch (error: unknown) {

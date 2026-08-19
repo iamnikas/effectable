@@ -161,8 +161,8 @@ describe('GraphRuntime — resilience J11', () => {
   });
 });
 
-describe('GraphRuntime — resilience J12', () => {
-  it('changing inner ProviderShell value on reconcile does not reinject @UseContext — consumer stays on first mount', async () => {
+describe('GraphRuntime — resilience J12 (issue #15 fixed)', () => {
+  it('changing inner ProviderShell value on reconcile DOES reinject @UseContext — consumer receives new value', async () => {
     const runtime = await GraphRuntime.mount(h(ShadowRoot, { innerValue: SHADOW_INNER_INITIAL }));
 
     const root = runtime.getRootInstance() as ShadowRoot | null;
@@ -183,7 +183,7 @@ describe('GraphRuntime — resilience J12', () => {
 
     await runtime.reconcile(h(ShadowRoot, { innerValue: SHADOW_INNER_AFTER_RECONCILE }));
 
-    expect(consumerRef.current.injectedValue).toBe(SHADOW_INNER_INITIAL);
+    expect(consumerRef.current.injectedValue).toBe(SHADOW_INNER_AFTER_RECONCILE);
     expect(consumerRef.current.receivedOnMount).toBe(SHADOW_INNER_INITIAL);
 
     await runtime.unmount();
