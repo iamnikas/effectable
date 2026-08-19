@@ -209,7 +209,7 @@ describe('GraphRuntime teardown observability (issue #20)', () => {
       }
     }
 
-    it('concurrent unmount() calls await the same promise', async () => {
+    it('concurrent unmount() calls await the same promise and join in-flight unmount', async () => {
       const runtime = await GraphRuntime.mount(h(SlowUnmountRoot, {}));
       const root = runtime.getRootInstance() as SlowUnmountRoot | null;
 
@@ -220,15 +220,51 @@ describe('GraphRuntime teardown observability (issue #20)', () => {
         throw new Error('expected SlowUnmountRoot instance');
       }
 
-      // Start two unmount calls concurrently
+      // Start first unmount
       const unmount1 = runtime.unmount();
+
+      // Wait a bit to ensure first unmount has started and changed state
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+
+      // At this point: runtime is UNMOUNTING/UNMOUNTED, but unmountCompleted should still be false
+      expect(root.unmountCompleted).toBe(false);
+
+      // Start second unmount - it must join the in-flight unmount
       const unmount2 = runtime.unmount();
 
+      // Wait for both to complete
       await Promise.all([unmount1, unmount2]);
 
+      // Now unmount should be completed
       expect(runtime.isActive()).toBe(false);
       expect(root.unmountStarted).toBe(true);
       expect(root.unmountCompleted).toBe(true);
+    });
+
+    it('third unmount() call after completion returns immediately', async () => {
+      const runtime = await GraphRuntime.mount(h(SlowUnmountRoot, {}));
+      const root = runtime.getRootInstance() as SlowUnmountRoot | null;
+
+      expect(root).not.toBeNull();
+      expect(runtime.isActive()).toBe(true);
+
+      if (root === null) {
+        throw new Error('expected SlowUnmountRoot instance');
+      }
+
+      // First unmount
+      await runtime.unmount();
+
+      expect(runtime.isActive()).toBe(false);
+      expect(root.unmountCompleted).toBe(true);
+
+      // Second unmount after completion should return immediately (no-op)
+      const unmount2Start = Date.now();
+      await runtime.unmount();
+      const unmount2Duration = Date.now() - unmount2Start;
+
+      // Should be essentially instant (< 5ms)
+      expect(unmount2Duration).toBeLessThan(5);
     });
   });
 
