@@ -19,6 +19,7 @@ import {
   readFromScope,
   type ContextScope,
   type ContextToken,
+  type RefObject,
 } from 'Effectable';
 import type { VirtualServiceNode } from 'Effectable';
 
