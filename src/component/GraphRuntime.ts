@@ -816,7 +816,10 @@ export class GraphRuntime {
 
     try {
       for (const fiber of snapshot) {
-        if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
+        // getState() keeps the full RuntimeState union: tsc narrows `this.state` to
+        // idle|active after the guard above, but a later await can fail-stop/unmount.
+        const runtimeState: RuntimeState = this.getState();
+        if (runtimeState === RUNTIME_STATE.FAILED || runtimeState === RUNTIME_STATE.UNMOUNTING || runtimeState === RUNTIME_STATE.UNMOUNTED) {
           break;
         }
         const res = this.reconcileDirtyFiber(fiber);
@@ -1021,11 +1024,14 @@ export class GraphRuntime {
         await this.activeFlush;
       }
 
-      if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
+      // Re-read after await: tsc still treats `this.state` as idle|active from the
+      // checks above, but flush/unmount/fail-stop may have run during the wait.
+      const afterFlushState: RuntimeState = this.getState();
+      if (afterFlushState === RUNTIME_STATE.UNMOUNTING || afterFlushState === RUNTIME_STATE.UNMOUNTED) {
         throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
       }
 
-      if (this.state === RUNTIME_STATE.FAILED) {
+      if (afterFlushState === RUNTIME_STATE.FAILED) {
         throw this.terminalError || new Error('[Effectable] GraphRuntime: reconcile attempted after terminal failure.');
       }
 
