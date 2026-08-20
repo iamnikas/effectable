@@ -249,7 +249,6 @@ export async function bootstrap<
       await activeGraphRuntime.reconcile(h(type, props));
     },
     async shutdown (options?: { rejectOnCleanupError?: boolean }): Promise<void> {
-      // Concurrent shutdowns await the same promise (check cache first)
       if (cachedShutdownPromise !== null) {
         return cachedShutdownPromise;
       }
@@ -259,17 +258,9 @@ export async function bootstrap<
       }
 
       running = false;
-
-      // Create and cache the shutdown promise
-      cachedShutdownPromise = (async (): Promise<void> => {
-        try {
-          await activeGraphRuntime.unmount(options);
-        } finally {
-          // Always clear owned primitives even if unmount rejects
-          clearOwnedRuntimePrimitives(runtime, owned);
-        }
-      })();
-
+      cachedShutdownPromise = activeGraphRuntime.unmount(options).finally(() => {
+        clearOwnedRuntimePrimitives(runtime, owned);
+      });
       return cachedShutdownPromise;
     },
   };
