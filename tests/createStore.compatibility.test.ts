@@ -9,8 +9,8 @@
  */
 
 import { applyMiddleware, createStore } from 'Effectable';
-import type { Action, Middleware, MiddlewareAPI, Reducer, Store } from 'Effectable';
-import { firstValueFrom, lastValueFrom, take, toArray } from 'rxjs';
+import type { Middleware, MiddlewareAPI, Reducer, StoreEnhancer } from 'Effectable';
+import { firstValueFrom, take, toArray } from 'rxjs';
 
 interface CounterState {
   count: number;
@@ -100,6 +100,9 @@ describe('Redux compatibility functional tests', () => {
       const returned = store.dispatch(action);
 
       expect(returned).toBe(action);
+      if (returned instanceof Promise) {
+        throw new Error('expected synchronous dispatch');
+      }
       expect(returned.type).toBe('SET');
       expect(store.getState().count).toBe(42);
 
@@ -130,10 +133,15 @@ describe('Redux compatibility functional tests', () => {
         return result;
       };
 
+      const maybeEnhancer = applyMiddleware(loggingMiddleware);
+      if (typeof maybeEnhancer !== 'function') {
+        throw new Error('applyMiddleware must return enhancer function');
+      }
+      const enhancer = maybeEnhancer as StoreEnhancer<CounterState, CounterAction>;
       const store = createStore<CounterState, CounterAction>(
         counterReducer,
         initialState,
-        applyMiddleware(loggingMiddleware)
+        enhancer
       );
 
       store.dispatch({ type: 'INC' });
@@ -171,10 +179,15 @@ describe('Redux compatibility functional tests', () => {
         return result;
       };
 
+      const maybeEnhancer = applyMiddleware(middleware1, middleware2);
+      if (typeof maybeEnhancer !== 'function') {
+        throw new Error('applyMiddleware must return enhancer function');
+      }
+      const enhancer = maybeEnhancer as StoreEnhancer<CounterState, CounterAction>;
       const store = createStore<CounterState, CounterAction>(
         counterReducer,
         initialState,
-        applyMiddleware(middleware1, middleware2)
+        enhancer
       );
 
       store.dispatch({ type: 'INC' });
@@ -209,10 +222,15 @@ describe('Redux compatibility functional tests', () => {
         return next(typed);
       };
 
+      const maybeEnhancer = applyMiddleware(interceptMiddleware);
+      if (typeof maybeEnhancer !== 'function') {
+        throw new Error('applyMiddleware must return enhancer function');
+      }
+      const enhancer = maybeEnhancer as StoreEnhancer<CounterState, CounterAction>;
       const store = createStore<CounterState, CounterAction>(
         counterReducer,
         initialState,
-        applyMiddleware(interceptMiddleware)
+        enhancer
       );
 
       store.dispatch({ type: 'INC' });
