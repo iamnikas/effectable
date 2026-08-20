@@ -259,6 +259,16 @@ export interface Middleware<
   (api: MiddlewareAPI<D, S>): (next: D) => (action: unknown) => unknown | Promise<unknown>;
 }
 
+/**
+ * Middleware argument accepted by enhancer-mode `applyMiddleware`.
+ * Matches runtime: a middleware function or a module namespace `{ default: fn }`.
+ */
+export type MiddlewareInput<
+  DispatchExt = {},
+  S = unknown,
+  D = Dispatch
+> = Middleware<DispatchExt, S, D> | { default: Middleware<DispatchExt, S, D> };
+
 // ============================================================================
 // Selector Types
 // ============================================================================
@@ -310,8 +320,8 @@ export function isAction (obj: any): obj is Action {
 /**
  * Type guard to check whether a function is Middleware
  */
-export function isMiddleware<DispatchExt = {}, S = unknown, D extends Dispatch = Dispatch> (
-  fn: any
+export function isMiddleware<DispatchExt = {}, S = unknown, D = Dispatch> (
+  fn: unknown
 ): fn is Middleware<DispatchExt, S, D> {
   return typeof fn === 'function';
 }

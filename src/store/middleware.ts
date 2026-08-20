@@ -8,7 +8,26 @@
  * @module Effectable/store/middleware
  */
 
-import { Action, DispatchMethod, Middleware, MiddlewareAPI, Reducer, Store, StoreCreator } from './types';
+import { Action, isMiddleware, Middleware, MiddlewareAPI, MiddlewareInput, Reducer, StoreCreator, StoreEnhancer } from './types';
+
+/**
+ * Dispatch-shaped function used to type the wrap-mode chain.
+ * Method-syntax bivariance lets {@link DispatchMethod} satisfy this type under
+ * `strictFunctionTypes`, so wrap-mode `D extends DispatchFn` typechecks without `as`.
+ */
+type DispatchFn = {
+  bivarianceHack (action: unknown): unknown | Promise<unknown>;
+}['bivarianceHack'];
+
+function hasGetState (value: unknown): value is MiddlewareAPI<DispatchFn> {
+  return typeof value === 'object' && value !== null && 'getState' in value;
+}
+
+function isWrapModeArgs (
+  args: unknown[]
+): args is [MiddlewareAPI<DispatchFn>, DispatchFn, ...unknown[]] {
+  return args.length > 1 && hasGetState(args[0]);
+}
 
 /**
  * Normalizes middleware: a function or a default-export module `{ default: fn }`.
@@ -16,15 +35,15 @@ import { Action, DispatchMethod, Middleware, MiddlewareAPI, Reducer, Store, Stor
  * @param {unknown} middleware - middleware or module-namespace with default
  * @returns {Middleware<unknown, S, D>}
  */
-function coerceMiddleware<S, D> (middleware: unknown): Middleware<unknown, S, D> {
-  if (typeof middleware === 'function') {
-    return middleware as Middleware<unknown, S, D>;
+function coerceMiddleware<S, D extends DispatchFn> (middleware: unknown): Middleware<unknown, S, D> {
+  if (isMiddleware<unknown, S, D>(middleware)) {
+    return middleware;
   }
 
   if (typeof middleware === 'object' && middleware !== null && Object.hasOwn(middleware, 'default')) {
     const defaultExport = Reflect.get(middleware, 'default');
-    if (typeof defaultExport === 'function') {
-      return defaultExport as Middleware<unknown, S, D>;
+    if (isMiddleware<unknown, S, D>(defaultExport)) {
+      return defaultExport;
     }
   }
 
@@ -33,23 +52,25 @@ function coerceMiddleware<S, D> (middleware: unknown): Middleware<unknown, S, D>
   );
 }
 
-function wrapDispatch<S, D> (
-  api: MiddlewareAPI<D, S>,
-  rawDispatch: D,
+function wrapDispatch<S> (
+  api: MiddlewareAPI<DispatchFn, S>,
+  rawDispatch: DispatchFn,
   middlewares: Array<unknown>
-): D {
-  const chain = middlewares.reduceRight<(action: unknown) => unknown | Promise<unknown>>(
+): DispatchFn {
+  const chain = middlewares.reduceRight<DispatchFn>(
     (next, middleware) => {
-      const coerced = coerceMiddleware<S, D>(middleware);
-      // FIXME: teach middleware so action can carry a type and the output has a known type
-      const resolvedMiddleware = coerced(api) as (next: D) => (action: unknown) => unknown | Promise<unknown>;
-      return resolvedMiddleware(next as D) as (action: unknown) => unknown | Promise<unknown>;
+      const coerced = coerceMiddleware<S, DispatchFn>(middleware);
+      return coerced(api)(next);
     },
-    rawDispatch as (action: unknown) => unknown | Promise<unknown>
+    rawDispatch
   );
 
-  (api as { dispatch: D }).dispatch = chain as D;
-  return chain as D;
+  api.dispatch = chain;
+  return chain;
+}
+
+function unboundDispatch (action: unknown): unknown {
+  return action;
 }
 
 /**
@@ -57,22 +78,33 @@ function wrapDispatch<S, D> (
  * 1. `applyMiddleware(api, rawDispatch, ...middlewares)` — wrap an existing dispatch
  * 2. `applyMiddleware(...middlewares)` — legacy enhancer-style for compatibility
  * 3. Middleware may arrive as default-export functions from slice modules.
+ *
+ * Wrap-mode overload is first so `applyMiddleware(api, rawDispatch, ...)` is not
+ * parsed as enhancer-style rest middlewares.
  */
+export function applyMiddleware<S, D extends DispatchFn> (
+  api: MiddlewareAPI<D, S>,
+  rawDispatch: D,
+  ...middlewares: unknown[]
+): D;
+export function applyMiddleware (): StoreEnhancer;
+export function applyMiddleware<S = unknown, A extends Action = Action> (
+  ...middlewares: Array<MiddlewareInput<unknown, S>>
+): StoreEnhancer<S, A>;
 export function applyMiddleware (...args: unknown[]): unknown {
-  if (args.length > 1 && typeof args[0] === 'object' && args[0] !== null && 'getState' in (args[0] as object)) {
-    const [api, rawDispatch, ...middlewares] = args as [MiddlewareAPI<unknown, unknown>, unknown, ...Array<Middleware<unknown, unknown, unknown>>];
+  if (isWrapModeArgs(args)) {
+    const [api, rawDispatch, ...middlewares] = args;
     return wrapDispatch(api, rawDispatch, middlewares);
   }
 
-  const middlewares = args as Array<Middleware<unknown, unknown, DispatchMethod<Action>>>;
   return (createStore: StoreCreator<unknown, Action>) =>
-    (reducer: Reducer<unknown, Action>, initialState: unknown): Store<unknown, Action> => {
+    (reducer: Reducer<unknown, Action>, initialState: unknown) => {
       const store = createStore(reducer, initialState);
-      const api: MiddlewareAPI<DispatchMethod<Action>, unknown> = {
+      const api: MiddlewareAPI<DispatchFn, unknown> = {
         getState: store.getState,
-        dispatch: null as unknown as DispatchMethod<Action>,
+        dispatch: unboundDispatch,
       };
-      const dispatch = wrapDispatch(api, store.dispatch, middlewares);
+      const dispatch = wrapDispatch(api, store.dispatch, args);
       return {
         ...store,
         dispatch,

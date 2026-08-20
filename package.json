@@ -84,6 +84,7 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test": "jest --config ./jest.config.js --runInBand",
+    "test:pack-smoke": "node ./scripts/pack-smoke.cjs",
     "test:watch": "jest --config ./jest.config.js --watch",
     "test:spec": "jest --config ./jest.config.js --runInBand --testPathPatterns=spec",
     "test:entity": "jest --config ./jest.config.js --runInBand --testPathPatterns=entity",

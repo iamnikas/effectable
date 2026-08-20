@@ -182,8 +182,9 @@ export type FiberInspectNode = {
 
 /**
  * Fiber — the reconciler work unit.
- * Each virtual tree node has a corresponding fiber in the current tree.
- * During reconcile a work-in-progress (WIP) tree is built via the alternate field.
+ * Each virtual tree node has a corresponding fiber in the current (live) graph.
+ * GraphRuntime reconciles in place: it mutates this fiber and its children.
+ * There is no isolated work-in-progress (WIP) tree.
  */
 export interface Fiber<P = unknown> {
   /** Virtual node this fiber was created from. */
@@ -197,8 +198,10 @@ export interface Fiber<P = unknown> {
   /** Parent fiber (null for the root). */
   parentFiber: Fiber | null;
   /**
-   * Alternate fiber — WIP pair of the current node during reconcile.
-   * current.alternate == wip, wip.alternate == current.
+   * Unused leftover on the public {@link Fiber} shape. Always `null` at runtime:
+   * GraphRuntime creates every fiber with `alternate: null` and never pairs
+   * current/WIP trees through this field. Kept so the public type stays unchanged;
+   * do not treat it as a work-in-progress pointer.
    */
   alternate: Fiber | null;
   /** Pending props for a node update (null — no pending update). */
