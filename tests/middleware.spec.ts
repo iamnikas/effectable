@@ -245,12 +245,12 @@ describe('MW-08 / MW-09 middleware async and swallow', () => {
       const currentAction = action as AnyAction;
       return next(currentAction);
     };
-    const moduleNs = { default: logging };
+    const moduleNs: { default: Middleware<unknown, TestState> } = { default: logging };
 
     const store = createStore(
       testReducer,
       { events: [] },
-      applyMiddleware<TestState, AnyAction>(moduleNs as unknown as Middleware)
+      applyMiddleware(moduleNs)
     );
     store.dispatch({ type: 'FROM_DEFAULT_EXPORT' });
     expect(store.getState().events).toEqual(['FROM_DEFAULT_EXPORT']);

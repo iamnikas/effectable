@@ -88,10 +88,6 @@ const RUNTIME_STATE = {
  */
 type RuntimeState = (typeof RUNTIME_STATE)[keyof typeof RUNTIME_STATE];
 
-function readRuntimeState (state: RuntimeState): RuntimeState {
-  return state;
-}
-
 // ---------------------------------------------------------------------------
 // Helper types
 // ---------------------------------------------------------------------------
@@ -164,11 +160,23 @@ export class GraphRuntime {
   private stableAsyncContinueCount = 0;
 
   /**
+   * Backing field for {@link GraphRuntime.state}. Writes and most reads go
+   * through the accessor; post-await re-reads use `_state` (TS 6 still narrows getters).
+   */
+  private _state: RuntimeState = RUNTIME_STATE.IDLE;
+
+  /**
    * Runtime state machine (issue #10).
    * IDLE → ACTIVE (on mount) → FAILED | UNMOUNTING → UNMOUNTED.
    * FAILED is terminal: subsequent reconcile rejects, unmount is safe.
    */
-  private state: RuntimeState = RUNTIME_STATE.IDLE;
+  private get state (): RuntimeState {
+    return this._state;
+  }
+
+  private set state (next: RuntimeState) {
+    this._state = next;
+  }
 
   /**
    * Terminal error captured by failStop() (issue #10).
@@ -820,8 +828,7 @@ export class GraphRuntime {
 
     try {
       for (const fiber of snapshot) {
-        const runtimeState = readRuntimeState(this.state);
-        if (runtimeState === RUNTIME_STATE.FAILED || runtimeState === RUNTIME_STATE.UNMOUNTING || runtimeState === RUNTIME_STATE.UNMOUNTED) {
+        if (this._state === RUNTIME_STATE.FAILED || this._state === RUNTIME_STATE.UNMOUNTING || this._state === RUNTIME_STATE.UNMOUNTED) {
           break;
         }
         const res = this.reconcileDirtyFiber(fiber);
@@ -1026,12 +1033,11 @@ export class GraphRuntime {
         await this.activeFlush;
       }
 
-      const afterFlushState = readRuntimeState(this.state);
-      if (afterFlushState === RUNTIME_STATE.UNMOUNTING || afterFlushState === RUNTIME_STATE.UNMOUNTED) {
+      if (this._state === RUNTIME_STATE.UNMOUNTING || this._state === RUNTIME_STATE.UNMOUNTED) {
         throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
       }
 
-      if (afterFlushState === RUNTIME_STATE.FAILED) {
+      if (this._state === RUNTIME_STATE.FAILED) {
         throw this.terminalError || new Error('[Effectable] GraphRuntime: reconcile attempted after terminal failure.');
       }
 
