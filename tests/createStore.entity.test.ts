@@ -12,7 +12,6 @@ import {
   isMiddleware,
 } from 'Effectable';
 import type {
-  Action,
   AnyAction,
   Middleware,
   Reducer,
@@ -233,6 +232,125 @@ describe('createStore', () => {
 
       store.destroy();
     });
+
+    it('dispatch of an array throws (strict plain object check)', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      expect(() => {
+        store.dispatch([{ type: 'INC' }] as unknown as CounterAction);
+      }).toThrow(/plain objects/);
+
+      store.destroy();
+    });
+
+    it('dispatch of a class instance throws (strict plain object check)', () => {
+      class ActionClass {
+        type = 'INC';
+      }
+
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      expect(() => {
+        store.dispatch(new ActionClass() as unknown as CounterAction);
+      }).toThrow(/plain objects/);
+
+      store.destroy();
+    });
+
+    it('dispatch of Object.create(null) throws (strict Redux v4 behavior)', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      const action = Object.create(null) as CounterAction;
+      action.type = 'INC';
+
+      expect(() => {
+        store.dispatch(action);
+      }).toThrow(/plain objects/);
+
+      store.destroy();
+    });
+  });
+
+  describe('reducer undefined validation (Redux-compatible)', () => {
+    it('reducer returning undefined throws', () => {
+      const badReducer = (): CounterState => {
+        return undefined as unknown as CounterState;
+      };
+
+      const store = createStore<CounterState, CounterAction>(
+        badReducer,
+        initialCounterState,
+      );
+
+      expect(() => {
+        store.dispatch({ type: 'INC' });
+      }).toThrow(/Reducer returned undefined/);
+
+      store.destroy();
+    });
+
+    it('reducer returning undefined for specific action throws', () => {
+      const conditionalBadReducer = (
+        state: CounterState,
+        action: CounterAction,
+      ): CounterState => {
+        if (action.type === 'SET') {
+          return undefined as unknown as CounterState;
+        }
+        return state;
+      };
+
+      const store = createStore<CounterState, CounterAction>(
+        conditionalBadReducer,
+        initialCounterState,
+      );
+
+      store.dispatch({ type: 'INC' });
+      expect(store.getState().count).toBe(0);
+
+      expect(() => {
+        store.dispatch({ type: 'SET', payload: 5 });
+      }).toThrow(/Reducer returned undefined when handling action "SET"/);
+
+      store.destroy();
+    });
+  });
+
+  describe('post-destroy guards (Redux-compatible behavior)', () => {
+    it('dispatch after destroy throws', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      store.destroy();
+
+      expect(() => {
+        store.dispatch({ type: 'INC' });
+      }).toThrow(/Cannot dispatch.*after.*destroyed/);
+    });
+
+    it('getState after destroy throws', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      store.destroy();
+
+      expect(() => {
+        store.getState();
+      }).toThrow(/Cannot access state.*after.*destroyed/);
+    });
   });
 
   describe('reentrancy and subscribers (B05, B06)', () => {
@@ -296,13 +414,7 @@ describe('createStore', () => {
         return next(typed);
       };
 
-      const maybeEnhancer = applyMiddleware(loggingMiddleware);
-      if (typeof maybeEnhancer !== 'function') {
-        throw new Error('applyMiddleware must return enhancer function');
-      }
-
-      const enhancer = maybeEnhancer as StoreEnhancer<CounterState, CounterAction>;
-      const store = createStore(counterReducer, initialCounterState, enhancer);
+      const store = createStore(counterReducer, initialCounterState, applyMiddleware(loggingMiddleware));
 
       store.dispatch({ type: 'INC' });
 
@@ -370,39 +482,6 @@ describe('createStore', () => {
 
       stateSub.unsubscribe();
       selectSub.unsubscribe();
-    });
-
-    it('after destroy dispatch does not throw and updates getState (BehaviorSubject)', () => {
-      const store = createStore<CounterState, CounterAction>(
-        counterReducer,
-        initialCounterState,
-      );
-
-      store.destroy();
-
-      let threw = false;
-      try {
-        store.dispatch({ type: 'INC' });
-      } catch {
-        threw = true;
-      }
-
-      expect(threw).toBe(false);
-      expect(store.getState()).toEqual({ count: 1, label: 'main' });
-
-      let emissionsAfterDestroy = 0;
-      const sub = store.state$.subscribe({
-        next: () => {
-          emissionsAfterDestroy += 1;
-        },
-        complete: () => {},
-      });
-
-      store.dispatch({ type: 'INC' });
-      expect(store.getState().count).toBe(2);
-      expect(emissionsAfterDestroy).toBe(0);
-
-      sub.unsubscribe();
     });
   });
 

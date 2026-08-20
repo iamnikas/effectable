@@ -178,6 +178,50 @@ describe('HandleRegistry', () => {
     expect(registry.has('a')).toBe(false);
   });
 
+  it('stale handle disposer after replacement does not delete the newer handle', () => {
+    const registry = new HandleRegistry();
+    const handleA = { id: 'A' };
+    const handleB = { id: 'B' };
+
+    const disposeA = registry.register('x', handleA);
+    registry.register('x', handleB);
+
+    disposeA();
+
+    expect(registry.get('x')).toBe(handleB);
+    expect(registry.has('x')).toBe(true);
+  });
+
+  it('disposal after registry clear does not delete a later re-registration', () => {
+    const registry = new HandleRegistry();
+    const handleA = { id: 'A' };
+    const handleB = { id: 'B' };
+
+    const disposeA = registry.register('x', handleA);
+    registry.clear();
+    registry.register('x', handleB);
+
+    disposeA();
+
+    expect(registry.get('x')).toBe(handleB);
+  });
+
+  it('repeated disposal is a no-op and does not remove a replacement', () => {
+    const registry = new HandleRegistry();
+    const handleA = { id: 'A' };
+    const handleB = { id: 'B' };
+
+    const disposeA = registry.register('x', handleA);
+    disposeA();
+    expect(registry.get('x')).toBeUndefined();
+
+    registry.register('x', handleB);
+    disposeA();
+    disposeA();
+
+    expect(registry.get('x')).toBe(handleB);
+  });
+
   it('HR-10: autoRegister on an invalid instance throws', () => {
     const registry = new HandleRegistry();
     expect(() => {

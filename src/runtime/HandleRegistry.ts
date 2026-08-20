@@ -67,7 +67,7 @@ export function UseImperativeHandle (): MethodDecorator {
     }
 
     const ctor = target.constructor;
-    const current = Reflect.getMetadata(
+    const current = Reflect.getOwnMetadata(
       USE_IMPERATIVE_HANDLE_METADATA_KEY,
       ctor
     ) as Set<string> | undefined;
@@ -103,6 +103,22 @@ export function UseRef (): PropertyDecorator {
 export class HandleRegistry {
   private readonly handles = new Map<string, unknown>();
 
+  private getInheritedMetadata<T> (ctor: Function, metaKey: string): T | undefined {
+    let current: Function | null = ctor;
+    while (current != null && typeof current === 'function') {
+      const value = Reflect.getOwnMetadata(metaKey, current) as T | undefined;
+      if (value !== undefined) {
+        return value;
+      }
+      const next = Object.getPrototypeOf(current);
+      if (typeof next !== 'function' || next === null) {
+        break;
+      }
+      current = next;
+    }
+    return undefined;
+  }
+
   private buildRefHandle (instance: unknown): unknown {
     const ctor = instance !== null && typeof instance === 'object'
       ? (instance as { constructor: Function }).constructor
@@ -111,10 +127,7 @@ export class HandleRegistry {
       throw new Error('HandleRegistry.autoRegister: invalid instance');
     }
 
-    const refPropertyKey = Reflect.getMetadata(
-      USE_REF_PROPERTY_METADATA_KEY,
-      ctor
-    ) as string | undefined;
+    const refPropertyKey = this.getInheritedMetadata<string>(ctor, USE_REF_PROPERTY_METADATA_KEY);
 
     if (typeof refPropertyKey === 'undefined') {
       throw new Error('HandleRegistry.autoRegister: missing ref property metadata (@UseRef)');
@@ -125,12 +138,26 @@ export class HandleRegistry {
       throw new Error('HandleRegistry.autoRegister: ref property is not an object');
     }
 
-    const methodNames = Reflect.getMetadata(
-      USE_IMPERATIVE_HANDLE_METADATA_KEY,
-      ctor
-    ) as Set<string> | undefined;
+    const methodNames = new Set<string>();
+    let current: Function | null = ctor;
+    while (current != null && typeof current === 'function') {
+      const ownMethods = Reflect.getOwnMetadata(
+        USE_IMPERATIVE_HANDLE_METADATA_KEY,
+        current
+      ) as Set<string> | undefined;
+      if (ownMethods !== undefined) {
+        for (const methodName of ownMethods) {
+          methodNames.add(methodName);
+        }
+      }
+      const next = Object.getPrototypeOf(current);
+      if (typeof next !== 'function' || next === null) {
+        break;
+      }
+      current = next;
+    }
 
-    if (typeof methodNames === 'undefined' || methodNames.size === 0) {
+    if (methodNames.size === 0) {
       throw new Error('HandleRegistry.autoRegister: no @UseImperativeHandle methods');
     }
 
@@ -154,10 +181,10 @@ export class HandleRegistry {
       throw new Error('HandleRegistry.autoRegister: invalid instance');
     }
 
-    const keyOrFactory = Reflect.getMetadata(
-      USE_REF_METADATA_KEY,
-      ctor
-    ) as HandleRefKeyFactory<unknown> | undefined;
+    const keyOrFactory = this.getInheritedMetadata<HandleRefKeyFactory<unknown>>(
+      ctor,
+      USE_REF_METADATA_KEY
+    );
 
     if (typeof keyOrFactory === 'undefined') {
       throw new Error('HandleRegistry.autoRegister: missing @UseRef metadata');
@@ -194,12 +221,14 @@ export class HandleRegistry {
    *
    * @param {string} key - handle key
    * @param {THandle} handle - imperative API object
-   * @returns {() => void} unregister function
+   * @returns {() => void} unregister function; no-op if a different handle is now registered under the same key
    */
   public register<THandle> (key: string, handle: THandle): () => void {
     this.handles.set(key, handle);
     return () => {
-      this.unregister(key);
+      if (this.handles.get(key) === handle) {
+        this.handles.delete(key);
+      }
     };
   }
 

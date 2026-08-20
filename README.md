@@ -4,12 +4,13 @@
 [![CI](https://github.com/iamnikas/effectable/actions/workflows/ci.yml/badge.svg)](https://github.com/iamnikas/effectable/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/node/v/effectable.svg)](https://nodejs.org)
+[![ESLint](https://img.shields.io/badge/ESLint-10-4B32C3?logo=eslint&logoColor=white)](https://eslint.org)
 
 Reactive layer library: explicit bootstrap-path, Redux-RxJS store, base class with lifecycle, class-based HOC `connect`, and GraphRuntime with a declarative component tree (`h`, `compose`).
 
 ## Installation
 
-Requires **Node.js 18.18+** and **npm 9+**.
+Requires **Node.js 22+** and **npm 9+**.
 
 ```bash
 npm install effectable
@@ -47,7 +48,7 @@ Architecture overview: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 - Creates `EventBus`, `CommandBus`, `QueryBus`, and `HandleRegistry` when the caller does not pass them explicitly.
 - Mounts the root component via `GraphRuntime` (including ones wrapped with `connect`).
-- Returns a handle with `shutdown()` for graceful teardown: calls `onUnmount` in reverse order.
+- Returns a handle with `shutdown()` for graceful teardown: calls `onUnmount` children-first, then parent; siblings sequentially in compose order; async `onUnmount` is awaited. Default `shutdown()` is best-effort: it **resolves** even if cleanup or `onUnmount` fails. Pass `{ rejectOnCleanupError: true }` to reject with `Error` (one failure) or `AggregateError` (several). Same option and default as `GraphRuntime.unmount()`.
 - On startup failure, automatically cleans up already created runtime primitives.
 
 ### Bootstrap-path example
@@ -160,7 +161,7 @@ fix: buffer setState during onMount
 docs: clarify bootstrap shutdown
 ```
 
-After `npm ci`, lefthook installs a local `commit-msg` hook. CI also lint-checks PR commits. Prefer Conventional Commits for squash-merge titles too.
+After `npm ci`, lefthook installs a local `commit-msg` hook. CI also lint-checks PR commits. Prefer Conventional Commits for squash-merge titles too. Unused imports are an ESLint error, and the lefthook pre-commit hook runs `eslint --fix` automatically.
 
 ## Publishing
 

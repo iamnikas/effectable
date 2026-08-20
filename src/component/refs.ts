@@ -32,6 +32,26 @@ export const REF_FIELDS_META_KEY = Symbol('effectable:ref_fields');
 export const IMPERATIVE_HANDLE_META_KEY = Symbol('effectable:imperative_handle');
 
 /**
+ * Symbol prefix for ref storage keys.
+ * Each @UseRef property gets a unique symbol for collision-safe storage.
+ */
+const REF_STORAGE_SYMBOL_PREFIX = 'effectable:ref_storage:';
+
+/**
+ * Map of propertyKey -> storage symbol for ref objects.
+ * Ensures each @UseRef property has a unique, collision-free storage location.
+ */
+const refStorageSymbols = new WeakMap<object, Map<string | symbol, symbol>>();
+
+/**
+ * Type for objects that can hold ref storage via symbol-indexed properties.
+ * Typed interface to eliminate 'as symbol' casts in property access.
+ */
+interface RefStorageHost {
+  [storage: symbol]: RefObject<unknown> | undefined;
+}
+
+/**
  * Record for a field registered by the {@link UseRef} decorator.
  *
  * Used by the runtime to bind a child component instance to the parent's ref.
@@ -56,6 +76,8 @@ export interface ImperativeHandleMeta {
  *
  * On first getter access, one `RefObject` is created per instance; the same ref is passed to `h(Child, {}, this.childRef)`.
  * GraphRuntime fills `current` when the child node mounts.
+ * 
+ * Uses symbol-based storage to prevent collisions with user properties.
  *
  * @returns {PropertyDecorator} property decorator: getter returns a stable `RefObject` for the child node
  * @example
@@ -74,26 +96,37 @@ export function UseRef (): PropertyDecorator {
       [REF_FIELDS_META_KEY]?: RefFieldMeta[];
     };
 
-    if (!Array.isArray(constructor[REF_FIELDS_META_KEY])) {
-      constructor[REF_FIELDS_META_KEY] = [];
+    const current = constructor[REF_FIELDS_META_KEY];
+    const isInherited = current !== undefined && !Object.hasOwn(constructor, REF_FIELDS_META_KEY);
+
+    const next = isInherited ? [...current] : (current ?? []);
+    next.push({ propertyKey });
+
+    constructor[REF_FIELDS_META_KEY] = next;
+
+    // Get or create the symbol map for this constructor
+    let symbolMap = refStorageSymbols.get(constructor);
+    if (symbolMap === undefined) {
+      symbolMap = new Map();
+      refStorageSymbols.set(constructor, symbolMap);
     }
 
-    const existing = constructor[REF_FIELDS_META_KEY];
-
-    if (existing !== undefined) {
-      existing.push({ propertyKey });
+    // Get or create a unique symbol for this property
+    let refStorageSymbol = symbolMap.get(propertyKey);
+    if (refStorageSymbol === undefined) {
+      refStorageSymbol = Symbol(`${REF_STORAGE_SYMBOL_PREFIX}${String(propertyKey)}`);
+      symbolMap.set(propertyKey, refStorageSymbol);
     }
-
-    // Pre-compute storage key once in closure (30.9x speedup vs string concat per getter call)
-    const refKey = `__ref_${String(propertyKey)}`;
 
     Object.defineProperty(target, propertyKey, {
-      get (this: Record<string | symbol, unknown>) {
-        if (this[refKey] === undefined) {
-          this[refKey] = { current: null } as RefObject<unknown>;
+      get (this: RefStorageHost): RefObject<unknown> {
+        const existing = this[refStorageSymbol];
+        if (existing === undefined) {
+          const created: RefObject<unknown> = { current: null };
+          this[refStorageSymbol] = created;
+          return created;
         }
-
-        return this[refKey];
+        return existing;
       },
       enumerable: true,
       configurable: true,
@@ -126,15 +159,13 @@ export function UseImperativeHandle (): MethodDecorator {
       [IMPERATIVE_HANDLE_META_KEY]?: ImperativeHandleMeta[];
     };
 
-    if (!Array.isArray(constructor[IMPERATIVE_HANDLE_META_KEY])) {
-      constructor[IMPERATIVE_HANDLE_META_KEY] = [];
-    }
+    const current = constructor[IMPERATIVE_HANDLE_META_KEY];
+    const isInherited = current !== undefined && !Object.hasOwn(constructor, IMPERATIVE_HANDLE_META_KEY);
 
-    const existing = constructor[IMPERATIVE_HANDLE_META_KEY];
+    const next = isInherited ? [...current] : (current ?? []);
+    next.push({ methodKey });
 
-    if (existing !== undefined) {
-      existing.push({ methodKey });
-    }
+    constructor[IMPERATIVE_HANDLE_META_KEY] = next;
   };
 }
 
@@ -149,21 +180,23 @@ export function UseImperativeHandle (): MethodDecorator {
  */
 export function getRefFields (
   componentClass: { [REF_FIELDS_META_KEY]?: RefFieldMeta[] },
-): RefFieldMeta[] {
-  return componentClass[REF_FIELDS_META_KEY] ?? [];
+): readonly RefFieldMeta[] {
+  const fields = componentClass[REF_FIELDS_META_KEY];
+  return fields === undefined ? [] : [...fields];
 }
 
 /**
  * Returns the array of methods registered by {@link UseImperativeHandle} on the given constructor.
  *
- * If meta is absent, returns a new empty array. If meta is present, returns the same array stored
- * on the constructor (external mutations affect the metadata).
+ * If meta is absent, returns a new empty array. If meta is present, returns a copy
+ * of the internal array (external mutations do not affect the metadata).
  *
  * @param {object} componentClass - component constructor: object with optional {@link IMPERATIVE_HANDLE_META_KEY}
- * @returns {ImperativeHandleMeta[]} imperative API method records; order matches decorator application order
+ * @returns {readonly ImperativeHandleMeta[]} imperative API method records; order matches decorator application order
  */
 export function getImperativeHandleMethods (
   componentClass: { [IMPERATIVE_HANDLE_META_KEY]?: ImperativeHandleMeta[] },
-): ImperativeHandleMeta[] {
-  return componentClass[IMPERATIVE_HANDLE_META_KEY] ?? [];
+): readonly ImperativeHandleMeta[] {
+  const methods = componentClass[IMPERATIVE_HANDLE_META_KEY];
+  return methods === undefined ? [] : [...methods];
 }

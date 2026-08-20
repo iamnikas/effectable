@@ -382,7 +382,7 @@ describe('GraphRuntime', () => {
 
       await expect(
         runtime.reconcile(h(LeafComponent, { value: 1 }))
-      ).rejects.toThrow('[Effectable] GraphRuntime: reconcile attempted after unmount.');
+      ).rejects.toThrow('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
     });
 
     it('after unmount getRootInstance() returns null', async () => {
@@ -740,6 +740,283 @@ describe('GraphRuntime', () => {
       await runtime.unmount();
     });
 
+    it('ContextProvider mounts explicit children and they receive the provider value', async () => {
+      // Lifecycle verification: child must actually mount and receive the provider value
+      class ConsumerWithLifecycle extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(NUMBER_TOKEN)
+        public injectedValue = -1;
+
+        public mountCalled = false;
+        public receivedOnMount: number | undefined;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.mountCalled = true;
+          this.receivedOnMount = this.injectedValue;
+        }
+      }
+
+      class ConsumerRef extends Component<Record<string, never>, Record<string, never>> {
+        @UseRef()
+        private declare childRef: RefObject<ConsumerWithLifecycle>;
+
+        constructor () {
+          super({});
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          return [
+            h(ContextProvider, { value: [NUMBER_TOKEN, 123] }, [
+              h(ConsumerWithLifecycle, {}, this.childRef),
+            ]),
+          ];
+        }
+
+        public getChildRef (): RefObject<ConsumerWithLifecycle> {
+          return this.childRef;
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(h(ConsumerRef, {}));
+      const root = runtime.getRootInstance() as ConsumerRef;
+      const childRef = root.getChildRef();
+
+      expect(childRef.current).not.toBeNull();
+
+      if (childRef.current === null) {
+        throw new Error('expected ConsumerWithLifecycle to be mounted');
+      }
+
+      // Assert lifecycle: child was mounted
+      expect(childRef.current.mountCalled).toBe(true);
+      // Assert value injection: child received provider value
+      expect(childRef.current.receivedOnMount).toBe(123);
+      expect(childRef.current.injectedValue).toBe(123);
+
+      await runtime.unmount();
+    });
+
+    it('issue #13: documented root usage — ContextProvider as root with explicit children', async () => {
+      // Test the exact contract: h(ContextProvider, { value }, [h(Consumer)])
+      class DirectConsumer extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(NUMBER_TOKEN)
+        public injectedValue = -1;
+
+        public mountCalled = false;
+        public unmountCalled = false;
+        public receivedOnMount: number | undefined;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.mountCalled = true;
+          this.receivedOnMount = this.injectedValue;
+        }
+
+        public override onUnmount (): void {
+          this.unmountCalled = true;
+        }
+      }
+
+      // Direct mount: ContextProvider as root with child consumer
+      const consumerRef: RefObject<DirectConsumer> = { current: null };
+      const runtime = await GraphRuntime.mount(
+        h(ContextProvider, { value: [NUMBER_TOKEN, 123] }, [
+          h(DirectConsumer, {}, consumerRef),
+        ])
+      );
+
+      // Verify mount succeeded
+      expect(runtime.isActive()).toBe(true);
+      expect(consumerRef.current).not.toBeNull();
+
+      if (consumerRef.current === null) {
+        throw new Error('expected DirectConsumer to be mounted');
+      }
+
+      // Assert lifecycle: child onMount fired
+      expect(consumerRef.current.mountCalled).toBe(true);
+      // Assert value injection: child received provider value
+      expect(consumerRef.current.receivedOnMount).toBe(123);
+      expect(consumerRef.current.injectedValue).toBe(123);
+
+      await runtime.unmount();
+    });
+
+    it('issue #13: nested providers with different tokens — both consumers receive correct values', async () => {
+      const TOKEN_A = createContext<string>('TOKEN_A');
+      const TOKEN_B = createContext<number>('TOKEN_B');
+
+      class ConsumerA extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(TOKEN_A)
+        public injectedA!: string;
+
+        public receivedOnMount: string | undefined;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.receivedOnMount = this.injectedA;
+        }
+      }
+
+      class ConsumerB extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(TOKEN_B)
+        public injectedB!: number;
+
+        public receivedOnMount: number | undefined;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.receivedOnMount = this.injectedB;
+        }
+      }
+
+      const refA: RefObject<ConsumerA> = { current: null };
+      const refB: RefObject<ConsumerB> = { current: null };
+
+      // Nested providers: outer TOKEN_A, inner TOKEN_B
+      const runtime = await GraphRuntime.mount(
+        h(ContextProvider, { value: [TOKEN_A, 'outerValue'] }, [
+          h(ConsumerA, {}, refA),
+          h(ContextProvider, { value: [TOKEN_B, 999] }, [
+            h(ConsumerB, {}, refB),
+          ]),
+        ])
+      );
+
+      expect(refA.current).not.toBeNull();
+      expect(refB.current).not.toBeNull();
+
+      if (refA.current === null || refB.current === null) {
+        throw new Error('expected both consumers to be mounted');
+      }
+
+      // Consumer A receives TOKEN_A from outer provider
+      expect(refA.current.receivedOnMount).toBe('outerValue');
+      expect(refA.current.injectedA).toBe('outerValue');
+
+      // Consumer B receives TOKEN_B from inner provider
+      expect(refB.current.receivedOnMount).toBe(999);
+      expect(refB.current.injectedB).toBe(999);
+
+      await runtime.unmount();
+    });
+
+    it('issue #13: reconcile updates provider props — consumer receives updated value (issue #15 fixed)', async () => {
+      // Context injection happens on mount AND on reconcile when provider value changes
+      class ConsumerWithUpdate extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(NUMBER_TOKEN)
+        public injectedValue = -1;
+
+        public receivedOnMount: number | undefined;
+        public updateCalled = false;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.receivedOnMount = this.injectedValue;
+        }
+
+        public override onUpdate (): void {
+          this.updateCalled = true;
+        }
+      }
+
+      const consumerRef: RefObject<ConsumerWithUpdate> = { current: null };
+
+      // Mount with value 1
+      const runtime = await GraphRuntime.mount(
+        h(ContextProvider, { value: [NUMBER_TOKEN, 1] }, [
+          h(ConsumerWithUpdate, {}, consumerRef),
+        ])
+      );
+
+      expect(consumerRef.current).not.toBeNull();
+
+      if (consumerRef.current === null) {
+        throw new Error('expected ConsumerWithUpdate to be mounted');
+      }
+
+      expect(consumerRef.current.receivedOnMount).toBe(1);
+      expect(consumerRef.current.injectedValue).toBe(1);
+
+      // Reconcile with value 2
+      await runtime.reconcile(
+        h(ContextProvider, { value: [NUMBER_TOKEN, 2] }, [
+          h(ConsumerWithUpdate, {}, consumerRef),
+        ])
+      );
+
+      // Fixed behavior: context is re-injected on reconcile when provider value changes
+      // Consumer receives the updated value and onUpdate is called
+      expect(consumerRef.current.injectedValue).toBe(2);
+      expect(consumerRef.current.receivedOnMount).toBe(1);
+      expect(consumerRef.current.updateCalled).toBe(true);
+
+      await runtime.unmount();
+    });
+
+    it('issue #13: unmount of provider tree — child onUnmount runs, ref cleared', async () => {
+      class ConsumerWithUnmount extends Component<Record<string, never>, Record<string, never>> {
+        @UseContext(NUMBER_TOKEN)
+        public injectedValue = -1;
+
+        public mountCalled = false;
+        public unmountCalled = false;
+
+        constructor () {
+          super({});
+        }
+
+        public override onMount (): void {
+          this.mountCalled = true;
+        }
+
+        public override onUnmount (): void {
+          this.unmountCalled = true;
+        }
+      }
+
+      const consumerRef: RefObject<ConsumerWithUnmount> = { current: null };
+
+      const runtime = await GraphRuntime.mount(
+        h(ContextProvider, { value: [NUMBER_TOKEN, 456] }, [
+          h(ConsumerWithUnmount, {}, consumerRef),
+        ])
+      );
+
+      expect(consumerRef.current).not.toBeNull();
+
+      if (consumerRef.current === null) {
+        throw new Error('expected ConsumerWithUnmount to be mounted');
+      }
+
+      expect(consumerRef.current.mountCalled).toBe(true);
+      expect(consumerRef.current.unmountCalled).toBe(false);
+
+      // Store reference to verify unmount was called
+      const instance = consumerRef.current;
+
+      await runtime.unmount();
+
+      // After unmount: onUnmount was called, ref cleared
+      expect(instance.unmountCalled).toBe(true);
+      expect(consumerRef.current).toBeNull();
+    });
+
     it('ScopedConsumerParent: child NumberConsumer via ref receives the value from initialScope', async () => {
       const scope = extendScope(EMPTY_CONTEXT_SCOPE, NUMBER_TOKEN, 55);
 
@@ -882,11 +1159,24 @@ describe('GraphRuntime', () => {
         }
       }
 
+      // Option A contract: duplicate keys in current children are invalid
+      await expect(
+        GraphRuntime.mount(
+          h(DupHost, {
+            items: [
+              { key: 'dup', label: 'first' },
+              { key: 'dup', label: 'second' },
+            ],
+          }),
+        ),
+      ).rejects.toThrow('duplicate key "dup" in current children');
+
+      // Option A contract: duplicate keys in next children are invalid
       const runtime = await GraphRuntime.mount(
         h(DupHost, {
           items: [
-            { key: 'dup', label: 'first' },
-            { key: 'dup', label: 'second' },
+            { key: 'unique-a', label: 'first' },
+            { key: 'unique-b', label: 'second' },
           ],
         }),
       );
@@ -895,19 +1185,16 @@ describe('GraphRuntime', () => {
       mounts.length = 0;
       unmounts.length = 0;
 
-      // length 2→1: isStableChildren=false → full keyed diff;
-      // Map.set overwrites key=dup with the last fiber (second).
-      await runtime.reconcile(
-        h(DupHost, {
-          items: [{ key: 'dup', label: 'reuse' }],
-        }),
-      );
-
-      expect(mounts).toEqual([]);
-      // Actual contract: Map.set overwrites the key without destroying the previous fiber,
-      // so a sibling with a duplicate key is not visited in the orphan pass and onUnmount
-      // is not called when the list shrinks (lifecycle leak vs unique keys).
-      expect(unmounts).toEqual([]);
+      await expect(
+        runtime.reconcile(
+          h(DupHost, {
+            items: [
+              { key: 'dup', label: 'reuse-1' },
+              { key: 'dup', label: 'reuse-2' },
+            ],
+          }),
+        ),
+      ).rejects.toThrow('duplicate key "dup" in next children');
 
       await runtime.unmount();
     });
@@ -2083,7 +2370,7 @@ describe('GraphRuntime', () => {
       });
     }
 
-    it('without onAutoReconcileError a compose error in auto-flush does not crash the runtime', async () => {
+    it('without onAutoReconcileError a compose error in auto-flush transitions to FAILED (issue #10)', async () => {
       class BoomComposeRoot extends Component<{ boom: boolean }, Record<string, never>> {
         constructor () {
           super({});
@@ -2109,9 +2396,12 @@ describe('GraphRuntime', () => {
       root.setState({ boom: true });
       await drainMicrotasks();
 
-      expect(runtime.isActive()).toBe(true);
-      expect(runtime.getRootInstance()).not.toBeNull();
+      // Dirty-flush error transitions to FAILED
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('failed');
+      expect(runtime.getRootInstance()).toBeNull();
 
+      // Unmount is still safe
       await runtime.unmount();
     });
 
@@ -2206,7 +2496,8 @@ describe('GraphRuntime', () => {
       const RuntimeFactory = GraphRuntime as unknown as new () => GraphRuntime;
       const runtime = new RuntimeFactory();
 
-      expect(runtime.isActive()).toBe(true);
+      // Runtime created directly (not via mount) is in IDLE state
+      expect(runtime.isActive()).toBe(false);
       expect(runtime.getRootInstance()).toBeNull();
 
       await expect(
@@ -2433,7 +2724,7 @@ describe('GraphRuntime', () => {
 
       class PoolDepthNode extends Component<Record<string, never>, { depth: number; tick: number; path: string }> {
         @UseRef()
-        private declare childRef: RefObject<PoolDepthLeaf | PoolDepthNode>;
+        private declare childRef: RefObject<PoolDepthNode>;
 
         constructor (props: { depth: number; tick: number; path: string }) {
           super(props);

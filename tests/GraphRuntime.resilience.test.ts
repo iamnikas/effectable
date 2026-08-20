@@ -386,7 +386,7 @@ describe('GraphRuntime resilience (P1 I38–I42)', () => {
   });
 
   describe('I39 — leaf error on a deep tree', () => {
-    it('on leaf onMount error during reconcile rethrows, runtime stays active until unmount', async () => {
+    it('on leaf onMount error during reconcile rethrows, runtime transitions to FAILED (issue #10)', async () => {
       const depth = 16;
       const runtime = await GraphRuntime.mount(
         h(DeepFailNestHost, {
@@ -410,11 +410,15 @@ describe('GraphRuntime resilience (P1 I38–I42)', () => {
         ),
       ).rejects.toThrow('FailOnMountLeaf: intentional mount failure');
 
-      expect(runtime.isActive()).toBe(true);
+      // Runtime transitions to FAILED on unrecoverable error
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('failed');
 
+      // Unmount is still safe
       await runtime.unmount();
       await runtime.unmount();
       expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('unmounted');
     });
 
     it('on leaf onMount error at start mount rejects and repeated unmount without runtime is idempotent', async () => {
@@ -511,6 +515,190 @@ describe('GraphRuntime resilience (P1 I38–I42)', () => {
       await flushRuntimeTasks();
       const composeAfterIdle = root.composeInvocations;
       expect(composeAfterIdle).toBe(composeAfterFlush);
+
+      await runtime.unmount();
+      expect(runtime.isActive()).toBe(false);
+    });
+  });
+
+  describe('I43 — duplicate key semantics (issue #18)', () => {
+    interface DupKeyProps {
+      label: string;
+    }
+
+    class DupKeyLeaf extends Component<Record<string, never>, DupKeyProps> {
+      public mountCalls = 0;
+
+      public unmountCalls = 0;
+
+      constructor (props: DupKeyProps) {
+        super(props);
+        this.state = {};
+      }
+
+      public override onMount (): void {
+        this.mountCalls += 1;
+      }
+
+      public override onUnmount (): void {
+        this.unmountCalls += 1;
+      }
+    }
+
+    interface DupKeyHostProps {
+      items: Array<{ key: string; label: string }>;
+    }
+
+    class DupKeyHost extends Component<Record<string, never>, DupKeyHostProps> {
+      constructor (props: DupKeyHostProps) {
+        super(props);
+        this.state = {};
+      }
+
+      public override compose (): VirtualServiceNode[] {
+        return this.props.items.map((item) =>
+          h(DupKeyLeaf, { label: item.label }, item.key),
+        );
+      }
+    }
+
+    it('throws on duplicate keys in current children during mount (same-length)', async () => {
+      await expect(
+        GraphRuntime.mount(
+          h(DupKeyHost, {
+            items: [
+              { key: 'dup', label: 'first' },
+              { key: 'dup', label: 'second' },
+            ],
+          }),
+        ),
+      ).rejects.toThrow(/duplicate key "dup" in current children of DupKeyHost/);
+    });
+
+    it('throws on duplicate keys in current children during mount (different-length)', async () => {
+      await expect(
+        GraphRuntime.mount(
+          h(DupKeyHost, {
+            items: [
+              { key: 'dup', label: 'first' },
+              { key: 'dup', label: 'second' },
+              { key: 'unique', label: 'third' },
+            ],
+          }),
+        ),
+      ).rejects.toThrow(/duplicate key "dup" in current children of DupKeyHost/);
+    });
+
+    it('throws on duplicate keys in next children during reconcile (same-length)', async () => {
+      const runtime = await GraphRuntime.mount(
+        h(DupKeyHost, {
+          items: [
+            { key: 'a', label: 'first' },
+            { key: 'b', label: 'second' },
+          ],
+        }),
+      );
+
+      await expect(
+        runtime.reconcile(
+          h(DupKeyHost, {
+            items: [
+              { key: 'dup', label: 'new-first' },
+              { key: 'dup', label: 'new-second' },
+            ],
+          }),
+        ),
+      ).rejects.toThrow(/duplicate key "dup" in next children of DupKeyHost/);
+
+      await runtime.unmount();
+    });
+
+    it('throws on duplicate keys in next children during reconcile (different-length)', async () => {
+      const runtime = await GraphRuntime.mount(
+        h(DupKeyHost, {
+          items: [
+            { key: 'a', label: 'first' },
+            { key: 'b', label: 'second' },
+          ],
+        }),
+      );
+
+      await expect(
+        runtime.reconcile(
+          h(DupKeyHost, {
+            items: [
+              { key: 'dup', label: 'new-first' },
+              { key: 'dup', label: 'new-second' },
+              { key: 'c', label: 'new-third' },
+            ],
+          }),
+        ),
+      ).rejects.toThrow(/duplicate key "dup" in next children of DupKeyHost/);
+
+      await runtime.unmount();
+    });
+
+    it('validates before side effects: no leaked fiber when duplicate detected', async () => {
+      let mountedInstances: DupKeyLeaf[] = [];
+
+      class TrackingDupHost extends Component<Record<string, never>, DupKeyHostProps> {
+        constructor (props: DupKeyHostProps) {
+          super(props);
+          this.state = {};
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          return this.props.items.map((item) => {
+            const ref = { current: null as DupKeyLeaf | null };
+            const node = h(DupKeyLeaf, { label: item.label }, item.key);
+            node.ref = ref;
+            
+            if (ref.current !== null) {
+              mountedInstances.push(ref.current);
+            }
+            
+            return node;
+          });
+        }
+      }
+
+      await expect(
+        GraphRuntime.mount(
+          h(TrackingDupHost, {
+            items: [
+              { key: 'dup', label: 'first' },
+              { key: 'dup', label: 'second' },
+            ],
+          }),
+        ),
+      ).rejects.toThrow(/duplicate key "dup"/);
+
+      // No instances should be mounted because validation happens BEFORE side effects
+      expect(mountedInstances.length).toBe(0);
+    });
+
+    it('unique keys complete reconcile without errors (regression test)', async () => {
+      const runtime = await GraphRuntime.mount(
+        h(DupKeyHost, {
+          items: [
+            { key: 'a', label: 'first' },
+            { key: 'b', label: 'second' },
+          ],
+        }),
+      );
+
+      expect(runtime.isActive()).toBe(true);
+
+      await runtime.reconcile(
+        h(DupKeyHost, {
+          items: [
+            { key: 'c', label: 'third' },
+            { key: 'd', label: 'fourth' },
+          ],
+        }),
+      );
+
+      expect(runtime.isActive()).toBe(true);
 
       await runtime.unmount();
       expect(runtime.isActive()).toBe(false);

@@ -1,7 +1,24 @@
-# Redux-RxJS Store Core Library
+# Redux-Compatible Store with RxJS Extensions
 
-A Redux-like store library with full RxJS support.
+A Redux v4-compatible store with reactive RxJS extensions.
+Core Redux behavior is strictly compatible; state$ and select() are additions.
 It has no application-specific dependencies and can be used in any project.
+
+## What changed (strict Redux v4 compatibility)
+
+This store now enforces strict Redux v4 contracts:
+
+**Before:**
+- Action check accepted arrays and class instances
+- Reducer could return `undefined` without error
+- `dispatch()` / `getState()` still worked after `destroy()`
+- Docs implied `MiddlewareAPI` had `state$` (it never did)
+
+**After:**
+- Actions must be plain objects with `Object.prototype` (rejects arrays, class instances, `Object.create(null)`)
+- Reducer returning `undefined` throws; last good state stays
+- After `destroy()`: `dispatch()` and `getState()` throw; `state$` is completed
+- `MiddlewareAPI` is only `dispatch` + `getState`; use `getState()` inside middleware, subscribe to `store.state$` outside
 
 ## File structure
 
@@ -166,21 +183,17 @@ currentPath$.subscribe(path => console.log('Path:', path));
 
 ### 2. RxJS in Middleware
 
-Middleware has access to the `state$` Observable:
+Middleware does NOT have direct access to `state$`. Use `getState()` to read the current state:
 
 ```typescript
-const reactiveMiddleware = (store) => (next) => {
-  // Subscribe to state changes
-  store.state$.pipe(
-    map(state => state.navigation.currentPath),
-    distinctUntilChanged()
-  ).subscribe(path => {
-    console.log('Path changed:', path);
-  });
-
-  return (action) => next(action);
+const stateAwareMiddleware = (api) => (next) => (action) => {
+  const currentState = api.getState();
+  console.log('Current state:', currentState);
+  return next(action);
 };
 ```
+
+For reactive state monitoring outside middleware, subscribe to `store.state$` directly.
 
 ### 3. No subscribe method
 
@@ -316,7 +329,6 @@ type Middleware<S, A extends Action> = (
 interface MiddlewareAPI<D extends Dispatch = Dispatch, S = unknown> {
   dispatch: D;
   getState: () => S;
-  state$: Observable<S>;
 }
 ```
 
@@ -333,15 +345,22 @@ interface MemoizedSelector<S, R> extends Selector<S, R> {
 
 ## Compatibility with Redux
 
-The library is highly compatible with the Redux v4 API:
+The library maintains strict Redux v4 compatibility for core store behavior:
 
 ✅ `createStore(reducer, initialState, enhancer)`
 ✅ `applyMiddleware(...middlewares)`
-✅ `store.dispatch(action)`
+✅ `store.dispatch(action)` — strict plain object validation (rejects arrays, class instances, Object.create(null))
 ✅ `store.getState()`
 ✅ Middleware signature `(store) => (next) => (action) => result`
 ✅ Reducer pattern `(state, action) => newState`
+✅ Reducer must not return `undefined`
 
+**RxJS extensions (not in Redux):**
+- `store.state$` — Observable of state changes
+- `store.select(selector)` — selector with distinctUntilChanged
+- `store.destroy()` — cleanup method (guarded: dispatch/getState throw after destroy)
+
+**Not implemented:**
 ❌ `store.subscribe()` - use `store.state$`
 ❌ `combineReducers()` - create manually
 ❌ Redux DevTools - not supported yet
@@ -457,7 +476,7 @@ const selectActiveUsers = createSelector(
 
 ### 4. Cleanup
 
-Do not forget to call `destroy()`:
+Call `destroy()` when done. After calling `destroy()`, the store cannot be used:
 
 ```typescript
 const store = createStore(reducer, initialState);
@@ -465,6 +484,13 @@ const store = createStore(reducer, initialState);
 // On component unmount
 componentWillUnmount() {
   store.destroy();
+}
+
+// After destroy(), dispatch and getState will throw errors
+try {
+  store.dispatch({ type: 'ACTION' }); // throws
+} catch (e) {
+  console.error(e); // "Cannot dispatch an action after the store has been destroyed."
 }
 ```
 

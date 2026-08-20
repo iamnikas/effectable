@@ -1662,7 +1662,7 @@ describe('Effectable.connect (class-based HOC)', () => {
       expect(storeFromScope).toBe(store);
     });
 
-    test('mapDispatch with a default props parameter — dispatch-only binding (props do not arrive)', () => {
+    test('mapDispatch with a default props parameter — props ARE passed (default not used)', () => {
       const store = createStore<TestStoreState, TestAction>(reducer, {
         status: 'idle',
         version: 0,
@@ -1708,7 +1708,7 @@ describe('Effectable.connect (class-based HOC)', () => {
       instance.onMount?.();
       instance.props.emitStatusFromProps?.();
 
-      expect(store.getState().status).toBe('default-id');
+      expect(store.getState().status).toBe('real-own-id');
 
       instance.onUnmount?.();
     });

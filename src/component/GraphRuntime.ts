@@ -4,10 +4,14 @@
  * Responsibilities:
  * - Materialize a VirtualServiceNode tree into real component instances (Fiber tree).
  * - Fiber-like reconcile: diff current vs next trees by key + type, assign effectTags.
+ *   Reconciliation mutates the live graph (not an isolated work-in-progress tree).
  * - Drive lifecycle via LifecycleEngine: startup in topological order (children before parent),
- *   shutdown in reverse order (parent before children).
+ *   shutdown in the same order (children before parent).
  * - Inject contexts (@UseContext) and bind refs on mount.
  * - Pass updated props into existing instances during reconcile.
+ * - Serialize all graph operations through a single operation queue.
+ * - Fail-stop on unrecoverable errors: mark runtime FAILED, reject later reconcile,
+ *   unmount stays safe.
  *
  * Current limitations:
  * - Work loop is synchronous (no priority lanes — next increment).
@@ -63,8 +67,49 @@ function isThenable<T> (value: T | PromiseLike<T>): value is PromiseLike<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime state machine
+// ---------------------------------------------------------------------------
+
+/**
+ * Runtime state literals.
+ * Private to GraphRuntime; reduced set without mounting/reconciling.
+ */
+const RUNTIME_STATE = {
+  IDLE: 'idle',
+  ACTIVE: 'active',
+  FAILED: 'failed',
+  UNMOUNTING: 'unmounting',
+  UNMOUNTED: 'unmounted',
+} as const;
+
+/**
+ * Runtime state type derived from RUNTIME_STATE.
+ * Not exported from package index (internal diagnostic only).
+ */
+type RuntimeState = (typeof RUNTIME_STATE)[keyof typeof RUNTIME_STATE];
+
+// ---------------------------------------------------------------------------
 // Helper types
 // ---------------------------------------------------------------------------
+
+/**
+ * Construction journal: tracks resources acquired during fiber materialization.
+ * On failure, resources are released in reverse acquisition order.
+ */
+interface FiberConstructionJournal {
+  /** Scheduler hook injection step completed. */
+  schedulerHookAttached?: boolean;
+  /** Runtime bus wiring step completed. */
+  busWiringAttached?: boolean;
+  /** Ref binding step completed. */
+  refBound?: boolean;
+  /** Successfully mounted child fibers (in acquisition order). */
+  mountedChildren: RuntimeFiber<unknown>[];
+  /** Original ref owner (for identity-safe clearing during rollback). */
+  refOwner?: Component<unknown, unknown>;
+  /** Rollback already invoked (idempotency guard). */
+  rolledBack?: boolean;
+}
 
 /**
  * Internal extended fiber with lifecycle-engine and scope.
@@ -84,6 +129,11 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
    * {@link SCHEDULE_UPDATE_HOOK} was injected: after startup, {@link scheduleUpdate} must run.
    */
   pendingScheduleUpdate?: boolean;
+  /**
+   * Construction journal: records acquired resources during materialization.
+   * Used for transactional rollback on failure.
+   */
+  constructionJournal?: FiberConstructionJournal;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,13 +153,36 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
 export class GraphRuntime {
   /** Current root fiber tree (current tree). */
   private currentRoot: RuntimeFiber | null = null;
-  /** Whether unmount has completed. */
-  private unmounted = false;
   /**
    * Entry counter for {@link continueStableReconcileAsync} (test/debug probe).
    * Not reset automatically — compare before/after around reconcile.
    */
   private stableAsyncContinueCount = 0;
+
+  /**
+   * Backing field for {@link GraphRuntime.state}. Writes and most reads go
+   * through the accessor; post-await re-reads use `_state` (TS 6 still narrows getters).
+   */
+  private _state: RuntimeState = RUNTIME_STATE.IDLE;
+
+  /**
+   * Runtime state machine.
+   * IDLE → ACTIVE (on mount) → FAILED | UNMOUNTING → UNMOUNTED.
+   * FAILED is terminal: subsequent reconcile rejects, unmount is safe.
+   */
+  private get state (): RuntimeState {
+    return this._state;
+  }
+
+  private set state (next: RuntimeState) {
+    this._state = next;
+  }
+
+  /**
+   * Terminal error captured by failStop().
+   * Stored to reject later reconcile calls with the same error.
+   */
+  private terminalError: Error | null = null;
 
   /**
    * Runtime buses for auto-wiring decorators on nodes (optional, set in {@link GraphRuntime.mount}).
@@ -164,9 +237,91 @@ export class GraphRuntime {
   private onAutoReconcileError: ((err: unknown) => void) | null = null;
 
   /**
+   * Operation queue: serializes reconcile and unmount.
+   * Each operation is a Promise-returning function executed sequentially.
+   */
+  private operationQueue: Array<() => Promise<void>> = [];
+
+  /**
+   * Whether an operation is currently running.
+   */
+  private operationInProgress = false;
+
+  /**
+   * Cached unmount promise for concurrent unmount callers.
+   */
+  private cachedUnmountPromise: Promise<void> | null = null;
+
+  /**
+   * Pending fail-stop teardown work.
+   * When failStop nulls currentRoot but destroy is async, this tracks the in-flight cleanup.
+   * unmount() must await this before concluding teardown is finished.
+   */
+  private pendingTeardown: Promise<void> | null = null;
+
+  /**
    * Instances are created only via {@link GraphRuntime.mount}; direct `new GraphRuntime()` is unavailable externally.
    */
   private constructor () {}
+
+  /**
+   * Fail-stop: mark the runtime as failed, disable scheduling, tear down the graph best-effort.
+   * After fail-stop:
+   * - state is FAILED
+   * - terminalError is set
+   * - currentRoot is null (even if destroyFiber throws)
+   * - later reconcile() rejects with the terminal error
+   * - unmount() is safe and joinable
+   *
+   * No failed reconcile leaves the runtime active with a partial graph.
+   * Primary-error rules: cleanup errors attached as rollbackErrors, never replace primary.
+   *
+   * @param {Error} error - unrecoverable error that triggered fail-stop
+   * @returns {void | Promise<void>}
+   */
+  private failStop (error: Error): void | Promise<void> {
+    // Idempotent: if already failed, skip
+    if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTED) {
+      return;
+    }
+
+    this.state = RUNTIME_STATE.FAILED;
+    this.terminalError = error;
+
+    // Disable scheduling immediately
+    this.dirtyFibers.clear();
+    this.flushScheduled = false;
+
+    // Best-effort teardown of the current/partial graph
+    // MUST set currentRoot = null even if destroyFiber throws
+    if (this.currentRoot !== null) {
+      const root = this.currentRoot;
+      this.currentRoot = null;
+      
+      // Collect cleanup errors during fail-stop (attach as rollbackErrors)
+      const cleanupErrors: Error[] = [];
+      const destroyRes = this.destroyFiber(root, cleanupErrors);
+      
+      if (isThenable(destroyRes)) {
+        // Async path: track pending teardown so unmount() can join
+        this.pendingTeardown = destroyRes
+          .then(() => {
+            if (cleanupErrors.length > 0) {
+              (error as Error & { rollbackErrors?: Error[] }).rollbackErrors = cleanupErrors;
+            }
+          })
+          .finally(() => {
+            this.pendingTeardown = null;
+          });
+        return this.pendingTeardown;
+      }
+      
+      // Sync path: attach cleanup errors immediately
+      if (cleanupErrors.length > 0) {
+        (error as Error & { rollbackErrors?: Error[] }).rollbackErrors = cleanupErrors;
+      }
+    }
+  }
 
   /**
    * Auto-wires runtime-bus decorators onto the instance before {@link LifecycleEngine.runStartup}.
@@ -203,6 +358,257 @@ export class GraphRuntime {
     }
 
     delete fiber.effectableRuntimeBusDisposer;
+  }
+
+  /**
+   * Identity-safe ref clearing: clears ref.current only if it still points to the expected owner.
+   * Prevents an old rollback from clearing a ref that a newer materialization already reused.
+   * No cast required (Component | null → unknown | null is assignable).
+   *
+   * @param {RefObject<unknown>} ref - ref object
+   * @param {Component<unknown, unknown>} expectedOwner - expected current owner
+   * @returns {void}
+   */
+  private clearRefSafe (ref: RefObject<unknown>, expectedOwner: Component<unknown, unknown>): void {
+    if (ref.current === expectedOwner) {
+      ref.current = null;
+    }
+  }
+
+  /**
+   * Centralized ref ownership transition.
+   * Handles every ref binding/clearing operation: add, remove, replace.
+   * 
+   * Rules:
+   * - Clear previousRef only if it still points to expectedPreviousOwner (identity-safe).
+   * - Bind nextRef to instance if nextRef is provided.
+   * - previousRef and nextRef can be the same object (ref reuse) or different (ref swap).
+   * - Do not let an old disposer clear a newer owner.
+   * 
+   * No casts: Component | null → unknown | null is assignable (widening).
+   * 
+   * @param {RefObject<unknown> | undefined} previousRef - ref to clear (can be undefined if no previous ref)
+   * @param {Component<unknown, unknown> | null} expectedPreviousOwner - expected owner of previousRef (null if unknown)
+   * @param {RefObject<unknown> | undefined} nextRef - ref to bind to instance (can be undefined if removing ref)
+   * @param {Component<unknown, unknown> | null} instance - instance to bind nextRef to (null when clearing only)
+   * @returns {void}
+   */
+  private commitRef (
+    previousRef: RefObject<unknown> | undefined,
+    expectedPreviousOwner: Component<unknown, unknown> | null,
+    nextRef: RefObject<unknown> | undefined,
+    instance: Component<unknown, unknown> | null,
+  ): void {
+    // Clear previous ref if it's different from next (ref swap) or if next is undefined (ref removal)
+    if (previousRef !== undefined && previousRef !== nextRef && expectedPreviousOwner !== null) {
+      this.clearRefSafe(previousRef, expectedPreviousOwner);
+    }
+    
+    // Bind next ref to instance (Component | null → unknown | null, no cast)
+    if (nextRef !== undefined) {
+      nextRef.current = instance;
+    }
+  }
+
+  /**
+   * Finalize fiber destroy: dispose wiring, clear ref, update status.
+   * Collects errors when collectErrors is provided (best-effort cleanup).
+   * When collectErrors is null, errors are thrown immediately.
+   * 
+   * Uses commitRef for identity-safe ref clearing.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber being finalized
+   * @param {Error[] | null} collectErrors - array to collect errors (null to throw)
+   * @returns {void}
+   */
+  private finalizeFiberDestroy (fiber: RuntimeFiber<unknown>, collectErrors: Error[] | null): void {
+    // Dispose runtime bus wiring
+    if (collectErrors !== null) {
+      try {
+        this.disposeEffectableRuntimeBusWiring(fiber);
+      } catch (err: unknown) {
+        collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    } else {
+      this.disposeEffectableRuntimeBusWiring(fiber);
+    }
+
+    // Clear ref via commitRef (identity-safe clearing)
+    const ref = fiber.vnode.ref;
+    const instance = fiber.instance;
+    if (ref !== undefined && instance !== null) {
+      if (collectErrors !== null) {
+        try {
+          this.commitRef(ref, instance, undefined, null);
+        } catch (err: unknown) {
+          collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+        }
+      } else {
+        this.commitRef(ref, instance, undefined, null);
+      }
+    }
+
+    // Update lifecycle status
+    fiber.lifecycleStatus = fiber.engine.getStatus();
+  }
+
+  /**
+   * Transactional rollback for failed fiber materialization.
+   * Releases acquired resources in reverse acquisition order:
+   * 1. disable scheduler hook
+   * 2. dispose runtime bus registrations
+   * 3. clear bound ref (identity-safe)
+   * 4. run failed-startup cleanup
+   * 5. destroy mounted children in reverse order
+   * 6. unlink the partial fiber
+   * Cleanup is best-effort: one failure does not skip remaining steps.
+   * Preserves the original materialization error; cleanup errors are attached.
+   * Rollback is idempotent.
+   *
+   * @param {RuntimeFiber<P>} fiber - fiber being rolled back
+   * @param {Error} primaryError - original materialization/startup error
+   * @returns {void | Promise<void>}
+   */
+  private rollbackFailedMaterialization<P> (
+    fiber: RuntimeFiber<P>,
+    primaryError: Error,
+  ): void | Promise<void> {
+    const journal = fiber.constructionJournal;
+    if (journal === undefined || journal.rolledBack === true) {
+      return;
+    }
+    journal.rolledBack = true;
+
+    const cleanupErrors: Error[] = [];
+    const instance = fiber.instance;
+
+    // 1. Disable scheduler hook
+    if (journal.schedulerHookAttached === true && instance !== null) {
+      try {
+        this.clearUpdateHook(instance);
+        this.dirtyFibers.delete(fiber);
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    // 2. Dispose runtime bus registrations
+    if (journal.busWiringAttached === true) {
+      try {
+        this.disposeEffectableRuntimeBusWiring(fiber);
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    // 3. Clear bound ref (identity-safe)
+    if (journal.refBound === true && fiber.vnode.ref !== undefined && journal.refOwner !== undefined) {
+      try {
+        this.commitRef(fiber.vnode.ref, journal.refOwner, undefined, null);
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    // 4. Run failed-startup cleanup (if instance exists)
+    let cleanupPromise: Promise<void> | null = null;
+    if (instance !== null) {
+      try {
+        const cleanupRes = fiber.engine.runFailedCleanup(instance, true);
+        if (isThenable(cleanupRes)) {
+          cleanupPromise = cleanupRes;
+        }
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    // 5. Destroy mounted children in reverse order
+    const destroyChildrenAndFinalize = (): void | Promise<void> => {
+      const children = journal.mountedChildren;
+      for (let i = children.length - 1; i >= 0; i -= 1) {
+        try {
+          const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
+          if (isThenable(destroyRes)) {
+            return this.continueRollbackDestroyAsync(
+              children,
+              i,
+              destroyRes,
+              primaryError,
+              cleanupErrors,
+            );
+          }
+        } catch (err) {
+          cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+
+      // 6. Finalize: attach cleanup errors to primary error
+      this.finalizeRollback(primaryError, cleanupErrors);
+    };
+
+    if (cleanupPromise !== null) {
+      return cleanupPromise.then(
+        () => destroyChildrenAndFinalize(),
+        (err) => {
+          cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+          return destroyChildrenAndFinalize();
+        },
+      );
+    }
+
+    return destroyChildrenAndFinalize();
+  }
+
+  /**
+   * Async continuation of rollback child destruction after one child's destroy returned a Promise.
+   *
+   * @param {RuntimeFiber<unknown>[]} children - mounted children
+   * @param {number} lastIdx - index of the last processed child
+   * @param {Promise<void>} pending - Promise from destroying the previous child
+   * @param {Error} primaryError - original materialization error
+   * @param {Error[]} cleanupErrors - accumulated cleanup errors
+   * @returns {Promise<void>}
+   */
+  private async continueRollbackDestroyAsync (
+    children: RuntimeFiber<unknown>[],
+    lastIdx: number,
+    pending: Promise<void>,
+    primaryError: Error,
+    cleanupErrors: Error[],
+  ): Promise<void> {
+    try {
+      await pending;
+    } catch (err) {
+      cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+    }
+
+    for (let i = lastIdx - 1; i >= 0; i -= 1) {
+      try {
+        const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
+        if (isThenable(destroyRes)) {
+          await destroyRes;
+        }
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    this.finalizeRollback(primaryError, cleanupErrors);
+  }
+
+  /**
+   * Attaches cleanup errors to the primary error and rethrows.
+   *
+   * @param {Error} primaryError - original materialization error
+   * @param {Error[]} cleanupErrors - cleanup errors
+   * @returns {never}
+   */
+  private finalizeRollback (primaryError: Error, cleanupErrors: Error[]): never {
+    if (cleanupErrors.length > 0) {
+      (primaryError as Error & { rollbackErrors?: Error[] }).rollbackErrors = cleanupErrors;
+    }
+    throw primaryError;
   }
 
   /**
@@ -264,11 +670,13 @@ export class GraphRuntime {
    * - If an ancestor of the fiber is already queued → skip (ancestor covers the subtree).
    * - If descendants of the fiber are queued → remove them (fiber covers their subtrees).
    *
+   * Skip scheduling when runtime is FAILED.
+   *
    * @param {RuntimeFiber<unknown>} fiber - fiber whose subtree needs rebuild
    * @returns {void}
    */
   private scheduleUpdate (fiber: RuntimeFiber<unknown>): void {
-    if (this.unmounted) {
+    if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
       return;
     }
 
@@ -303,12 +711,73 @@ export class GraphRuntime {
   }
 
   /**
+   * Enqueues an operation and starts the queue processor if idle.
+   * Operations are executed sequentially; concurrent callers await the same in-flight operation.
+   * Serialize all graph mutations.
+   *
+   * @param {() => Promise<void>} operation - operation to enqueue
+   * @returns {Promise<void>}
+   */
+  private async enqueueOperation (operation: () => Promise<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.operationQueue.push(async () => {
+        try {
+          await operation();
+          resolve();
+        } catch (error: unknown) {
+          reject(error);
+        }
+      });
+
+      if (!this.operationInProgress) {
+        // Start processing without awaiting to allow concurrent enqueuing
+        void this.processOperationQueue();
+      }
+    });
+  }
+
+  /**
+   * Processes the operation queue: runs operations one at a time.
+   * Single serialized owner of tree mutations.
+   * Errors from individual operations are propagated to their callers but do not stop the queue.
+   *
+   * @returns {Promise<void>}
+   */
+  private async processOperationQueue (): Promise<void> {
+    if (this.operationInProgress) {
+      return;
+    }
+
+    this.operationInProgress = true;
+
+    try {
+      while (this.operationQueue.length > 0) {
+        const operation = this.operationQueue.shift();
+        if (operation === undefined) {
+          break;
+        }
+
+        try {
+          await operation();
+        } catch {
+          // Error is already propagated to the caller via the promise wrapper
+          // Continue processing the queue (don't poison it forever)
+        }
+      }
+    } finally {
+      this.operationInProgress = false;
+    }
+  }
+
+  /**
    * Queues one dirty-flush microtask and publishes {@link activeFlush} for await from `reconcile`.
+   *
+   * Skip scheduling when runtime is FAILED.
    *
    * @returns {void}
    */
   private scheduleDirtyFlushMicrotask (): void {
-    if (this.flushScheduled || this.unmounted) {
+    if (this.flushScheduled || this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
       return;
     }
 
@@ -316,10 +785,8 @@ export class GraphRuntime {
     const flushWork = new Promise<void>((resolve) => {
       queueMicrotask(() => {
         this.flushDirtyFibers()
-          .catch((err: unknown) => {
-            if (this.onAutoReconcileError !== null) {
-              this.onAutoReconcileError(err);
-            }
+          .catch(() => {
+            // Error already handled in flushDirtyFibers (onAutoReconcileError + fail-stop)
           })
           .finally(() => {
             resolve();
@@ -341,12 +808,15 @@ export class GraphRuntime {
    * Guarded by the `flushing` flag against re-entrancy.
    * The chain of repeat passes is capped by {@link GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES}.
    *
+   * Respects state (UNMOUNTING/UNMOUNTED/FAILED) to cancel flush when unmount begins or failure occurs.
+   * On unrecoverable error, invokes onAutoReconcileError then fail-stops.
+   *
    * @returns {Promise<void>}
    */
   private async flushDirtyFibers (): Promise<void> {
     this.flushScheduled = false;
 
-    if (this.unmounted || this.flushing) {
+    if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED || this.flushing) {
       this.dirtyFibers.clear();
       return;
     }
@@ -358,7 +828,7 @@ export class GraphRuntime {
 
     try {
       for (const fiber of snapshot) {
-        if (this.unmounted) {
+        if (this._state === RUNTIME_STATE.FAILED || this._state === RUNTIME_STATE.UNMOUNTING || this._state === RUNTIME_STATE.UNMOUNTED) {
           break;
         }
         const res = this.reconcileDirtyFiber(fiber);
@@ -366,18 +836,47 @@ export class GraphRuntime {
           await res;
         }
       }
+    } catch (error: unknown) {
+      this.flushing = false;
+      
+      // Notify error handler before fail-stop
+      if (this.onAutoReconcileError !== null) {
+        this.onAutoReconcileError(error);
+      }
+      
+      // Fail-stop on unrecoverable dirty-flush error
+      const failError = error instanceof Error ? error : new Error(String(error));
+      const failRes = this.failStop(failError);
+      if (isThenable(failRes)) {
+        await failRes;
+      }
+      
+      throw failError;
     } finally {
       this.flushing = false;
     }
 
     // If new dirty fibers appeared during flush — schedule the next pass
-    if (this.dirtyFibers.size > 0 && !this.unmounted) {
+    if (this.dirtyFibers.size > 0 && this.state === RUNTIME_STATE.ACTIVE) {
       if (this.dirtyFlushPassCount >= GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES) {
         this.dirtyFibers.clear();
         this.dirtyFlushPassCount = 0;
-        throw new Error(
+        const loopError = new Error(
           `GraphRuntime: dirty flush exceeded ${String(GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES)} passes (anti-loop)`
         );
+        
+        // Notify error handler before fail-stop
+        if (this.onAutoReconcileError !== null) {
+          this.onAutoReconcileError(loopError);
+        }
+        
+        // Fail-stop on loop limit
+        const failRes = this.failStop(loopError);
+        if (isThenable(failRes)) {
+          await failRes;
+        }
+        
+        throw loopError;
       }
       this.scheduleDirtyFlushMicrotask();
     } else {
@@ -395,7 +894,7 @@ export class GraphRuntime {
    * @returns {void | Promise<void>}
    */
   private reconcileDirtyFiber (fiber: RuntimeFiber<unknown>): void | Promise<void> {
-    if (this.unmounted) {
+    if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
       return;
     }
 
@@ -467,82 +966,202 @@ export class GraphRuntime {
     const rt = new GraphRuntime();
     rt.effectableRuntimeBuses = typeof runtimeBuses === 'undefined' ? null : runtimeBuses;
     rt.onAutoReconcileError = typeof onAutoReconcileError === 'function' ? onAutoReconcileError : null;
-    const res = rt.materialize(
-      root as VirtualServiceNode<unknown>,
-      null,
-      initialScope,
-    );
-    rt.currentRoot = isThenable(res) ? await res : res;
-    return rt;
+    
+    try {
+      const res = rt.materialize(
+        root as VirtualServiceNode<unknown>,
+        null,
+        initialScope,
+      );
+      rt.currentRoot = isThenable(res) ? await res : res;
+      rt.state = RUNTIME_STATE.ACTIVE;
+      return rt;
+    } catch (error: unknown) {
+      // Fail-stop on unrecoverable mount error
+      const failError = error instanceof Error ? error : new Error(String(error));
+      const failRes = rt.failStop(failError);
+      if (isThenable(failRes)) {
+        await failRes;
+      }
+      throw failError;
+    }
   }
 
   /**
    * Reconciles against a new tree.
-   * Builds a work-in-progress tree, computes effectTags, applies changes:
+   * Diffs the current tree against the new one, computes effectTags, applies changes:
    * - PLACE: create and mount a new node
    * - UPDATE: update props on an existing instance, call onUpdate
    * - DELETE: unmount and destroy a node
    *
+   * All reconcile calls are serialized through the operation queue.
+   * Rejects with terminal error when runtime is FAILED.
+   *
    * @param {VirtualServiceNode<P>} nextTree - new virtual tree
    * @returns {Promise<void>}
-   * @throws {Error} if the runtime is already unmounted
+   * @throws {Error} if the runtime state is UNMOUNTING, UNMOUNTED, or FAILED
    */
   public async reconcile<P = unknown>(nextTree: VirtualServiceNode<P>): Promise<void> {
-    if (this.unmounted) {
-      throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount.');
+    // Reject immediately if unmount has started or completed
+    if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
+      throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
     }
 
-    if (this.currentRoot === null) {
-      throw new Error('[Effectable] GraphRuntime: currentRoot is not initialized.');
+    // Reject immediately if runtime is in failed state
+    if (this.state === RUNTIME_STATE.FAILED) {
+      throw this.terminalError || new Error('[Effectable] GraphRuntime: reconcile attempted after terminal failure.');
     }
 
-    // Await the full dirty-flush chain (including re-schedule) — otherwise manual
-    // reconcile overlaps the snapshot auto-flush.
-    while (this.activeFlush !== null) {
-      await this.activeFlush;
-    }
+    // Serialize via operation queue
+    await this.enqueueOperation(async () => {
+      // Double-check after queue wait
+      if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
+        throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
+      }
 
-    if (this.unmounted) {
-      throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount.');
-    }
+      if (this.state === RUNTIME_STATE.FAILED) {
+        throw this.terminalError || new Error('[Effectable] GraphRuntime: reconcile attempted after terminal failure.');
+      }
 
-    // Manual reconcile covers the whole tree from the root: cancel pending auto-flush
-    // to avoid double-mounting components from concurrent reconcile paths.
-    this.dirtyFibers.clear();
-    this.flushScheduled = false;
-    this.dirtyFlushPassCount = 0;
+      if (this.currentRoot === null) {
+        throw new Error('[Effectable] GraphRuntime: currentRoot is not initialized.');
+      }
 
-    const res = this.reconcileFiber(
-      this.currentRoot,
-      nextTree as VirtualServiceNode<unknown>,
-      null,
-      this.currentRoot.scope,
-    );
+      // Await the full dirty-flush chain (including re-schedule) — otherwise manual
+      // reconcile overlaps the snapshot auto-flush.
+      while (this.activeFlush !== null) {
+        await this.activeFlush;
+      }
 
-    this.currentRoot = isThenable(res) ? await res : res;
+      if (this._state === RUNTIME_STATE.UNMOUNTING || this._state === RUNTIME_STATE.UNMOUNTED) {
+        throw new Error('[Effectable] GraphRuntime: reconcile attempted after unmount started.');
+      }
+
+      if (this._state === RUNTIME_STATE.FAILED) {
+        throw this.terminalError || new Error('[Effectable] GraphRuntime: reconcile attempted after terminal failure.');
+      }
+
+      // Manual reconcile covers the whole tree from the root: cancel pending auto-flush
+      // to avoid double-mounting components from concurrent reconcile paths.
+      this.dirtyFibers.clear();
+      this.flushScheduled = false;
+      this.dirtyFlushPassCount = 0;
+
+      try {
+        const res = this.reconcileFiber(
+          this.currentRoot,
+          nextTree as VirtualServiceNode<unknown>,
+          null,
+          this.currentRoot.scope,
+        );
+
+        this.currentRoot = isThenable(res) ? await res : res;
+      } catch (error: unknown) {
+        // Fail-stop on unrecoverable reconcile error
+        // Let failStop destroy current tree and null currentRoot (single owner)
+        const failError = error instanceof Error ? error : new Error(String(error));
+        const failRes = this.failStop(failError);
+        if (isThenable(failRes)) {
+          await failRes;
+        }
+        throw failError;
+      }
+    });
   }
 
   /**
    * Fully unmounts the component tree.
-   * Calls onUnmount for each node in reverse order (children before parent) and
+   * Calls onUnmount for each node (children before parent) and
    * moves stages to destroyed via LifecycleEngine.
    *
+   * Unmount is serialized, cached promise returned for concurrent callers.
+   * Safe and joinable even when runtime is FAILED.
+   * Collects cleanup errors when `rejectOnCleanupError: true` is passed.
+   *
+   * @param {object} [options] - unmount options
+   * @param {boolean} [options.rejectOnCleanupError=false] - reject on cleanup errors
    * @returns {Promise<void>}
    */
-  public async unmount (): Promise<void> {
-    if (this.unmounted) {
+  public async unmount (options?: { rejectOnCleanupError?: boolean }): Promise<void> {
+    const rejectOnCleanupError = options?.rejectOnCleanupError === true;
+
+    // If unmount is in progress, return the cached promise (HOLE 1)
+    // Must check BEFORE the UNMOUNTED early-return so concurrent callers join the in-flight unmount
+    if (this.cachedUnmountPromise !== null) {
+      return this.cachedUnmountPromise;
+    }
+
+    // If unmount already completed, return immediately
+    if (this.state === RUNTIME_STATE.UNMOUNTED) {
       return;
     }
 
-    this.unmounted = true;
-
-    if (this.currentRoot !== null) {
-      const d = this.destroyFiber(this.currentRoot);
-      if (isThenable(d)) {
-        await d;
-      }
-      this.currentRoot = null;
+    // Transition to UNMOUNTING state (reject new reconcile calls)
+    // If already FAILED, stay FAILED until unmount completes
+    if (this.state !== RUNTIME_STATE.FAILED) {
+      this.state = RUNTIME_STATE.UNMOUNTING;
     }
+
+    // Create and cache the unmount promise
+    this.cachedUnmountPromise = this.enqueueOperation(async () => {
+      // Double-check unmounted state
+      if (this.state === RUNTIME_STATE.UNMOUNTED) {
+        return;
+      }
+
+      // Cancel any pending dirty flush
+      this.dirtyFibers.clear();
+      this.flushScheduled = false;
+
+      // Wait for in-flight dirty flush to complete
+      if (this.activeFlush !== null) {
+        try {
+          await this.activeFlush;
+        } catch {
+          // Ignore flush errors during unmount
+        }
+      }
+
+      // HOLE 1: stay UNMOUNTING during destroy (not UNMOUNTED)
+      // If already FAILED, keep FAILED state through destroy
+      // State transition to UNMOUNTED happens AFTER destroy completes
+
+      // If pendingTeardown is active (fail-stop in progress), await it first
+      if (this.pendingTeardown !== null) {
+        try {
+          await this.pendingTeardown;
+        } catch {
+          // Ignore errors — they are already attached to the fail-stop primary error
+        }
+      }
+
+      if (this.currentRoot !== null) {
+        // Collect cleanup errors during unmount
+        const cleanupErrors: Error[] = [];
+        const d = this.destroyFiber(this.currentRoot, cleanupErrors);
+        if (isThenable(d)) {
+          await d;
+        }
+        this.currentRoot = null;
+
+        // HOLE 1: set UNMOUNTED only after destroy finishes
+        // Transition even if FAILED — unmount is the terminal operation
+        this.state = RUNTIME_STATE.UNMOUNTED;
+
+        // Reject with cleanup errors when requested
+        if (rejectOnCleanupError && cleanupErrors.length > 0) {
+          if (cleanupErrors.length === 1) {
+            throw cleanupErrors[0];
+          }
+          throw new AggregateError(cleanupErrors, 'Cleanup errors during unmount');
+        }
+      } else {
+        // No root to destroy — transition to UNMOUNTED
+        this.state = RUNTIME_STATE.UNMOUNTED;
+      }
+    });
+
+    return this.cachedUnmountPromise;
   }
 
   /**
@@ -559,12 +1178,13 @@ export class GraphRuntime {
   }
 
   /**
-   * Whether the runtime is active (unmount has not been called).
+   * Whether the runtime is active (not failed and unmount has not been called).
+   * Returns false when state is FAILED.
    *
    * @returns {boolean}
    */
   public isActive (): boolean {
-    return !this.unmounted;
+    return this.state === RUNTIME_STATE.ACTIVE;
   }
 
   /**
@@ -604,6 +1224,16 @@ export class GraphRuntime {
    */
   public getStableAsyncContinueCount (): number {
     return this.stableAsyncContinueCount;
+  }
+
+  /**
+   * Current runtime state.
+   * Test/debug probe; not a production API.
+   *
+   * @returns {RuntimeState} current state
+   */
+  public getState (): RuntimeState {
+    return this.state;
   }
 
   /**
@@ -679,15 +1309,38 @@ export class GraphRuntime {
       effectTag: FIBER_EFFECT_TAG.PLACE,
       engine,
       scope: parentScope,
+      constructionJournal: {
+        mountedChildren: [],
+      },
     };
 
     // Recursively materialize children before running the parent's lifecycle
     const childVnodes = this.getChildVnodes(instance, vnode.children);
-    const childFibers: RuntimeFiber<unknown>[] = [];
+
+    // Validate unique keys BEFORE materialization (Option A: React v16.5 contract)
+    // Prevent partial tree construction when duplicate keys are present
+    this.validateUniqueKeys(
+      childVnodes.map(vnode => ({ vnode, instance: null })),
+      fiber as RuntimeFiber<unknown>,
+      'current'
+    );
 
     for (let i = 0; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
-      const childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
+      let childRes: RuntimeFiber<unknown> | Promise<RuntimeFiber<unknown>>;
+      
+      try {
+        childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+        if (isThenable(rollbackRes)) {
+          return rollbackRes.then(() => {
+            throw error;
+          }) as Promise<RuntimeFiber<P>>;
+        }
+        throw error;
+      }
 
       if (isThenable(childRes)) {
         // Hit an async child — continue the materialization tail in the async continuation.
@@ -697,23 +1350,52 @@ export class GraphRuntime {
           engine,
           vnode,
           childVnodes,
-          childFibers,
+          childScope,
           childRes,
           i,
         );
       }
 
-      childFibers.push(childRes as RuntimeFiber<unknown>);
+      fiber.constructionJournal!.mountedChildren.push(childRes as RuntimeFiber<unknown>);
     }
 
-    fiber.children = childFibers as Fiber[];
+    fiber.children = fiber.constructionJournal!.mountedChildren as Fiber[];
 
-    // Bind ref to the instance
+    // Bind ref to the instance (centralized via commitRef)
     if (vnode.ref !== undefined) {
-      (vnode.ref as RefObject<typeof instance>).current = instance;
+      try {
+        this.commitRef(undefined, null, vnode.ref, instance);
+        fiber.constructionJournal!.refBound = true;
+        fiber.constructionJournal!.refOwner = instance;
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+        if (isThenable(rollbackRes)) {
+          return rollbackRes.then(() => {
+            throw error;
+          }) as Promise<RuntimeFiber<P>>;
+        }
+        throw error;
+      }
     }
 
-    this.attachEffectableRuntimeBusWiring(instance, fiber);
+    try {
+      this.attachEffectableRuntimeBusWiring(instance, fiber);
+      if (fiber.effectableRuntimeBusDisposer !== undefined) {
+        fiber.constructionJournal!.busWiringAttached = true;
+      }
+    } catch (err) {
+      const rollbackRes = this.rollbackFailedMaterialization(
+        fiber,
+        err instanceof Error ? err : new Error(String(err)),
+      );
+      if (isThenable(rollbackRes)) {
+        return rollbackRes.then(() => {
+          throw err;
+        }) as Promise<RuntimeFiber<P>>;
+      }
+      throw err;
+    }
 
     // Run lifecycle after all children are materialized.
     // Pre-mount hook buffers setState from onMount until injectUpdateHook.
@@ -721,22 +1403,23 @@ export class GraphRuntime {
     const startupRes = engine.runStartup(instance);
 
     if (isThenable(startupRes)) {
-      return this.finalizeMaterializeAsync(fiber, engine, childFibers, startupRes);
+      return this.finalizeMaterializeAsync(fiber, engine, startupRes);
     }
 
     if (!startupRes.ok) {
-      // Unmount already-mounted children when parent startup fails
-      const destroyChain = this.destroyChildrenOnError(childFibers);
-      if (isThenable(destroyChain)) {
-        return destroyChain.then(() => {
-          throw startupRes.error;
-        });
+      const error = startupRes.error instanceof Error ? startupRes.error : new Error(String(startupRes.error));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        return rollbackRes.then(() => {
+          throw error;
+        }) as Promise<RuntimeFiber<P>>;
       }
-      throw startupRes.error;
+      throw error;
     }
 
     fiber.lifecycleStatus = engine.getStatus();
     fiber.effectTag = null;
+    fiber.constructionJournal!.schedulerHookAttached = true;
     this.injectUpdateHook(instance, fiber);
     return fiber;
   }
@@ -750,7 +1433,7 @@ export class GraphRuntime {
    * @param {LifecycleEngine} engine - lifecycle engine
    * @param {VirtualServiceNode<P>} vnode - virtual node
    * @param {VirtualServiceNode[]} childVnodes - all child vnodes
-   * @param {RuntimeFiber<unknown>[]} childFibers - already materialized child fibers
+   * @param {ContextScope} childScope - scope for child nodes
    * @param {Promise<RuntimeFiber<unknown>>} pending - Promise for the current child
    * @param {number} pendingIdx - index of the current child
    * @returns {Promise<RuntimeFiber<P>>}
@@ -761,44 +1444,89 @@ export class GraphRuntime {
     engine: LifecycleEngine,
     vnode: VirtualServiceNode<P>,
     childVnodes: VirtualServiceNode[],
-    childFibers: RuntimeFiber<unknown>[],
+    childScope: ContextScope,
     pending: PromiseLike<RuntimeFiber<unknown>>,
     pendingIdx: number,
   ): Promise<RuntimeFiber<P>> {
-    const childScope = this.buildChildScope(instance, fiber.scope);
+    const journal = fiber.constructionJournal!;
 
-    childFibers.push(await pending);
+    try {
+      journal.mountedChildren.push(await pending);
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        await rollbackRes;
+      }
+      throw error;
+    }
 
     for (let i = pendingIdx + 1; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
-      const childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
-      childFibers.push(isThenable(childRes) ? await childRes : (childRes as RuntimeFiber<unknown>));
+      
+      try {
+        const childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
+        const resolvedChild = isThenable(childRes) ? await childRes : (childRes as RuntimeFiber<unknown>);
+        journal.mountedChildren.push(resolvedChild);
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+        if (isThenable(rollbackRes)) {
+          await rollbackRes;
+        }
+        throw error;
+      }
     }
 
-    fiber.children = childFibers as Fiber[];
+    fiber.children = journal.mountedChildren as Fiber[];
 
     if (vnode.ref !== undefined) {
-      (vnode.ref as RefObject<typeof instance>).current = instance;
+      try {
+        this.commitRef(undefined, null, vnode.ref, instance);
+        journal.refBound = true;
+        journal.refOwner = instance;
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+        if (isThenable(rollbackRes)) {
+          await rollbackRes;
+        }
+        throw error;
+      }
     }
 
-    this.attachEffectableRuntimeBusWiring(instance, fiber);
+    try {
+      this.attachEffectableRuntimeBusWiring(instance, fiber);
+      if (fiber.effectableRuntimeBusDisposer !== undefined) {
+        journal.busWiringAttached = true;
+      }
+    } catch (err) {
+      const rollbackRes = this.rollbackFailedMaterialization(
+        fiber,
+        err instanceof Error ? err : new Error(String(err)),
+      );
+      if (isThenable(rollbackRes)) {
+        await rollbackRes;
+      }
+      throw err;
+    }
 
     this.injectPreMountUpdateHook(instance, fiber);
     const startupRes = engine.runStartup(instance);
     const resolved = isThenable(startupRes) ? await startupRes : startupRes;
 
     if (!resolved.ok) {
-      for (const c of childFibers) {
-        const d = this.destroyFiber(c);
-        if (isThenable(d)) {
-          await d;
-        }
+      const error = resolved.error instanceof Error ? resolved.error : new Error(String(resolved.error));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        await rollbackRes;
       }
-      throw resolved.error;
+      throw error;
     }
 
     fiber.lifecycleStatus = engine.getStatus();
     fiber.effectTag = null;
+    journal.schedulerHookAttached = true;
     this.injectUpdateHook(instance, fiber);
     return fiber;
   }
@@ -809,70 +1537,35 @@ export class GraphRuntime {
    * @template P node props type
    * @param {RuntimeFiber<P>} fiber - fiber of the subtree root node
    * @param {LifecycleEngine} engine - lifecycle engine for this node
-   * @param {RuntimeFiber<unknown>[]} childFibers - already mounted child fibers (for rollback on error)
    * @param {PromiseLike<import('./lifecycle').LifecycleTransitionResult>} pendingStartup - Promise of the `runStartup` result
    * @returns {Promise<RuntimeFiber<P>>} ready fiber, or rollback children and rethrow
    */
   private async finalizeMaterializeAsync<P>(
     fiber: RuntimeFiber<P>,
     engine: LifecycleEngine,
-    childFibers: RuntimeFiber<unknown>[],
     pendingStartup: PromiseLike<import('./lifecycle').LifecycleTransitionResult>,
   ): Promise<RuntimeFiber<P>> {
     const result = await pendingStartup;
+    const journal = fiber.constructionJournal!;
 
     if (!result.ok) {
-      for (const c of childFibers) {
-        const d = this.destroyFiber(c);
-        if (isThenable(d)) {
-          await d;
-        }
+      const error = result.error instanceof Error ? result.error : new Error(String(result.error));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        await rollbackRes;
       }
-      throw result.error;
+      throw error;
     }
 
     fiber.lifecycleStatus = engine.getStatus();
     fiber.effectTag = null;
     if (fiber.instance !== null) {
+      journal.schedulerHookAttached = true;
       this.injectUpdateHook(fiber.instance, fiber);
     }
     return fiber;
   }
 
-  /**
-   * Unmounts already-mounted children when parent startup fails.
-   * Returns sync void if all demounts are sync, otherwise a Promise.
-   *
-   * @param {RuntimeFiber<unknown>[]} childFibers
-   * @returns {void | Promise<void>}
-   */
-  private destroyChildrenOnError (childFibers: RuntimeFiber<unknown>[]): void | Promise<void> {
-    let pending: PromiseLike<void> | null = null;
-    let startIdx = 0;
-
-    for (let i = 0; i < childFibers.length; i++) {
-      const d = this.destroyFiber(childFibers[i] as RuntimeFiber<unknown>);
-      if (isThenable(d)) {
-        pending = d;
-        startIdx = i + 1;
-        break;
-      }
-    }
-
-    if (pending === null) {
-      return;
-    }
-
-    return (async (): Promise<void> => {
-      await pending;
-      for (let i = startIdx; i < childFibers.length; i++) {
-        const d = this.destroyFiber(childFibers[i] as RuntimeFiber<unknown>);
-        if (isThenable(d)) {
-          await d;
-        }
-      }
-    })();
-  }
 
   // ---------------------------------------------------------------------------
   // Reconcile
@@ -947,11 +1640,28 @@ export class GraphRuntime {
       instance.props = nextVnode.props;
     }
 
+    // Re-inject context fields when parent scope changed
+    let contextChanged = false;
+    if (current.scope !== parentScope) {
+      try {
+        contextChanged = injectContextFields(instance, parentScope);
+      } catch (error: unknown) {
+        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>);
+        if (isThenable(cleanupResult)) {
+          return cleanupResult.then(() => {
+            throw error;
+          });
+        }
+        throw error;
+      }
+    }
+
     // Build scope for child nodes (ContextProvider may have updated values)
     const childScope = this.buildChildScope(instance, parentScope);
 
-    // Call onUpdate if props changed
-    if (prevProps !== instance.props && current.engine.canUpdate()) {
+    // Call onUpdate if props or context changed (React 16.5 class-component style: one hook)
+    const propsChanged = prevProps !== instance.props;
+    if ((propsChanged || contextChanged) && current.engine.canUpdate()) {
       try {
         instance.onUpdate(prevProps, instance.props);
       } catch (error: unknown) {
@@ -965,10 +1675,8 @@ export class GraphRuntime {
       }
     }
 
-    // Update ref
-    if (nextVnode.ref !== undefined) {
-      (nextVnode.ref as RefObject<typeof instance>).current = instance;
-    }
+    // Commit ref transition: clear old ref if changed, bind new ref
+    this.commitRef(current.vnode.ref, instance, nextVnode.ref, instance);
 
     // Reconcile child nodes (sync fast-path if all children are sync).
     let nextChildVnodes: VirtualServiceNode[];
@@ -1147,14 +1855,62 @@ export class GraphRuntime {
   }
 
   /**
+   * Validates that sibling keys are unique within a list.
+   * Follows React v16.5 keyed child reconciliation contract: duplicate keys are invalid.
+   * Throws a descriptive error including the duplicate key and parent component identity.
+   *
+   * @param {Array<{ vnode: { key?: string }; instance?: Component<unknown, unknown> | null }>} items - list of fibers or vnodes
+   * @param {RuntimeFiber<unknown>} parentFiber - parent fiber (for error message)
+   * @param {string} listName - "current" or "next" (for error message)
+   * @returns {void}
+   * @throws {Error} when duplicate keys are detected
+   */
+  private validateUniqueKeys (
+    items: Array<{ vnode: { key?: string }; instance?: Component<unknown, unknown> | null }>,
+    parentFiber: RuntimeFiber<unknown>,
+    listName: string,
+  ): void {
+    const seenKeys = new Set<string>();
+    
+    for (const item of items) {
+      const key = item.vnode.key;
+      
+      if (key !== undefined) {
+        if (seenKeys.has(key)) {
+          const parentInstance = parentFiber.instance;
+          const parentName = parentInstance !== null 
+            ? parentInstance.constructor.name 
+            : 'unknown';
+          
+          throw new Error(
+            `[Effectable] GraphRuntime: duplicate key "${key}" in ${listName} children of ${parentName}. ` +
+            `Sibling keys must be unique (React v16.5 keyed child reconciliation contract). ` +
+            `Duplicates cause undefined matching behavior and lifecycle leaks.`
+          );
+        }
+        
+        seenKeys.add(key);
+      }
+    }
+  }
+
+  /**
    * Full-diff reconcile: keyed/unkeyed Map + destroy orphans.
    * Always async — internal branching is too complex for an efficient sync path.
+   *
+   * Contract: Sibling keys must be unique (React v16.5 keyed child reconciliation).
+   * Validates both current and next children BEFORE any side effects.
+   * Throws deterministic error on duplicate keys to prevent lifecycle leaks.
+   *
+   * HOLE 3: On throw during PLACE, cleans up previously placed new nodes
+   * to prevent lifecycle leaks. Uses identity-safe check against currentChildren Set.
    *
    * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
    * @param {VirtualServiceNode[]} nextVnodes - new vnodes
    * @param {RuntimeFiber<unknown>} parentFiber - parent fiber
    * @param {ContextScope} childScope - children scope
    * @returns {Promise<RuntimeFiber<unknown>[]>}
+   * @throws {Error} when duplicate keys are detected in current or next children
    */
   private async reconcileChildrenFullDiff (
     currentChildren: RuntimeFiber<unknown>[],
@@ -1162,6 +1918,18 @@ export class GraphRuntime {
     parentFiber: RuntimeFiber<unknown>,
     childScope: ContextScope,
   ): Promise<RuntimeFiber<unknown>[]> {
+    // Validate unique keys BEFORE any side effects (Option A: React v16.5 contract)
+    this.validateUniqueKeys(currentChildren, parentFiber, 'current');
+    this.validateUniqueKeys(
+      nextVnodes.map(vnode => ({ vnode, instance: null })),
+      parentFiber,
+      'next'
+    );
+
+    // HOLE 3: Build identity Set of currentChildren for rollback
+    // Used to distinguish UPDATE (same object) from PLACE/REPLACE (new object)
+    const currentChildrenSet = new Set(currentChildren);
+
     // Check for keyed children before creating a Map (6.06x speedup for unkeyed-only)
     let hasKeyedCurrent = false;
 
@@ -1176,43 +1944,80 @@ export class GraphRuntime {
     const nextChildren: RuntimeFiber<unknown>[] = [];
     let unkeyedIdx = 0;
 
-    if (hasKeyedCurrent) {
-      // Acquire Map from the depth-indexed pool (5.1x: Map.clear() vs new Map())
-      const keyedCurrentMap = this.acquireKeyedMap();
-      this.reconcileDepth++;
+    try {
+      if (hasKeyedCurrent) {
+        // Acquire Map from the depth-indexed pool (5.1x: Map.clear() vs new Map())
+        const keyedCurrentMap = this.acquireKeyedMap();
+        this.reconcileDepth++;
 
-      try {
-        // Build map of current children by key (for keyed matching)
-        for (const child of currentChildren) {
-          const key = child.vnode.key;
+        try {
+          // Build map of current children by key (for keyed matching)
+          for (const child of currentChildren) {
+            const key = child.vnode.key;
 
-          if (key !== undefined) {
-            keyedCurrentMap.set(key, child);
-          } else {
-            unkeyedCurrent.push(child);
+            if (key !== undefined) {
+              keyedCurrentMap.set(key, child);
+            } else {
+              unkeyedCurrent.push(child);
+            }
           }
+
+          for (const nextVnode of nextVnodes) {
+            const nextKey = nextVnode.key;
+
+            if (nextKey !== undefined && keyedCurrentMap.has(nextKey)) {
+              const currentFiber = keyedCurrentMap.get(nextKey);
+
+              if (currentFiber === undefined) {
+                throw new Error(`[Effectable] GraphRuntime: fiber with key "${nextKey}" not found in map.`);
+              }
+
+              keyedCurrentMap.delete(nextKey);
+
+              const reconciledRes = this.reconcileFiber(
+                currentFiber,
+                nextVnode as VirtualServiceNode<unknown>,
+                parentFiber,
+                childScope,
+              );
+              nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
+            } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
+              const currentFiber = unkeyedCurrent[unkeyedIdx];
+              unkeyedIdx += 1;
+
+              const reconciledRes = this.reconcileFiber(
+                currentFiber as RuntimeFiber<unknown>,
+                nextVnode as VirtualServiceNode<unknown>,
+                parentFiber,
+                childScope,
+              );
+              nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
+            } else {
+              // New node — PLACE
+              const newRes = this.materialize(nextVnode, parentFiber, childScope);
+              nextChildren.push(isThenable(newRes) ? await newRes : newRes);
+            }
+          }
+
+          // Destroy remaining unpaired current children (keyed)
+          for (const [, orphan] of keyedCurrentMap) {
+            const d = this.destroyFiber(orphan);
+            if (isThenable(d)) {
+              await d;
+            }
+          }
+        } finally {
+          this.reconcileDepth--;
+          this.releaseKeyedMap();
+        }
+      } else {
+        // No keyed children — skip Map, positional reconcile
+        for (const child of currentChildren) {
+          unkeyedCurrent.push(child);
         }
 
         for (const nextVnode of nextVnodes) {
-          const nextKey = nextVnode.key;
-
-          if (nextKey !== undefined && keyedCurrentMap.has(nextKey)) {
-            const currentFiber = keyedCurrentMap.get(nextKey);
-
-            if (currentFiber === undefined) {
-              throw new Error(`[Effectable] GraphRuntime: fiber with key "${nextKey}" not found in map.`);
-            }
-
-            keyedCurrentMap.delete(nextKey);
-
-            const reconciledRes = this.reconcileFiber(
-              currentFiber,
-              nextVnode as VirtualServiceNode<unknown>,
-              parentFiber,
-              childScope,
-            );
-            nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
-          } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
+          if (unkeyedIdx < unkeyedCurrent.length) {
             const currentFiber = unkeyedCurrent[unkeyedIdx];
             unkeyedIdx += 1;
 
@@ -1229,57 +2034,53 @@ export class GraphRuntime {
             nextChildren.push(isThenable(newRes) ? await newRes : newRes);
           }
         }
+      }
 
-        // Destroy remaining unpaired current children (keyed)
-        for (const [, orphan] of keyedCurrentMap) {
+      // Destroy remaining unpaired unkeyed children
+      for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
+        const orphan = unkeyedCurrent[i];
+
+        if (orphan !== undefined) {
           const d = this.destroyFiber(orphan);
           if (isThenable(d)) {
             await d;
           }
         }
-      } finally {
-        this.reconcileDepth--;
-        this.releaseKeyedMap();
-      }
-    } else {
-      // No keyed children — skip Map, positional reconcile
-      for (const child of currentChildren) {
-        unkeyedCurrent.push(child);
       }
 
-      for (const nextVnode of nextVnodes) {
-        if (unkeyedIdx < unkeyedCurrent.length) {
-          const currentFiber = unkeyedCurrent[unkeyedIdx];
-          unkeyedIdx += 1;
+      return nextChildren;
+    } catch (primaryError: unknown) {
+      // HOLE 3: On throw, clean up new fibers in nextChildren
+      // that are NOT identity-in currentChildren (PLACE/REPLACE results).
+      // Do not destroy UPDATE siblings (same object as current child).
+      const rollbackErrors: Error[] = [];
 
-          const reconciledRes = this.reconcileFiber(
-            currentFiber as RuntimeFiber<unknown>,
-            nextVnode as VirtualServiceNode<unknown>,
-            parentFiber,
-            childScope,
-          );
-          nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
-        } else {
-          // New node — PLACE
-          const newRes = this.materialize(nextVnode, parentFiber, childScope);
-          nextChildren.push(isThenable(newRes) ? await newRes : newRes);
+      for (const child of nextChildren) {
+        // Skip if this fiber is identity-in currentChildren (UPDATE, not PLACE/REPLACE)
+        if (currentChildrenSet.has(child)) {
+          continue;
+        }
+
+        // New fiber (PLACE or REPLACE result) — destroy it
+        try {
+          const d = this.destroyFiber(child, rollbackErrors);
+          if (isThenable(d)) {
+            await d;
+          }
+        } catch (err: unknown) {
+          rollbackErrors.push(err instanceof Error ? err : new Error(String(err)));
         }
       }
-    }
 
-    // Destroy remaining unpaired unkeyed children
-    for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
-      const orphan = unkeyedCurrent[i];
-
-      if (orphan !== undefined) {
-        const d = this.destroyFiber(orphan);
-        if (isThenable(d)) {
-          await d;
-        }
+      // Attach rollback errors to primary error (pattern)
+      if (rollbackErrors.length > 0) {
+        const error = primaryError instanceof Error ? primaryError : new Error(String(primaryError));
+        (error as Error & { rollbackErrors?: Error[] }).rollbackErrors = rollbackErrors;
+        throw error;
       }
-    }
 
-    return nextChildren;
+      throw primaryError;
+    }
   }
 
   /**
@@ -1353,18 +2154,30 @@ export class GraphRuntime {
    * Returns `void` synchronously if the whole subtree is sync (up to 266x speedup
    * on an 85-node tree); otherwise a Promise. `await` works correctly with either union branch.
    *
+   * Collects cleanup errors via `collectErrors` parameter (best-effort cleanup).
+   *
    * @param {RuntimeFiber} fiber - fiber to destroy
+   * @param {Error[] | null} collectErrors - array to collect cleanup errors (null to throw immediately)
    * @returns {void | Promise<void>}
    */
-  private destroyFiber (fiber: RuntimeFiber<unknown>): void | Promise<void> {
+  private destroyFiber (fiber: RuntimeFiber<unknown>, collectErrors: Error[] | null = null): void | Promise<void> {
     const children = fiber.children;
     const n = children.length;
 
     // Sync recursion over children until the first async
     for (let i = 0; i < n; i++) {
-      const childRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
-      if (isThenable(childRes)) {
-        return this.continueDestroyAsync(fiber, children, i, childRes);
+      try {
+        const childRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, collectErrors);
+        if (isThenable(childRes)) {
+          return this.continueDestroyAsync(fiber, children, i, childRes, collectErrors);
+        }
+      } catch (err: unknown) {
+        // Best-effort cleanup — collect error and continue
+        if (collectErrors !== null) {
+          collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+        } else {
+          throw err;
+        }
       }
     }
 
@@ -1378,17 +2191,19 @@ export class GraphRuntime {
 
     const shutdownRes = fiber.engine.runShutdown(instance);
     if (isThenable(shutdownRes)) {
-      return this.finalizeDestroyAsync(fiber, shutdownRes);
+      return this.finalizeDestroyAsync(fiber, shutdownRes, collectErrors);
     }
 
-    this.disposeEffectableRuntimeBusWiring(fiber);
-
-    // Clear ref after unmount
-    const ref = fiber.vnode.ref;
-    if (ref !== undefined) {
-      ref.current = null;
+    // Collect shutdown errors for observability
+    if (!shutdownRes.ok) {
+      if (collectErrors !== null) {
+        collectErrors.push(shutdownRes.error instanceof Error ? shutdownRes.error : new Error(String(shutdownRes.error)));
+      }
     }
-    fiber.lifecycleStatus = fiber.engine.getStatus();
+
+    // Always finalize the fiber even if shutdown failed (best-effort cleanup)
+    // finalizeFiberDestroy uses commitRef for identity-safe ref clearing
+    this.finalizeFiberDestroy(fiber, collectErrors);
   }
 
   /**
@@ -1398,6 +2213,7 @@ export class GraphRuntime {
    * @param {Fiber[]} children - children list
    * @param {number} pendingIdx - index of the pending child
    * @param {PromiseLike<void>} pending - Promise from destroying the child
+   * @param {Error[] | null} collectErrors - array to collect cleanup errors
    * @returns {Promise<void>}
    */
   private async continueDestroyAsync (
@@ -1405,13 +2221,32 @@ export class GraphRuntime {
     children: Fiber[],
     pendingIdx: number,
     pending: PromiseLike<void>,
+    collectErrors: Error[] | null = null,
   ): Promise<void> {
-    await pending;
+    // Best-effort cleanup — await pending child
+    try {
+      await pending;
+    } catch (err: unknown) {
+      if (collectErrors !== null) {
+        collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+      } else {
+        throw err;
+      }
+    }
 
+    // Continue destroying remaining children even if previous failed
     for (let i = pendingIdx + 1; i < children.length; i++) {
-      const r = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
-      if (isThenable(r)) {
-        await r;
+      try {
+        const r = this.destroyFiber(children[i] as RuntimeFiber<unknown>, collectErrors);
+        if (isThenable(r)) {
+          await r;
+        }
+      } catch (err: unknown) {
+        if (collectErrors !== null) {
+          collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+        } else {
+          throw err;
+        }
       }
     }
 
@@ -1425,16 +2260,21 @@ export class GraphRuntime {
 
     const shutdownRes = fiber.engine.runShutdown(instance);
     if (isThenable(shutdownRes)) {
-      await shutdownRes;
+      const asyncRes = await shutdownRes;
+      if (typeof asyncRes === 'object' && asyncRes !== null && 'ok' in asyncRes && !asyncRes.ok) {
+        if (collectErrors !== null) {
+          collectErrors.push(asyncRes.error instanceof Error ? asyncRes.error : new Error(String(asyncRes.error)));
+        }
+      }
+    } else if (!shutdownRes.ok) {
+      if (collectErrors !== null) {
+        collectErrors.push(shutdownRes.error instanceof Error ? shutdownRes.error : new Error(String(shutdownRes.error)));
+      }
     }
 
-    this.disposeEffectableRuntimeBusWiring(fiber);
-
-    const ref = fiber.vnode.ref;
-    if (ref !== undefined) {
-      ref.current = null;
-    }
-    fiber.lifecycleStatus = fiber.engine.getStatus();
+    // Always finalize even if shutdown failed
+    // finalizeFiberDestroy uses commitRef for identity-safe ref clearing
+    this.finalizeFiberDestroy(fiber, collectErrors);
   }
 
   /**
@@ -1443,21 +2283,27 @@ export class GraphRuntime {
    *
    * @param {RuntimeFiber<unknown>} fiber
    * @param {PromiseLike<unknown>} pendingShutdown
+   * @param {Error[] | null} collectErrors - array to collect cleanup errors
    * @returns {Promise<void>}
    */
   private async finalizeDestroyAsync (
     fiber: RuntimeFiber<unknown>,
     pendingShutdown: PromiseLike<unknown>,
+    collectErrors: Error[] | null = null,
   ): Promise<void> {
-    await pendingShutdown;
+    const shutdownRes = await pendingShutdown;
 
-    this.disposeEffectableRuntimeBusWiring(fiber);
-
-    const ref = fiber.vnode.ref;
-    if (ref !== undefined) {
-      ref.current = null;
+    // Collect shutdown errors for observability
+    if (typeof shutdownRes === 'object' && shutdownRes !== null && 'ok' in shutdownRes && !shutdownRes.ok) {
+      if (collectErrors !== null) {
+        const err = (shutdownRes as { ok: false; error: unknown }).error;
+        collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
     }
-    fiber.lifecycleStatus = fiber.engine.getStatus();
+
+    // Always finalize even if shutdown failed
+    // finalizeFiberDestroy uses commitRef for identity-safe ref clearing
+    this.finalizeFiberDestroy(fiber, collectErrors);
   }
 
   // ---------------------------------------------------------------------------
