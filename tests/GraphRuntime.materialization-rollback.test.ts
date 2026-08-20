@@ -1,5 +1,5 @@
 /**
- * Rollback tests for transactional fiber materialization (issue #12).
+ * Rollback tests for transactional fiber materialization.
  *
  * @module Effectable/component/GraphRuntime.materialization-rollback.test
  */

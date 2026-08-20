@@ -1,5 +1,5 @@
 /**
- * Bootstrap: teardown observability (issue #20).
+ * Bootstrap: teardown observability.
  *
  * Tests that bootstrap().shutdown() exposes cleanup errors and always clears owned buses.
  *

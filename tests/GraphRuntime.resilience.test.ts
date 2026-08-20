@@ -410,7 +410,7 @@ describe('GraphRuntime resilience (P1 I38–I42)', () => {
         ),
       ).rejects.toThrow('FailOnMountLeaf: intentional mount failure');
 
-      // Runtime transitions to FAILED on unrecoverable error (issue #10)
+      // Runtime transitions to FAILED on unrecoverable error
       expect(runtime.isActive()).toBe(false);
       expect(runtime.getState()).toBe('failed');
 

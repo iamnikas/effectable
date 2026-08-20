@@ -800,7 +800,7 @@ describe('GraphRuntime', () => {
     });
 
     it('issue #13: documented root usage — ContextProvider as root with explicit children', async () => {
-      // Test the exact contract from #13: h(ContextProvider, { value }, [h(Consumer)])
+      // Test the exact contract: h(ContextProvider, { value }, [h(Consumer)])
       class DirectConsumer extends Component<Record<string, never>, Record<string, never>> {
         @UseContext(NUMBER_TOKEN)
         public injectedValue = -1;
@@ -914,7 +914,7 @@ describe('GraphRuntime', () => {
     });
 
     it('issue #13: reconcile updates provider props — consumer receives updated value (issue #15 fixed)', async () => {
-      // Context injection happens on mount AND on reconcile when provider value changes (issue #15)
+      // Context injection happens on mount AND on reconcile when provider value changes
       class ConsumerWithUpdate extends Component<Record<string, never>, Record<string, never>> {
         @UseContext(NUMBER_TOKEN)
         public injectedValue = -1;
@@ -960,7 +960,7 @@ describe('GraphRuntime', () => {
         ])
       );
 
-      // Fixed behavior (issue #15): context is re-injected on reconcile when provider value changes
+      // Fixed behavior: context is re-injected on reconcile when provider value changes
       // Consumer receives the updated value and onUpdate is called
       expect(consumerRef.current.injectedValue).toBe(2);
       expect(consumerRef.current.receivedOnMount).toBe(1);
@@ -2396,7 +2396,7 @@ describe('GraphRuntime', () => {
       root.setState({ boom: true });
       await drainMicrotasks();
 
-      // Dirty-flush error transitions to FAILED (issue #10)
+      // Dirty-flush error transitions to FAILED
       expect(runtime.isActive()).toBe(false);
       expect(runtime.getState()).toBe('failed');
       expect(runtime.getRootInstance()).toBeNull();
