@@ -24,7 +24,6 @@ import type {
   MapStateToProps,
   MapDispatchToProps,
   MapDispatchToPropsFunction,
-  MapDispatchToPropsDispatchOnly,
   ActionCreatorsMap,
   ConnectOptions,
   ConnectableHocTarget,

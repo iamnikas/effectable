@@ -153,7 +153,7 @@ describe('GraphRuntime ref ownership (issue #17)', () => {
 
       public override compose (): VirtualServiceNode[] {
         const ref = this.props.useRef1 ? this.ref1 : this.ref2;
-        return [h(KeyedChild, { id: 'keyed', key: 'child-key' }, ref)];
+        return [h(KeyedChild, { id: 'keyed' }, ref, 'child-key')];
       }
     }
 

@@ -12,7 +12,6 @@ import {
   isMiddleware,
 } from 'Effectable';
 import type {
-  Action,
   AnyAction,
   Middleware,
   Reducer,
