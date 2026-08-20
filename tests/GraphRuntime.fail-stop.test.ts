@@ -12,13 +12,11 @@ import type { VirtualServiceNode, RefObject } from 'Effectable';
 import { RUNTIME_PROPS_RECEIVER } from '../src/component/types';
 import type { RuntimePropsReceiver } from '../src/component/types';
 import { OnCommand, createRuntimeBuses } from 'Effectable';
-import type { RuntimeCommand, RuntimeEvent, RuntimeQuery } from 'Effectable';
+import type { RuntimeCommand } from 'Effectable';
 
 jest.setTimeout(30_000);
 
 type TCmd = RuntimeCommand<'TestCmd', { value: number }>;
-type TQuery = RuntimeQuery<'TestQuery', { id: string }>;
-type TEvent = RuntimeEvent<'TestEvent', { msg: string }>;
 
 async function drainMicrotasks (): Promise<void> {
   await Promise.resolve();
@@ -112,8 +110,8 @@ class FailOnUpdateRoot extends Component<Record<string, never>, { shouldFail: bo
     this.state = {};
   }
 
-  public override onUpdate (prevProps: { shouldFail: boolean }): void {
-    if (this.props.shouldFail && !prevProps.shouldFail) {
+  public override onUpdate (_prev: Record<string, never>, _next: Record<string, never>): void {
+    if (this.props.shouldFail) {
       throw new Error('FailOnUpdateRoot: intentional onUpdate failure');
     }
   }
@@ -346,7 +344,7 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
     it('compose error during dirty flush → FAILED', async () => {
       const errors: unknown[] = [];
 
-      class DirtyFailRoot extends Component<{ shouldFail: boolean }, Record<string, never>> {
+      class DirtyFailRoot extends Component<{ shouldFail: boolean }, { shouldFail: boolean }> {
         constructor (props: { shouldFail: boolean }) {
           super(props);
           this.state = { shouldFail: false };
@@ -396,7 +394,7 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
     it('sync compose error during dirty flush → FAILED', async () => {
       const errors: unknown[] = [];
 
-      class AsyncDirtyFailRoot extends Component<Record<string, never>, { shouldFail: boolean }> {
+      class AsyncDirtyFailRoot extends Component<{ shouldFail: boolean }, Record<string, never>> {
         constructor (props: Record<string, never>) {
           super(props);
           this.state = { shouldFail: false };
@@ -411,7 +409,7 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
       }
 
       const runtime = await GraphRuntime.mount(
-        h(AsyncDirtyFailRoot, {}),
+        h(AsyncDirtyFailRoot),
         undefined,
         undefined,
         (err: unknown) => {
@@ -617,7 +615,7 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
     });
 
     it('fail-stop clears bus handlers: after FAILED, commandBus rejects "not registered", ref cleared', async () => {
-      const buses = createRuntimeBuses<TCmd, TQuery, TEvent>();
+      const buses = createRuntimeBuses();
       const ref: RefObject<ComponentWithBusHandler> = { current: null };
 
       class ComponentWithBusHandler extends Component<Record<string, never>, { value: number }> {
@@ -802,7 +800,7 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
         }
       }
 
-      class FailOnReconcileRoot extends Component<{ shouldFail: boolean }, Record<string, never>> {
+      class FailOnReconcileRoot extends Component<Record<string, never>, { shouldFail: boolean }> {
         constructor (props: { shouldFail: boolean }) {
           super(props);
           this.state = {};
@@ -812,7 +810,7 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
           if (this.props.shouldFail) {
             throw new Error('FailOnReconcileRoot: intentional reconcile failure');
           }
-          return h(ThrowOnUnmount, {});
+          return h(ThrowOnUnmount);
         }
       }
 

@@ -9,8 +9,8 @@
  */
 
 import { applyMiddleware, createStore } from 'Effectable';
-import type { Action, Middleware, MiddlewareAPI, Reducer, Store } from 'Effectable';
-import { firstValueFrom, lastValueFrom, take, toArray } from 'rxjs';
+import type { Middleware, MiddlewareAPI, Reducer } from 'Effectable';
+import { firstValueFrom, take, toArray } from 'rxjs';
 
 interface CounterState {
   count: number;
@@ -100,6 +100,9 @@ describe('Redux compatibility functional tests', () => {
       const returned = store.dispatch(action);
 
       expect(returned).toBe(action);
+      if (returned instanceof Promise) {
+        throw new Error('expected synchronous dispatch');
+      }
       expect(returned.type).toBe('SET');
       expect(store.getState().count).toBe(42);
 

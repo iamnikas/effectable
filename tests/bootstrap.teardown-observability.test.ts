@@ -13,6 +13,7 @@ import {
   HandleRegistry,
   QueryBus,
   bootstrap,
+  h,
 } from 'Effectable';
 import type { VirtualServiceNode } from 'Effectable';
 
@@ -455,12 +456,9 @@ describe('bootstrap teardown observability (issue #20)', () => {
       }
 
       public override compose (): VirtualServiceNode[] {
-        return this.props.children.map((child) => ({
-          type: FailChildLeaf,
-          props: { label: child.label, fail: child.fail },
-          children: [],
-          key: child.key,
-        }));
+        return this.props.children.map((child) =>
+          h(FailChildLeaf, { label: child.label, fail: child.fail }, child.key)
+        );
       }
     }
 

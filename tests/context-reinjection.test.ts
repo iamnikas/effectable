@@ -524,7 +524,11 @@ describe('Issue #15: context re-injection on update', () => {
     expect(consumerRef.current!.state.count).toBe(0);
 
     consumerRef.current!.increment();
-    await new Promise((resolve) => queueMicrotask(resolve));
+    await new Promise<void>((resolve) => {
+      queueMicrotask(() => {
+        resolve();
+      });
+    });
 
     expect(consumerRef.current!.state.count).toBe(1);
     expect(consumerRef.current!.onUpdateCallCount).toBe(1);
@@ -652,7 +656,11 @@ describe('Issue #15: context re-injection on update', () => {
     expect(consumerRef.current!.state.count).toBe(0);
 
     consumerRef.current!.increment();
-    await new Promise((resolve) => queueMicrotask(resolve));
+    await new Promise<void>((resolve) => {
+      queueMicrotask(() => {
+        resolve();
+      });
+    });
 
     expect(consumerRef.current!.state.count).toBe(1);
     expect(consumerRef.current!.contextValue).toBe(initialContextValue);
