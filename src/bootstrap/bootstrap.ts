@@ -227,7 +227,7 @@ export async function bootstrap<
   const activeRootInstance = rootInstance;
 
   /**
-   * Cached shutdown promise for concurrent shutdown callers (issue #20).
+   * Cached shutdown promise for concurrent shutdown callers.
    * Ensures that multiple concurrent shutdown() calls await the same work.
    */
   let cachedShutdownPromise: Promise<void> | null = null;
@@ -249,7 +249,7 @@ export async function bootstrap<
       await activeGraphRuntime.reconcile(h(type, props));
     },
     async shutdown (options?: { rejectOnCleanupError?: boolean }): Promise<void> {
-      // Issue #20: concurrent shutdowns await the same promise (check cache first)
+      // Concurrent shutdowns await the same promise (check cache first)
       if (cachedShutdownPromise !== null) {
         return cachedShutdownPromise;
       }
@@ -260,12 +260,12 @@ export async function bootstrap<
 
       running = false;
 
-      // Issue #20: create and cache the shutdown promise
+      // Create and cache the shutdown promise
       cachedShutdownPromise = (async (): Promise<void> => {
         try {
           await activeGraphRuntime.unmount(options);
         } finally {
-          // Issue #20: always clear owned primitives even if unmount rejects
+          // Always clear owned primitives even if unmount rejects
           clearOwnedRuntimePrimitives(runtime, owned);
         }
       })();

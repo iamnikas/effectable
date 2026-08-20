@@ -1,5 +1,5 @@
 /**
- * Tests for issue #15: context re-injection on reused components.
+ * Tests for context re-injection on reused components.
  *
  * @module Effectable/tests/context-reinjection.test
  */

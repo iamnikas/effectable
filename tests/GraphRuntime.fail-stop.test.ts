@@ -1,5 +1,5 @@
 /**
- * GraphRuntime: fail-stop state machine (issue #10).
+ * GraphRuntime: fail-stop state machine.
  *
  * Tests that the runtime transitions to FAILED state on unrecoverable errors
  * and that later reconcile rejects, unmount stays safe, and currentRoot is null.

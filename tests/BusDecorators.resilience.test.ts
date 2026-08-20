@@ -1,5 +1,5 @@
 /**
- * Resilience tests for transactional bus wiring (issue #14).
+ * Resilience tests for transactional bus wiring.
  *
  * @module Effectable/runtime/BusDecorators.resilience.test
  */
