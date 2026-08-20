@@ -8,7 +8,7 @@
  * @module Effectable/store/middleware
  */
 
-import { Action, DispatchMethod, Middleware, MiddlewareAPI, Reducer, Store, StoreCreator } from './types';
+import { Action, DispatchMethod, Middleware, MiddlewareAPI, Reducer, Store, StoreCreator, StoreEnhancer } from './types';
 
 /**
  * Normalizes middleware: a function or a default-export module `{ default: fn }`.
@@ -57,7 +57,19 @@ function wrapDispatch<S, D> (
  * 1. `applyMiddleware(api, rawDispatch, ...middlewares)` — wrap an existing dispatch
  * 2. `applyMiddleware(...middlewares)` — legacy enhancer-style for compatibility
  * 3. Middleware may arrive as default-export functions from slice modules.
+ *
+ * Wrap-mode overload is first so `applyMiddleware(api, rawDispatch, ...)` is not
+ * parsed as enhancer-style rest middlewares.
  */
+export function applyMiddleware<S, D> (
+  api: MiddlewareAPI<D, S>,
+  rawDispatch: D,
+  ...middlewares: unknown[]
+): D;
+export function applyMiddleware (): StoreEnhancer;
+export function applyMiddleware<S = unknown, A extends Action = Action> (
+  ...middlewares: Array<Middleware<unknown, S>>
+): StoreEnhancer<S, A>;
 export function applyMiddleware (...args: unknown[]): unknown {
   if (args.length > 1 && typeof args[0] === 'object' && args[0] !== null && 'getState' in (args[0] as object)) {
     const [api, rawDispatch, ...middlewares] = args as [MiddlewareAPI<unknown, unknown>, unknown, ...Array<Middleware<unknown, unknown, unknown>>];

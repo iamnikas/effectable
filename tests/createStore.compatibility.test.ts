@@ -9,7 +9,7 @@
  */
 
 import { applyMiddleware, createStore } from 'Effectable';
-import type { Middleware, MiddlewareAPI, Reducer, StoreEnhancer } from 'Effectable';
+import type { Middleware, MiddlewareAPI, Reducer } from 'Effectable';
 import { firstValueFrom, take, toArray } from 'rxjs';
 
 interface CounterState {
@@ -133,15 +133,10 @@ describe('Redux compatibility functional tests', () => {
         return result;
       };
 
-      const maybeEnhancer = applyMiddleware(loggingMiddleware);
-      if (typeof maybeEnhancer !== 'function') {
-        throw new Error('applyMiddleware must return enhancer function');
-      }
-      const enhancer = maybeEnhancer as StoreEnhancer<CounterState, CounterAction>;
       const store = createStore<CounterState, CounterAction>(
         counterReducer,
         initialState,
-        enhancer
+        applyMiddleware(loggingMiddleware)
       );
 
       store.dispatch({ type: 'INC' });
@@ -179,15 +174,10 @@ describe('Redux compatibility functional tests', () => {
         return result;
       };
 
-      const maybeEnhancer = applyMiddleware(middleware1, middleware2);
-      if (typeof maybeEnhancer !== 'function') {
-        throw new Error('applyMiddleware must return enhancer function');
-      }
-      const enhancer = maybeEnhancer as StoreEnhancer<CounterState, CounterAction>;
       const store = createStore<CounterState, CounterAction>(
         counterReducer,
         initialState,
-        enhancer
+        applyMiddleware(middleware1, middleware2)
       );
 
       store.dispatch({ type: 'INC' });
@@ -222,15 +212,10 @@ describe('Redux compatibility functional tests', () => {
         return next(typed);
       };
 
-      const maybeEnhancer = applyMiddleware(interceptMiddleware);
-      if (typeof maybeEnhancer !== 'function') {
-        throw new Error('applyMiddleware must return enhancer function');
-      }
-      const enhancer = maybeEnhancer as StoreEnhancer<CounterState, CounterAction>;
       const store = createStore<CounterState, CounterAction>(
         counterReducer,
         initialState,
-        enhancer
+        applyMiddleware(interceptMiddleware)
       );
 
       store.dispatch({ type: 'INC' });
