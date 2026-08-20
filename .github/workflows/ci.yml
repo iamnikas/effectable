@@ -5,12 +5,10 @@ on:
     branches:
       - main
       - develop
-      - feature/graph-runtime-fail-safe
   push:
     branches:
       - main
       - develop
-      - feature/graph-runtime-fail-safe
 
 permissions:
   contents: read
