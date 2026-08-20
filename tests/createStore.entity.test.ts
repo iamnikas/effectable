@@ -414,13 +414,7 @@ describe('createStore', () => {
         return next(typed);
       };
 
-      const maybeEnhancer = applyMiddleware(loggingMiddleware);
-      if (typeof maybeEnhancer !== 'function') {
-        throw new Error('applyMiddleware must return enhancer function');
-      }
-
-      const enhancer = maybeEnhancer as StoreEnhancer<CounterState, CounterAction>;
-      const store = createStore(counterReducer, initialCounterState, enhancer);
+      const store = createStore(counterReducer, initialCounterState, applyMiddleware(loggingMiddleware));
 
       store.dispatch({ type: 'INC' });
 
