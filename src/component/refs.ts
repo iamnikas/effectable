@@ -32,7 +32,7 @@ export const REF_FIELDS_META_KEY = Symbol('effectable:ref_fields');
 export const IMPERATIVE_HANDLE_META_KEY = Symbol('effectable:imperative_handle');
 
 /**
- * Symbol prefix for ref storage keys (issue #17).
+ * Symbol prefix for ref storage keys.
  * Each @UseRef property gets a unique symbol for collision-safe storage.
  */
 const REF_STORAGE_SYMBOL_PREFIX = 'effectable:ref_storage:';
@@ -45,7 +45,7 @@ const refStorageSymbols = new WeakMap<object, Map<string | symbol, symbol>>();
 
 /**
  * Type for objects that can hold ref storage via symbol-indexed properties.
- * Issue #17: Typed interface to eliminate 'as symbol' casts in property access.
+ * Typed interface to eliminate 'as symbol' casts in property access.
  */
 interface RefStorageHost {
   [storage: symbol]: RefObject<unknown> | undefined;
@@ -77,7 +77,7 @@ export interface ImperativeHandleMeta {
  * On first getter access, one `RefObject` is created per instance; the same ref is passed to `h(Child, {}, this.childRef)`.
  * GraphRuntime fills `current` when the child node mounts.
  * 
- * Issue #17: Uses symbol-based storage to prevent collisions with user properties.
+ * Uses symbol-based storage to prevent collisions with user properties.
  *
  * @returns {PropertyDecorator} property decorator: getter returns a stable `RefObject` for the child node
  * @example

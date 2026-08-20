@@ -1,5 +1,5 @@
 /**
- * Tests for centralized ref ownership (issue #17).
+ * Tests for centralized ref ownership.
  * 
  * Verifies that:
  * - Old refs are cleared when removed or swapped

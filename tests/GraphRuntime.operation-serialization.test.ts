@@ -1,5 +1,5 @@
 /**
- * GraphRuntime: operation serialization (issue #11).
+ * GraphRuntime: operation serialization.
  *
  * Tests that all graph operations (reconcile, unmount) are properly serialized
  * through a single operation queue, preventing race conditions and ensuring
@@ -237,7 +237,7 @@ describe('GraphRuntime operation serialization (issue #11)', () => {
         runtime.reconcile(h(FailOnReconcileRoot, { shouldFail: true }))
       ).rejects.toThrow('Intentional reconcile failure');
 
-      // Runtime should be in FAILED state (issue #10)
+      // Runtime should be in FAILED state
       expect(runtime.isActive()).toBe(false);
       expect(runtime.getState()).toBe('failed');
 

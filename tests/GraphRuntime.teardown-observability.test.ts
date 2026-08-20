@@ -1,5 +1,5 @@
 /**
- * GraphRuntime: teardown observability (issue #20).
+ * GraphRuntime: teardown observability.
  *
  * Tests that cleanup errors are observable without blocking remaining cleanup steps.
  *

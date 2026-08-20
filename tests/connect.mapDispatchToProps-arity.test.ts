@@ -1,5 +1,5 @@
 /**
- * Tests for issue #23: mapDispatchToProps always receives (dispatch, props)
+ * Tests for mapDispatchToProps always receives (dispatch, props)
  * regardless of function.length (default params, rest params, bound functions).
  *
  * @module Effectable/connect.mapDispatchToProps-arity.test
