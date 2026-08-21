@@ -767,17 +767,30 @@ export class GraphRuntime {
     } finally {
       this.operationInProgress = false;
     }
+
+    // setState during reconcile/unmount defers the microtask (operationInProgress).
+    // Kick once the queue is idle so the flush cannot overlap in-flight graph mutations.
+    if (this.dirtyFibers.size > 0 && this._state === RUNTIME_STATE.ACTIVE) {
+      this.scheduleDirtyFlushMicrotask();
+    }
   }
 
   /**
    * Queues one dirty-flush microtask and publishes {@link activeFlush} for await from `reconcile`.
    *
-   * Skip scheduling when runtime is FAILED.
+   * Skip scheduling when runtime is not ACTIVE (IDLE / FAILED / UNMOUNTING / UNMOUNTED)
+   * or a public graph operation is in flight. Callers that mutate `dirtyFibers` during
+   * those windows must kick this method again after the tree is ACTIVE and idle
+   * ({@link GraphRuntime.mount} / {@link processOperationQueue}).
    *
    * @returns {void}
    */
   private scheduleDirtyFlushMicrotask (): void {
-    if (this.flushScheduled || this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
+    if (
+      this.flushScheduled ||
+      this.operationInProgress ||
+      this.state !== RUNTIME_STATE.ACTIVE
+    ) {
       return;
     }
 
@@ -818,6 +831,12 @@ export class GraphRuntime {
 
     if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED || this.flushing) {
       this.dirtyFibers.clear();
+      return;
+    }
+
+    // Do not mutate the graph until mount has published currentRoot, and never
+    // overlap a public reconcile/unmount (those leave dirtyFibers queued).
+    if (this.state !== RUNTIME_STATE.ACTIVE || this.operationInProgress) {
       return;
     }
 
@@ -974,7 +993,15 @@ export class GraphRuntime {
         initialScope,
       );
       rt.currentRoot = isThenable(res) ? await res : res;
+      if (rt._state === RUNTIME_STATE.FAILED) {
+        throw rt.terminalError ?? new Error(
+          '[Effectable] GraphRuntime: terminal failure during mount.'
+        );
+      }
       rt.state = RUNTIME_STATE.ACTIVE;
+      if (rt.dirtyFibers.size > 0) {
+        rt.scheduleDirtyFlushMicrotask();
+      }
       return rt;
     } catch (error: unknown) {
       // Fail-stop on unrecoverable mount error
