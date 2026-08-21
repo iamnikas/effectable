@@ -5,7 +5,7 @@
  */
 
 import { Component, GraphRuntime, h } from 'Effectable';
-import type { RefObject } from 'Effectable';
+import type { RefObject, VirtualServiceNode } from 'Effectable';
 import { OnCommand, createRuntimeBuses } from 'Effectable';
 import type { RuntimeCommand, RuntimeEvent, RuntimeQuery } from 'Effectable';
 
@@ -280,6 +280,132 @@ describe('GraphRuntime materialization rollback (issue #12)', () => {
 
       expect(error).not.toBeNull();
       expect(error?.message).toBe('ChildB onMount failure');
+    });
+  });
+
+  describe('nested destroy continues after throwing ref clear', () => {
+    function throwingClearRef<T> (label: string): RefObject<T> {
+      let value: T | null = null;
+      return {
+        get current (): T | null {
+          return value;
+        },
+        set current (next: T | null) {
+          if (next === null && value !== null) {
+            throw new Error(`ref clear failed: ${label}`);
+          }
+          value = next;
+        },
+      };
+    }
+
+    it('NESTED-REF-THROW: grandchild ref.current=null throw during mount rollback still unmounts remaining grandchildren', async () => {
+      const unmountLog: string[] = [];
+
+      class TrackingLeaf extends Component<Record<string, never>, { label: string }> {
+        public override onUnmount (): void {
+          unmountLog.push(this.props.label);
+        }
+      }
+
+      const throwingRef = throwingClearRef<TrackingLeaf>('g1');
+
+      class Mid extends Component<Record<string, never>, Record<string, never>> {
+        public override compose (): VirtualServiceNode[] {
+          return [
+            h(TrackingLeaf, { label: 'g1' }, throwingRef),
+            h(TrackingLeaf, { label: 'g2' }),
+          ];
+        }
+      }
+
+      class FailingParent extends Component<Record<string, never>, Record<string, never>> {
+        public override onMount (): void {
+          throw new Error('FailingParent onMount failure');
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          return [h(Mid)];
+        }
+      }
+
+      await expect(GraphRuntime.mount(h(FailingParent))).rejects.toThrow(
+        'FailingParent onMount failure'
+      );
+
+      expect(unmountLog).toEqual(['g1', 'g2']);
+    });
+
+    it('PLACE-ROLLBACK: failed PLACE during reconcile still unmounts remaining grandchildren after ref-clear throw', async () => {
+      const unmountLog: string[] = [];
+
+      class TrackingLeaf extends Component<Record<string, never>, { label: string }> {
+        public override onUnmount (): void {
+          unmountLog.push(this.props.label);
+        }
+      }
+
+      const throwingRef = throwingClearRef<TrackingLeaf>('g1-place');
+
+      class Mid extends Component<Record<string, never>, Record<string, never>> {
+        public override compose (): VirtualServiceNode[] {
+          return [
+            h(TrackingLeaf, { label: 'g1' }, throwingRef),
+            h(TrackingLeaf, { label: 'g2' }),
+          ];
+        }
+      }
+
+      class NestedHost extends Component<Record<string, never>, Record<string, never>> {
+        public override onMount (): void {
+          throw new Error('NestedHost onMount failure');
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          return [h(Mid)];
+        }
+      }
+
+      class StableLeaf extends Component<Record<string, never>, Record<string, never>> {}
+
+      class ReconcileParent extends Component<{ showNested: boolean }, Record<string, never>> {
+        constructor (props: Record<string, never>) {
+          super(props);
+          this.state = { showNested: false };
+        }
+
+        public revealNested (): void {
+          this.setState({ showNested: true });
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          if (!this.state.showNested) {
+            return [h(StableLeaf)];
+          }
+
+          return [h(StableLeaf), h(NestedHost)];
+        }
+      }
+
+      const parentRef: RefObject<ReconcileParent> = { current: null };
+      const parentNode = h(ReconcileParent);
+      parentNode.ref = parentRef;
+      const runtime = await GraphRuntime.mount(parentNode);
+      const parent = parentRef.current;
+
+      if (parent === null) {
+        throw new Error('expected ReconcileParent instance');
+      }
+
+      parent.revealNested();
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+
+      expect(runtime.getState()).toBe('failed');
+      expect(unmountLog).toEqual(['g1', 'g2']);
+
+      await runtime.unmount();
     });
   });
 });
