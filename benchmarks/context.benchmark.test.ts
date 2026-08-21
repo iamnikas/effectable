@@ -19,6 +19,7 @@ import {
   readFromScope,
   type ContextScope,
   type ContextToken,
+  type RefObject,
 } from 'Effectable';
 import type { VirtualServiceNode } from 'Effectable';
 
@@ -792,6 +793,164 @@ describe('Benchmark: context production API paths', () => {
       expect(ns).toBeGreaterThan(0);
       expect(Number.isFinite(ns)).toBe(true);
     }
+  });
+});
+
+describe('Benchmark: #15 updateFiber scope-identity skip', () => {
+  const UPDATE_CONTEXT_TOKEN = createContext<number>('update_bench_ctx');
+
+  class UpdateConsumer extends Component<{ count: number }, Record<string, never>> {
+    @UseContext(UPDATE_CONTEXT_TOKEN)
+    public contextValue = -1;
+
+    constructor () {
+      super({}, { count: 0 });
+    }
+
+    public increment (): void {
+      this.setState({ count: this.state.count + 1 });
+    }
+
+    public override onUpdate (): void {
+      void this.state.count;
+    }
+  }
+
+  const N_CONSUMERS = 32;
+  const STABLE_CONSUMER_PROPS = {};
+
+  class UpdateBenchRootA extends Component<Record<string, never>, { dummyProp: number }> {
+    private consumerRefs: Array<RefObject<UpdateConsumer>> = [];
+
+    constructor (props: { dummyProp: number }) {
+      super(props);
+      for (let i = 0; i < N_CONSUMERS; i++) {
+        this.consumerRefs.push({ current: null });
+      }
+    }
+
+    public override compose (): VirtualServiceNode[] {
+      const consumers: VirtualServiceNode[] = [];
+      for (let i = 0; i < N_CONSUMERS; i++) {
+        consumers.push(h(UpdateConsumer, STABLE_CONSUMER_PROPS, this.consumerRefs[i], `consumer-${String(i)}`));
+      }
+
+      return [
+        h(ContextProvider, { value: [UPDATE_CONTEXT_TOKEN, 100] }, consumers),
+      ];
+    }
+
+    public triggerConsumerStateUpdates (): void {
+      for (const ref of this.consumerRefs) {
+        ref.current?.increment();
+      }
+    }
+  }
+
+  class UpdateBenchRootB extends Component<Record<string, never>, { providerValue: number }> {
+    constructor (props: { providerValue: number }) {
+      super(props);
+    }
+
+    public override compose (): VirtualServiceNode[] {
+      const consumers: VirtualServiceNode[] = [];
+      for (let i = 0; i < N_CONSUMERS; i++) {
+        consumers.push(h(UpdateConsumer, STABLE_CONSUMER_PROPS, `consumer-${String(i)}`));
+      }
+
+      return [
+        h(ContextProvider, { value: [UPDATE_CONTEXT_TOKEN, this.props.providerValue] }, consumers),
+      ];
+    }
+  }
+
+  it('A: props-only reconcile (same scope identity)', async () => {
+    console.log('\n=== Benchmark: #15 updateFiber scope-identity skip ===');
+
+    const runtime = await GraphRuntime.mount(
+      h(UpdateBenchRootA, { dummyProp: 0 })
+    );
+
+    const root = runtime.getRootInstance() as UpdateBenchRootA;
+
+    const nsA = benchAvgNs(
+      () => {
+        root.triggerConsumerStateUpdates();
+      },
+      500,
+      { warmupIterations: 50 }
+    );
+
+    console.log(`  A: props-only reconcile (same scope, ${N_CONSUMERS} consumers): ${nsA.toFixed(2)} ns/op`);
+
+    await runtime.unmount();
+
+    expect(nsA).toBeGreaterThan(0);
+    expect(Number.isFinite(nsA)).toBe(true);
+  });
+
+  it('B: provider value change (new scope, reused consumers)', async () => {
+    const runtime = await GraphRuntime.mount(
+      h(UpdateBenchRootB, { providerValue: 100 })
+    );
+
+    let nextValue = 101;
+    const nsB = await benchAvgAsyncNs(
+      async () => {
+        await runtime.reconcile(h(UpdateBenchRootB, { providerValue: nextValue }));
+        nextValue += 1;
+      },
+      500,
+      { warmupIterations: 50 }
+    );
+
+    console.log(`  B: provider value change (new scope, ${N_CONSUMERS} consumers): ${nsB.toFixed(2)} ns/op`);
+
+    await runtime.unmount();
+
+    expect(nsB).toBeGreaterThan(0);
+    expect(Number.isFinite(nsB)).toBe(true);
+  });
+
+  it('C: compare A vs B (A should be faster)', async () => {
+    const runtimeA = await GraphRuntime.mount(
+      h(UpdateBenchRootA, { dummyProp: 0 })
+    );
+
+    const rootA = runtimeA.getRootInstance() as UpdateBenchRootA;
+
+    const nsA = benchAvgNs(
+      () => {
+        rootA.triggerConsumerStateUpdates();
+      },
+      500,
+      { warmupIterations: 50 }
+    );
+
+    await runtimeA.unmount();
+
+    const runtimeB = await GraphRuntime.mount(
+      h(UpdateBenchRootB, { providerValue: 100 })
+    );
+
+    let nextValue = 101;
+    const nsB = await benchAvgAsyncNs(
+      async () => {
+        await runtimeB.reconcile(h(UpdateBenchRootB, { providerValue: nextValue }));
+        nextValue += 1;
+      },
+      500,
+      { warmupIterations: 50 }
+    );
+
+    await runtimeB.unmount();
+
+    const ratio = nsB / nsA;
+    console.log(`  Ratio B/A: ${ratio.toFixed(2)}x (B should be slower, ratio > 1.0)`);
+
+    expect(ratio).toBeGreaterThan(1.0);
+    expect(nsA).toBeGreaterThan(0);
+    expect(nsB).toBeGreaterThan(0);
   });
 });
 

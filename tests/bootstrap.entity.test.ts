@@ -406,7 +406,7 @@ describe('bootstrap — reverse shutdown order via parent→child chain', () => 
     }
   }
 
-  it('startup: children before parent; shutdown: full reverse order (children → parent)', async () => {
+  it('startup: children before parent; shutdown: same order (children → parent)', async () => {
     const handle = await bootstrap<{ id: string }, ParentComponent>(
       ParentComponent,
       { id: 'parent' },

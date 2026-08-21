@@ -32,7 +32,7 @@ const ON_EVENT_ENTRIES = 'effectable:runtime:OnEvent:entries';
 
 function appendPropKey (ctor: Function, metaKey: string, propertyKey: string | symbol): void {
   const key = String(propertyKey);
-  const current = Reflect.getMetadata(metaKey, ctor) as string[] | undefined;
+  const current = Reflect.getOwnMetadata(metaKey, ctor) as string[] | undefined;
   const next = typeof current === 'undefined' ? [key] : [...current, key];
   Reflect.defineMetadata(metaKey, next, ctor);
 }
@@ -42,7 +42,7 @@ function appendHandlerEntry (
   metaKey: string,
   entry: { type: string; method: string }
 ): void {
-  const current = Reflect.getMetadata(metaKey, ctor) as Array<{ type: string; method: string }> | undefined;
+  const current = Reflect.getOwnMetadata(metaKey, ctor) as Array<{ type: string; method: string }> | undefined;
   const next = typeof current === 'undefined' ? [entry] : [...current, entry];
   Reflect.defineMetadata(metaKey, next, ctor);
 }
@@ -159,12 +159,12 @@ export function createRuntimeBuses<
 }
 
 function getStringPropKeys (ctor: Function, metaKey: string): string[] {
-  const own = Reflect.getMetadata(metaKey, ctor) as string[] | undefined;
+  const own = Reflect.getOwnMetadata(metaKey, ctor) as string[] | undefined;
   return typeof own === 'undefined' ? [] : [...own];
 }
 
 function getHandlerEntries (ctor: Function, metaKey: string): Array<{ type: string; method: string }> {
-  const own = Reflect.getMetadata(metaKey, ctor) as Array<{ type: string; method: string }> | undefined;
+  const own = Reflect.getOwnMetadata(metaKey, ctor) as Array<{ type: string; method: string }> | undefined;
   return typeof own === 'undefined' ? [] : [...own];
 }
 
@@ -258,7 +258,29 @@ function assignBusProps (
 }
 
 /**
+ * Unwinds disposers in reverse order, continuing even if one throws.
+ * Returns primary error (if any) and optional cleanup errors.
+ *
+ * @param {Array<() => void>} disposers - disposers in registration order
+ * @returns {{ primaryError?: Error; cleanupErrors: Error[] }} unwinding result
+ */
+function unwindDisposers (disposers: Array<() => void>): { primaryError?: Error; cleanupErrors: Error[] } {
+  const cleanupErrors: Error[] = [];
+  for (let i = disposers.length - 1; i >= 0; i -= 1) {
+    try {
+      disposers[i]();
+    } catch (err) {
+      cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+  return { cleanupErrors };
+}
+
+/**
  * Injects buses into `@Use*Bus` fields and registers `@OnCommand` / `@OnQuery` / `@OnEvent` handlers.
+ * Registration is transactional: if a handler registration or validation throws, all prior registrations
+ * are unwound in reverse order and the wiring error is rethrown. The returned disposer is idempotent
+ * and continues cleanup even if an individual disposer throws.
  *
  * @template TCommand
  * @template TQuery
@@ -279,69 +301,89 @@ export function wireRuntimeBuses<
   const ctorChain = getConstructorChainLeafFirst(leafCtor);
   const disposers: Array<() => void> = [];
 
-  // Base → leaf: last assign wins when field names collide.
-  for (let i = ctorChain.length - 1; i >= 0; i -= 1) {
-    const ctor = ctorChain[i] as Function;
-    assignBusProps(instance, ctor, USE_COMMAND_BUS_PROPS, buses.commandBus);
-    assignBusProps(instance, ctor, USE_QUERY_BUS_PROPS, buses.queryBus);
-    assignBusProps(instance, ctor, USE_EVENT_BUS_PROPS, buses.eventBus);
+  try {
+    // Base → leaf: last assign wins when field names collide.
+    for (let i = ctorChain.length - 1; i >= 0; i -= 1) {
+      const ctor = ctorChain[i] as Function;
+      assignBusProps(instance, ctor, USE_COMMAND_BUS_PROPS, buses.commandBus);
+      assignBusProps(instance, ctor, USE_QUERY_BUS_PROPS, buses.queryBus);
+      assignBusProps(instance, ctor, USE_EVENT_BUS_PROPS, buses.eventBus);
+    }
+
+    const mergedCommand = new Map<string, string>();
+    const mergedQuery = new Map<string, string>();
+    const mergedEvent = new Map<string, string>();
+
+    for (let i = ctorChain.length - 1; i >= 0; i -= 1) {
+      const ctor = ctorChain[i] as Function;
+      for (const { type, method } of getHandlerEntries(ctor, ON_COMMAND_ENTRIES)) {
+        mergedCommand.set(type, method);
+      }
+      for (const { type, method } of getHandlerEntries(ctor, ON_QUERY_ENTRIES)) {
+        mergedQuery.set(type, method);
+      }
+      for (const { type, method } of getHandlerEntries(ctor, ON_EVENT_ENTRIES)) {
+        mergedEvent.set(type, method);
+      }
+    }
+
+    const record = instance as Record<string, unknown>;
+
+    for (const [type, method] of mergedCommand) {
+      const raw = record[method];
+      if (typeof raw !== 'function') {
+        throw new Error(`wireRuntimeBuses: OnCommand handler is not a function: ${method}`);
+      }
+      const handler: CommandHandler<TCommand, unknown> = (command) => {
+        return raw.call(instance, command) as ReturnType<CommandHandler<TCommand, unknown>>;
+      };
+      disposers.push(buses.commandBus.register(type as TCommand['type'], handler));
+    }
+
+    for (const [type, method] of mergedQuery) {
+      const raw = record[method];
+      if (typeof raw !== 'function') {
+        throw new Error(`wireRuntimeBuses: OnQuery handler is not a function: ${method}`);
+      }
+      const handler: QueryHandler<TQuery, unknown> = (query) => {
+        return raw.call(instance, query) as ReturnType<QueryHandler<TQuery, unknown>>;
+      };
+      disposers.push(buses.queryBus.register(type as TQuery['type'], handler));
+    }
+
+    for (const [type, method] of mergedEvent) {
+      const raw = record[method];
+      if (typeof raw !== 'function') {
+        throw new Error(`wireRuntimeBuses: OnEvent handler is not a function: ${method}`);
+      }
+      const handler: EventHandler<TEvent> = (event) => {
+        raw.call(instance, event);
+      };
+      disposers.push(buses.eventBus.subscribe(type as TEvent['type'], handler));
+    }
+  } catch (wiringError) {
+    const { cleanupErrors } = unwindDisposers(disposers);
+    const primary = wiringError instanceof Error ? wiringError : new Error(String(wiringError));
+    if (cleanupErrors.length > 0) {
+      (primary as Error & { cleanupErrors?: Error[] }).cleanupErrors = cleanupErrors;
+    }
+    throw primary;
   }
 
-  const mergedCommand = new Map<string, string>();
-  const mergedQuery = new Map<string, string>();
-  const mergedEvent = new Map<string, string>();
-
-  for (let i = ctorChain.length - 1; i >= 0; i -= 1) {
-    const ctor = ctorChain[i] as Function;
-    for (const { type, method } of getHandlerEntries(ctor, ON_COMMAND_ENTRIES)) {
-      mergedCommand.set(type, method);
-    }
-    for (const { type, method } of getHandlerEntries(ctor, ON_QUERY_ENTRIES)) {
-      mergedQuery.set(type, method);
-    }
-    for (const { type, method } of getHandlerEntries(ctor, ON_EVENT_ENTRIES)) {
-      mergedEvent.set(type, method);
-    }
-  }
-
-  const record = instance as Record<string, unknown>;
-
-  for (const [type, method] of mergedCommand) {
-    const raw = record[method];
-    if (typeof raw !== 'function') {
-      throw new Error(`wireRuntimeBuses: OnCommand handler is not a function: ${method}`);
-    }
-    const handler: CommandHandler<TCommand, unknown> = (command) => {
-      return raw.call(instance, command) as ReturnType<CommandHandler<TCommand, unknown>>;
-    };
-    disposers.push(buses.commandBus.register(type as TCommand['type'], handler));
-  }
-
-  for (const [type, method] of mergedQuery) {
-    const raw = record[method];
-    if (typeof raw !== 'function') {
-      throw new Error(`wireRuntimeBuses: OnQuery handler is not a function: ${method}`);
-    }
-    const handler: QueryHandler<TQuery, unknown> = (query) => {
-      return raw.call(instance, query) as ReturnType<QueryHandler<TQuery, unknown>>;
-    };
-    disposers.push(buses.queryBus.register(type as TQuery['type'], handler));
-  }
-
-  for (const [type, method] of mergedEvent) {
-    const raw = record[method];
-    if (typeof raw !== 'function') {
-      throw new Error(`wireRuntimeBuses: OnEvent handler is not a function: ${method}`);
-    }
-    const handler: EventHandler<TEvent> = (event) => {
-      raw.call(instance, event);
-    };
-    disposers.push(buses.eventBus.subscribe(type as TEvent['type'], handler));
-  }
-
+  let disposed = false;
   return () => {
-    for (const dispose of disposers.reverse()) {
-      dispose();
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+
+    const { cleanupErrors } = unwindDisposers(disposers);
+    if (cleanupErrors.length > 0) {
+      const aggregateError = new Error(
+        `wireRuntimeBuses: disposer cleanup encountered ${cleanupErrors.length} error(s)`
+      ) as Error & { cleanupErrors: Error[] };
+      aggregateError.cleanupErrors = cleanupErrors;
+      throw aggregateError;
     }
   };
 }
@@ -349,6 +391,9 @@ export function wireRuntimeBuses<
 /**
  * Wires multiple instances to one bus bundle: calls {@link wireRuntimeBuses} for each.
  * Order in `instances` defines wiring order; the disposer unregisters in reverse order.
+ * Wiring is transactional: if a later instance fails to wire, all earlier instances are unwound
+ * in reverse order. The returned disposer is idempotent and continues cleanup even if an
+ * individual disposer throws.
  *
  * @template TCommand
  * @template TQuery
@@ -366,13 +411,34 @@ export function wireRuntimeBusesAll<
   instances: readonly object[]
 ): () => void {
   const disposers: Array<() => void> = [];
-  for (let i = 0; i < instances.length; i += 1) {
-    const instance = instances[i];
-    disposers.push(wireRuntimeBuses(instance, buses));
+  try {
+    for (let i = 0; i < instances.length; i += 1) {
+      const instance = instances[i];
+      disposers.push(wireRuntimeBuses(instance, buses));
+    }
+  } catch (wiringError) {
+    const { cleanupErrors } = unwindDisposers(disposers);
+    const primary = wiringError instanceof Error ? wiringError : new Error(String(wiringError));
+    if (cleanupErrors.length > 0) {
+      (primary as Error & { cleanupErrors?: Error[] }).cleanupErrors = cleanupErrors;
+    }
+    throw primary;
   }
+
+  let disposed = false;
   return () => {
-    for (let j = disposers.length - 1; j >= 0; j -= 1) {
-      disposers[j]();
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+
+    const { cleanupErrors } = unwindDisposers(disposers);
+    if (cleanupErrors.length > 0) {
+      const aggregateError = new Error(
+        `wireRuntimeBusesAll: disposer cleanup encountered ${cleanupErrors.length} error(s)`
+      ) as Error & { cleanupErrors: Error[] };
+      aggregateError.cleanupErrors = cleanupErrors;
+      throw aggregateError;
     }
   };
 }

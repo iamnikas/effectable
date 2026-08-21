@@ -216,11 +216,11 @@ export interface MiddlewareAPI<D = Dispatch, S = unknown> {
  * Middleware can:
  * - Intercept actions
  * - Perform side-effects
- * - Dispatch new actions
+ * - Dispatch new actions via api.dispatch()
+ * - Read state via api.getState()
  * - Modify or block actions
  * - Call next() multiple times
  * - Use async/await
- * - Subscribe to state$ for reactive logic
  *
  * @template S - State type
  * @template A - Action type
@@ -242,7 +242,7 @@ export interface MiddlewareAPI<D = Dispatch, S = unknown> {
  * };
  */
 export interface Middleware<
-  DispatchExt = {},
+  _DispatchExt = {},
   S = unknown,
   D = Dispatch
 > {
@@ -258,6 +258,16 @@ export interface Middleware<
    */
   (api: MiddlewareAPI<D, S>): (next: D) => (action: unknown) => unknown | Promise<unknown>;
 }
+
+/**
+ * Middleware argument accepted by enhancer-mode `applyMiddleware`.
+ * Matches runtime: a middleware function or a module namespace `{ default: fn }`.
+ */
+export type MiddlewareInput<
+  DispatchExt = {},
+  S = unknown,
+  D = Dispatch
+> = Middleware<DispatchExt, S, D> | { default: Middleware<DispatchExt, S, D> };
 
 // ============================================================================
 // Selector Types
@@ -310,8 +320,8 @@ export function isAction (obj: any): obj is Action {
 /**
  * Type guard to check whether a function is Middleware
  */
-export function isMiddleware<DispatchExt = {}, S = unknown, D extends Dispatch = Dispatch> (
-  fn: any
+export function isMiddleware<DispatchExt = {}, S = unknown, D = Dispatch> (
+  fn: unknown
 ): fn is Middleware<DispatchExt, S, D> {
   return typeof fn === 'function';
 }

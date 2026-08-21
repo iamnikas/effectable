@@ -226,6 +226,12 @@ export async function bootstrap<
   const activeGraphRuntime = graphRuntime;
   const activeRootInstance = rootInstance;
 
+  /**
+   * Cached shutdown promise for concurrent shutdown callers.
+   * Ensures that multiple concurrent shutdown() calls await the same work.
+   */
+  let cachedShutdownPromise: Promise<void> | null = null;
+
   return {
     name,
     rootInstance: activeRootInstance,
@@ -242,18 +248,20 @@ export async function bootstrap<
 
       await activeGraphRuntime.reconcile(h(type, props));
     },
-    async shutdown (): Promise<void> {
+    async shutdown (options?: { rejectOnCleanupError?: boolean }): Promise<void> {
+      if (cachedShutdownPromise !== null) {
+        return cachedShutdownPromise;
+      }
+
       if (!running) {
         return;
       }
 
       running = false;
-
-      try {
-        await activeGraphRuntime.unmount();
-      } finally {
+      cachedShutdownPromise = activeGraphRuntime.unmount(options).finally(() => {
         clearOwnedRuntimePrimitives(runtime, owned);
-      }
+      });
+      return cachedShutdownPromise;
     },
   };
 }

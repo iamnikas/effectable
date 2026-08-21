@@ -55,6 +55,17 @@ Updates `state` and calls `onUpdate(prev, next)`.
 
 Optional declarative method. Returns `VirtualServiceNode | VirtualServiceNode[] | null` — a subtree described via `h(Ctor, props, children)`. Called by GraphRuntime; side effects inside are forbidden (subscriptions, network, handler registration).
 
+**Keyed children contract:** When using the optional `key` parameter in `h(Ctor, props, key)` for dynamic lists, sibling keys MUST be unique. Duplicate keys are invalid per React v16.5 keyed child reconciliation semantics and will throw a deterministic error during reconcile. This prevents undefined matching behavior and lifecycle leaks (orphaned fibers not unmounted).
+
+Example with unique keys:
+```typescript
+public override compose(): VirtualServiceNode[] {
+  return this.state.items.map(item => 
+    h(ItemComponent, { id: item.id }, item.id)  // key = item.id (must be unique)
+  );
+}
+```
+
 ### Lifecycle: who calls what
 
 - **GraphRuntime** calls `onMount → onUpdate* → onUnmount` according to LifecycleEngine state.
@@ -62,6 +73,10 @@ Optional declarative method. Returns `VirtualServiceNode | VirtualServiceNode[] 
   (deferred until the mount pass completes).
 - **connect-HOC** overrides `onMount`/`onUnmount` on the subclass: in `onMount` it opens a store subscription and delegates to `super.onMount`, in `onUnmount` it unsubscribes and delegates to `super.onUnmount`. Each store emit is merged into `this.props` and triggers `setState({})` → `onUpdate`. When `mapStateToProps` is present, one post-mount kick-off `onUpdate` is scheduled after mount (see [connect/README.md](../connect/README.md)).
 - **Component** itself only calls `onUpdate` — on every `setState`.
+
+### GraphRuntime unmount
+
+`GraphRuntime.unmount()` tears the tree down children-before-parent. By default the returned promise **resolves** even if cleanup or `onUnmount` fails (best-effort). Pass `{ rejectOnCleanupError: true }` to reject with `Error` (one failure) or `AggregateError` (several). `bootstrap().shutdown()` forwards the same option to `unmount()` and uses the same default.
 
 ## Example: class without connect, without GraphRuntime
 

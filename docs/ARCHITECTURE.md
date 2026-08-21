@@ -22,6 +22,7 @@ Import from `effectable` or from subpaths: `effectable/bootstrap`, `effectable/s
 
 - Process composition (env, signals, infrastructure) stays **outside** the library.
 - On mount failure, owned runtime primitives are cleaned up.
+- Default `shutdown()` / `GraphRuntime.unmount()` **resolve** even when cleanup or `onUnmount` fails (best-effort). Pass `{ rejectOnCleanupError: true }` to reject with `Error` or `AggregateError`.
 
 ## Component and GraphRuntime
 

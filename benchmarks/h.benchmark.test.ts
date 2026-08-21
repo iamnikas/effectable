@@ -29,7 +29,11 @@ class HParentComponent extends Component<Record<string, never>, BenchProps> {
   }
 }
 
-function createRef (): RefObject<unknown> {
+function createLeafRef (): RefObject<HLeafComponent> {
+  return { current: null };
+}
+
+function createParentRef (): RefObject<HParentComponent> {
   return { current: null };
 }
 
@@ -71,7 +75,7 @@ describe('Benchmark: h overload matrix', () => {
 
     const refOnlyNs = benchAvgNs(
       () => {
-        void h(HLeafComponent, { id: 'ref-only' }, createRef());
+        void h(HLeafComponent, { id: 'ref-only' }, createLeafRef());
       },
       ITERATIONS,
       { warmupIterations: 2000 }
@@ -90,7 +94,7 @@ describe('Benchmark: h overload matrix', () => {
         void h(
           HParentComponent,
           { id: 'full-overload', label: 'full' },
-          createRef(),
+          createParentRef(),
           childNodes,
           'full-key'
         );

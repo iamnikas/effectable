@@ -64,6 +64,10 @@ export interface Disposable {
 /**
  * Typed ref object for accessing a component instance from a parent.
  * Filled by GraphRuntime when the node mounts.
+ *
+ * Covariant in practice (writable data property). Do not add `in out T` — that would
+ * reject `RefObject<Child>` at every `h(..., childRef)` unless `h` is generic in the
+ * same change; we are not branding {@link RefObject}.
  */
 export interface RefObject<T> {
   /** Current component instance (null before mount or after unmount). */
@@ -72,8 +76,15 @@ export interface RefObject<T> {
 
 /**
  * Typed component constructor.
+ *
+ * Optional second type parameter `C` carries the instance type (for `h()` ref checking).
+ * Default keeps `ComponentConstructor<P>` meaning `new (props: P) => Component<unknown, P>`
+ * so GraphRuntime / mount signatures stay unchanged.
  */
-export type ComponentConstructor<P = unknown> = new (props: P) => Component<unknown, P>;
+export type ComponentConstructor<
+  P = unknown,
+  C extends Component<unknown, P> = Component<unknown, P>,
+> = new (props: P) => C;
 
 /**
  * Virtual service-tree node — a declarative component description for GraphRuntime.
@@ -171,8 +182,9 @@ export type FiberInspectNode = {
 
 /**
  * Fiber — the reconciler work unit.
- * Each virtual tree node has a corresponding fiber in the current tree.
- * During reconcile a work-in-progress (WIP) tree is built via the alternate field.
+ * Each virtual tree node has a corresponding fiber in the current (live) graph.
+ * GraphRuntime reconciles in place: it mutates this fiber and its children.
+ * There is no isolated work-in-progress (WIP) tree.
  */
 export interface Fiber<P = unknown> {
   /** Virtual node this fiber was created from. */
@@ -186,8 +198,10 @@ export interface Fiber<P = unknown> {
   /** Parent fiber (null for the root). */
   parentFiber: Fiber | null;
   /**
-   * Alternate fiber — WIP pair of the current node during reconcile.
-   * current.alternate == wip, wip.alternate == current.
+   * Unused leftover on the public {@link Fiber} shape. Always `null` at runtime:
+   * GraphRuntime creates every fiber with `alternate: null` and never pairs
+   * current/WIP trees through this field. Kept so the public type stays unchanged;
+   * do not treat it as a work-in-progress pointer.
    */
   alternate: Fiber | null;
   /** Pending props for a node update (null — no pending update). */

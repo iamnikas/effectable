@@ -3,7 +3,7 @@
  */
 
 import { applyMiddleware, compose, createStore } from 'Effectable';
-import type { AnyAction, Middleware, StoreEnhancer } from 'Effectable';
+import type { AnyAction, Middleware, MiddlewareAPI } from 'Effectable';
 
 interface TestState {
   events: string[];
@@ -54,9 +54,9 @@ describe('Effectable store middleware', () => {
     const rawDispatch = store.dispatch;
 
     let dispatchRef: typeof rawDispatch | null = null;
-    const api = {
+    const api: MiddlewareAPI<typeof rawDispatch, TestState> = {
       getState: store.getState,
-      dispatch: (action: AnyAction) => {
+      dispatch: (action) => {
         if (dispatchRef === null) {
           throw new Error('Dispatch is not wired yet');
         }
@@ -65,13 +65,7 @@ describe('Effectable store middleware', () => {
       },
     };
 
-    const maybeDispatch = applyMiddleware(api, rawDispatch, firstMiddleware, secondMiddleware);
-    if (typeof maybeDispatch !== 'function') {
-      throw new Error('applyMiddleware must return dispatch function');
-    }
-
-    // applyMiddleware returns the same dispatch type as rawDispatch.
-    const dispatch = maybeDispatch as typeof rawDispatch;
+    const dispatch = applyMiddleware(api, rawDispatch, firstMiddleware, secondMiddleware);
     dispatchRef = dispatch;
 
     dispatch({ type: 'ROOT_ACTION' });
@@ -107,9 +101,9 @@ describe('Effectable store middleware', () => {
     const rawDispatch = store.dispatch;
 
     let dispatchRef: typeof rawDispatch | null = null;
-    const api = {
+    const api: MiddlewareAPI<typeof rawDispatch, TestState> = {
       getState: store.getState,
-      dispatch: (action: AnyAction) => {
+      dispatch: (action) => {
         if (dispatchRef === null) {
           throw new Error('Dispatch is not wired yet');
         }
@@ -118,12 +112,7 @@ describe('Effectable store middleware', () => {
       },
     };
 
-    const maybeDispatch = applyMiddleware(api, rawDispatch, tracingMiddleware);
-    if (typeof maybeDispatch !== 'function') {
-      throw new Error('applyMiddleware must return dispatch function');
-    }
-
-    const dispatch = maybeDispatch as typeof rawDispatch;
+    const dispatch = applyMiddleware(api, rawDispatch, tracingMiddleware);
     dispatchRef = dispatch;
 
     dispatch({ type: 'OUTER_ACTION' });
@@ -151,13 +140,7 @@ describe('Effectable store middleware', () => {
       return next(currentAction);
     };
 
-    const maybeEnhancer = applyMiddleware(loggingMiddleware);
-    if (typeof maybeEnhancer !== 'function') {
-      throw new Error('applyMiddleware enhancer-mode must return StoreEnhancer function');
-    }
-
-    const enhancer = maybeEnhancer as StoreEnhancer<TestState, AnyAction>;
-    const store = createStore(testReducer, { events: [] }, enhancer);
+    const store = createStore(testReducer, { events: [] }, applyMiddleware(loggingMiddleware));
 
     store.dispatch({ type: 'ENHANCER_ACTION' });
 
@@ -187,13 +170,7 @@ describe('D05 middleware throw and state integrity', () => {
       throw new Error('middleware fail before next');
     };
 
-    const maybeEnhancer = applyMiddleware(throwingBeforeNext);
-    if (typeof maybeEnhancer !== 'function') {
-      throw new Error('applyMiddleware enhancer-mode must return StoreEnhancer function');
-    }
-
-    const enhancer = maybeEnhancer as StoreEnhancer<TestState, AnyAction>;
-    const store = createStore(testReducer, { events: [] }, enhancer);
+    const store = createStore(testReducer, { events: [] }, applyMiddleware(throwingBeforeNext));
 
     expect(() => {
       store.dispatch({ type: 'SHOULD_NOT_APPLY' });
@@ -213,13 +190,7 @@ describe('D05 middleware throw and state integrity', () => {
       throw new Error('middleware fail after next');
     };
 
-    const maybeEnhancer = applyMiddleware(throwingAfterNext);
-    if (typeof maybeEnhancer !== 'function') {
-      throw new Error('applyMiddleware enhancer-mode must return StoreEnhancer function');
-    }
-
-    const enhancer = maybeEnhancer as StoreEnhancer<TestState, AnyAction>;
-    const store = createStore(testReducer, { events: [] }, enhancer);
+    const store = createStore(testReducer, { events: [] }, applyMiddleware(throwingAfterNext));
 
     expect(() => {
       store.dispatch({ type: 'APPLIED_BEFORE_THROW' });
@@ -242,13 +213,7 @@ describe('MW-08 / MW-09 middleware async and swallow', () => {
       });
     };
 
-    const maybeEnhancer = applyMiddleware(asyncMiddleware);
-    if (typeof maybeEnhancer !== 'function') {
-      throw new Error('applyMiddleware enhancer-mode must return StoreEnhancer function');
-    }
-
-    const enhancer = maybeEnhancer as StoreEnhancer<TestState, AnyAction>;
-    const store = createStore(testReducer, { events: [] }, enhancer);
+    const store = createStore(testReducer, { events: [] }, applyMiddleware(asyncMiddleware));
 
     const result = store.dispatch({ type: 'ASYNC_OK' });
     expect(result).toBeInstanceOf(Promise);
@@ -264,13 +229,7 @@ describe('MW-08 / MW-09 middleware async and swallow', () => {
       return undefined;
     };
 
-    const maybeEnhancer = applyMiddleware(swallowing);
-    if (typeof maybeEnhancer !== 'function') {
-      throw new Error('applyMiddleware enhancer-mode must return StoreEnhancer function');
-    }
-
-    const enhancer = maybeEnhancer as StoreEnhancer<TestState, AnyAction>;
-    const store = createStore(testReducer, { events: [] }, enhancer);
+    const store = createStore(testReducer, { events: [] }, applyMiddleware(swallowing));
 
     store.dispatch({ type: 'SWALLOWED' });
 
@@ -286,15 +245,13 @@ describe('MW-08 / MW-09 middleware async and swallow', () => {
       const currentAction = action as AnyAction;
       return next(currentAction);
     };
-    const moduleNs = { default: logging };
+    const moduleNs: { default: Middleware<unknown, TestState> } = { default: logging };
 
-    const maybeEnhancer = applyMiddleware(moduleNs as unknown as Middleware);
-    if (typeof maybeEnhancer !== 'function') {
-      throw new Error('applyMiddleware enhancer-mode must return StoreEnhancer function');
-    }
-
-    const enhancer = maybeEnhancer as StoreEnhancer<TestState, AnyAction>;
-    const store = createStore(testReducer, { events: [] }, enhancer);
+    const store = createStore(
+      testReducer,
+      { events: [] },
+      applyMiddleware(moduleNs)
+    );
     store.dispatch({ type: 'FROM_DEFAULT_EXPORT' });
     expect(store.getState().events).toEqual(['FROM_DEFAULT_EXPORT']);
     store.destroy();
