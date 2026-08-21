@@ -523,12 +523,15 @@ export class GraphRuntime {
       }
     }
 
-    // 5. Destroy mounted children in reverse order
+    // 5. Destroy mounted children in reverse order.
+    // Pass cleanupErrors so nested destroy is best-effort: a throwing
+    // ref-clear/disposer on one grandchild must not skip remaining siblings.
+    // Those nodes were never attached to currentRoot, so failStop cannot reclaim them.
     const destroyChildrenAndFinalize = (): void | Promise<void> => {
       const children = journal.mountedChildren;
       for (let i = children.length - 1; i >= 0; i -= 1) {
         try {
-          const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
+          const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, cleanupErrors);
           if (isThenable(destroyRes)) {
             return this.continueRollbackDestroyAsync(
               children,
@@ -585,7 +588,7 @@ export class GraphRuntime {
 
     for (let i = lastIdx - 1; i >= 0; i -= 1) {
       try {
-        const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>);
+        const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, cleanupErrors);
         if (isThenable(destroyRes)) {
           await destroyRes;
         }
