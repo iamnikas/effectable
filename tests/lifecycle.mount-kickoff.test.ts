@@ -217,6 +217,60 @@ describe('GraphRuntime: setState inside onMount', () => {
 
     await runtime.unmount();
   });
+
+  test('child onMount setState on parent rebuilds compose() (pre-mount hook before children)', async () => {
+    const mountedChildren: string[] = [];
+
+    class ReadyChild extends Component<object, { onReady: () => void }> {
+      public override onMount (): void {
+        this.props.onReady();
+      }
+    }
+
+    class LiftedStateHost extends Component<SubtreeHostState, SubtreeHostProps> {
+      constructor (props: SubtreeHostProps) {
+        super(props, { show: false });
+      }
+
+      public override compose (): VirtualServiceNode[] {
+        const nodes: VirtualServiceNode[] = [
+          h(ReadyChild, {
+            onReady: (): void => {
+              this.setState({ show: true });
+            },
+          }, 'ready-child'),
+        ];
+
+        if (this.state.show) {
+          nodes.push(
+            h(ChildProbe, {
+              tag: 'lifted-extra',
+              onChildMount: this.props.onChildMount,
+            }, 'lifted-extra'),
+          );
+        }
+
+        return nodes;
+      }
+    }
+
+    const runtime = await GraphRuntime.mount(
+      h(LiftedStateHost, {
+        onChildMount: (tag: string): void => {
+          mountedChildren.push(tag);
+        },
+      })
+    );
+    await flushRuntimeTasks();
+
+    const host = runtime.getRootInstance() as LiftedStateHost | null;
+    expect(host).not.toBeNull();
+    expect(host?.state.show).toBe(true);
+    expect(mountedChildren).toEqual(['lifted-extra']);
+    expect(runtime.inspectRootFiber()?.childCount).toBe(2);
+
+    await runtime.unmount();
+  });
 });
 
 describe('connect + GraphRuntime: kick-off after mount with pre-populated store (hack model #1)', () => {

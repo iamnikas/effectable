@@ -636,12 +636,15 @@ export class GraphRuntime {
   }
 
   /**
-   * Pre-mount buffer: `setState` during `onMount` cannot yet schedule reconcile
-   * (the live hook is injected after startup). Marks the fiber; {@link injectUpdateHook}
-   * after startup will call {@link scheduleUpdate}
+   * Pre-mount buffer: `setState` during child materialization or this node's `onMount`
+   * cannot yet schedule reconcile (the live hook is injected after startup).
+   * Marks the fiber; {@link injectUpdateHook} after startup will call {@link scheduleUpdate}
    * (deferred until the mount pass completes).
    *
-   * @param {Component<unknown, unknown>} instance - instance before/during startup
+   * Must be attached before children are materialized: mount order is children-first,
+   * so a child `onMount` may call `parent.setState` while the parent has not run startup.
+   *
+   * @param {Component<unknown, unknown>} instance - instance before children / startup
    * @param {RuntimeFiber<unknown>} fiber - instance fiber
    * @returns {void}
    */
@@ -1344,6 +1347,11 @@ export class GraphRuntime {
       },
     };
 
+    // Buffer setState before children mount: child onMount may call parent.setState
+    // (lifted state / ready callbacks) while this node has not run startup yet.
+    this.injectPreMountUpdateHook(instance, fiber);
+    fiber.constructionJournal!.schedulerHookAttached = true;
+
     // Recursively materialize children before running the parent's lifecycle
     const childVnodes = this.getChildVnodes(instance, vnode.children);
 
@@ -1428,8 +1436,7 @@ export class GraphRuntime {
     }
 
     // Run lifecycle after all children are materialized.
-    // Pre-mount hook buffers setState from onMount until injectUpdateHook.
-    this.injectPreMountUpdateHook(instance, fiber);
+    // Pre-mount hook was attached before children; do not re-inject (would clear pending).
     const startupRes = engine.runStartup(instance);
 
     if (isThenable(startupRes)) {
@@ -1541,7 +1548,7 @@ export class GraphRuntime {
       throw err;
     }
 
-    this.injectPreMountUpdateHook(instance, fiber);
+    // Pre-mount hook was attached in materialize before children; do not re-inject.
     const startupRes = engine.runStartup(instance);
     const resolved = isThenable(startupRes) ? await startupRes : startupRes;
 
