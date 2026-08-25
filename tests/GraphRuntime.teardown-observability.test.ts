@@ -746,14 +746,88 @@ describe('GraphRuntime teardown observability (issue #20)', () => {
       }
 
       // THE LOCK: ALL orphans must have run onUnmount, even though c's destroy threw
-      // This will FAIL because current code fail-stops on c's throw and skips d,e
       expect(instanceB.onUnmountCalls).toBe(1);
       expect(instanceC.onUnmountCalls).toBe(1);
       expect(instanceD.onUnmountCalls).toBe(1);
       expect(instanceE.onUnmountCalls).toBe(1);
 
-      // Child 'a' should still be mounted or cleaned consistently
-      // (not testing 'a' survival requirement per spec, just that d/e were cleaned)
+      // Survivor 'a' must remain; throwing ref clear must not fail-stop the runtime.
+      expect(runtime.getState()).toBe('active');
+      expect(refA.current).not.toBeNull();
+      expect(refA.current!.onUnmountCalls).toBe(0);
+    });
+
+    it('throwing ref clear on orphan DELETE must not fail-stop surviving siblings', async () => {
+      function throwingClearRef<T> (label: string) {
+        let value: T | null = null;
+        return {
+          get current () {
+            return value;
+          },
+          set current (next: T | null) {
+            if (next === null && value !== null) {
+              throw new Error(`ref clear failed: ${label}`);
+            }
+            value = next;
+          },
+        };
+      }
+
+      class CountingLeaf extends Component<Record<string, never>, { label: string }> {
+        public onUnmountCalls = 0;
+
+        constructor (props: { label: string }) {
+          super(props);
+          this.state = {};
+        }
+
+        public override onUnmount (): void {
+          this.onUnmountCalls += 1;
+        }
+
+        public override compose (): null {
+          return null;
+        }
+      }
+
+      const refA = { current: null as CountingLeaf | null };
+      const refC = throwingClearRef<CountingLeaf>('C');
+      const refD = { current: null as CountingLeaf | null };
+
+      class Host extends Component<Record<string, never>, { keys: string[] }> {
+        constructor (props: { keys: string[] }) {
+          super(props);
+          this.state = {};
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          const refs: Array<{ current: CountingLeaf | null }> = [
+            refA,
+            { current: null },
+            refC,
+            refD,
+          ];
+          return this.props.keys.map((key, idx) => {
+            const node = h(CountingLeaf, { label: key }, key);
+            if (idx < refs.length) {
+              node.ref = refs[idx];
+            }
+            return node;
+          });
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(h(Host, { keys: ['a', 'b', 'c', 'd'] }));
+      const survivor = refA.current!;
+      const removedD = refD.current!;
+
+      await expect(runtime.reconcile(h(Host, { keys: ['a'] }))).resolves.toBeUndefined();
+
+      expect(runtime.getState()).toBe('active');
+      expect(runtime.getRootInstance()).not.toBeNull();
+      expect(survivor.onUnmountCalls).toBe(0);
+      expect(refA.current).toBe(survivor);
+      expect(removedD.onUnmountCalls).toBe(1);
     });
 
     // Hole 3: partial PLACE then throw: newly materialized nodes must be unmounted
