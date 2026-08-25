@@ -781,16 +781,20 @@ export class GraphRuntime {
   /**
    * Queues one dirty-flush microtask and publishes {@link activeFlush} for await from `reconcile`.
    *
-   * Skip scheduling when runtime is not ACTIVE (IDLE / FAILED / UNMOUNTING / UNMOUNTED)
-   * or a public graph operation is in flight. Callers that mutate `dirtyFibers` during
-   * those windows must kick this method again after the tree is ACTIVE and idle
-   * ({@link GraphRuntime.mount} / {@link processOperationQueue}).
+   * Skip scheduling when runtime is not ACTIVE (IDLE / FAILED / UNMOUNTING / UNMOUNTED),
+   * a public graph operation is in flight, or an async flush is already running. Callers that
+   * mutate `dirtyFibers` during those windows must kick this method again after the tree is
+   * ACTIVE and idle ({@link GraphRuntime.mount} / {@link processOperationQueue}), or after the
+   * outer flush finishes (end-of-pass kick).
    *
    * @returns {void}
    */
   private scheduleDirtyFlushMicrotask (): void {
+    // Skip while an async flush is in flight: setState during PLACE/onMount only
+    // enqueues dirtyFibers; the outer pass kicks the next microtask when it finishes.
     if (
       this.flushScheduled ||
+      this.flushing ||
       this.operationInProgress ||
       this.state !== RUNTIME_STATE.ACTIVE
     ) {
@@ -832,8 +836,14 @@ export class GraphRuntime {
   private async flushDirtyFibers (): Promise<void> {
     this.flushScheduled = false;
 
-    if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED || this.flushing) {
+    if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
       this.dirtyFibers.clear();
+      return;
+    }
+
+    // Re-entrant call while an async flush awaits: keep dirtyFibers for the outer
+    // pass's end-of-flush kick. Clearing here would silently drop setState updates.
+    if (this.flushing) {
       return;
     }
 
