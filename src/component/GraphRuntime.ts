@@ -780,7 +780,15 @@ export class GraphRuntime {
    * @returns {void}
    */
   private scheduleDirtyFlushMicrotask (): void {
-    if (this.flushScheduled || this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
+    // Skip while an async flush is in flight: setState during PLACE/onMount only
+    // enqueues dirtyFibers; the outer pass kicks the next microtask when it finishes.
+    if (
+      this.flushScheduled ||
+      this.flushing ||
+      this.state === RUNTIME_STATE.FAILED ||
+      this.state === RUNTIME_STATE.UNMOUNTING ||
+      this.state === RUNTIME_STATE.UNMOUNTED
+    ) {
       return;
     }
 
@@ -819,8 +827,14 @@ export class GraphRuntime {
   private async flushDirtyFibers (): Promise<void> {
     this.flushScheduled = false;
 
-    if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED || this.flushing) {
+    if (this.state === RUNTIME_STATE.FAILED || this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
       this.dirtyFibers.clear();
+      return;
+    }
+
+    // Re-entrant call while an async flush awaits: keep dirtyFibers for the outer
+    // pass's end-of-flush kick. Clearing here would silently drop setState updates.
+    if (this.flushing) {
       return;
     }
 
