@@ -154,7 +154,12 @@ describe('Effectable store middleware', () => {
         api.dispatch({ type: 'INIT_FROM_MW' });
       }).toThrow(/Dispatching while constructing your middleware is not allowed/);
 
-      return (next) => (action: unknown) => next(action);
+      return (next) => (action: unknown) => {
+        if (typeof action !== 'object' || action === null || !('type' in action)) {
+          throw new Error('Expected action with type');
+        }
+        return next(action as AnyAction);
+      };
     };
 
     const store = createStore(testReducer, { events: [] }, applyMiddleware(constructingMiddleware));
