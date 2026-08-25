@@ -239,6 +239,13 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * (`['mount:…']` without update), and by the time of the microtask GraphRuntime has already injected
        * `SCHEDULE_UPDATE_HOOK`, so the kick-off also rebuilds `compose()`.
        *
+       * Used for both `mapStateToProps` and `mapDispatchToProps`: GraphRuntime runs `compose()`
+       * during materialization before `onMount`, so children would otherwise keep stale/undefined
+       * mapped props until a later store emit or manual `setState`.
+       *
+       * Unmount cancel: `__connectMountCompleted` is cleared in `onUnmount` (mapDispatch-only
+       * has no subscription to null out).
+       *
        * @returns {void}
        */
       private schedulePostMountKickoff (): void {
@@ -248,10 +255,6 @@ function buildConnectHoc<S, P, R, A extends Action> (
 
         this.__connectKickoffScheduled = true;
         queueMicrotask(() => {
-          if (this.__connectSubscription === null) {
-            return;
-          }
-
           if (!this.__connectMountCompleted) {
             return;
           }
@@ -461,16 +464,35 @@ function buildConnectHoc<S, P, R, A extends Action> (
         const hasSuperOnMount = typeof superOnMount === 'function';
 
         if (mapStateToProps == null) {
-          this.__connectMountCompleted = true;
+          /**
+           * Completes the mapState-null mount path and, when dispatch props exist, schedules
+           * the same post-mount compose rebuild as the mapState path.
+           *
+           * @returns {void}
+           */
+          const finishDispatchOnlyMount = (): void => {
+            this.__connectMountCompleted = true;
+            if (mapDispatchToProps != null) {
+              this.schedulePostMountKickoff();
+            }
+          };
+
           if (!hasSuperOnMount) {
+            finishDispatchOnlyMount();
             return;
           }
 
           const mountResult = (superOnMount as () => void | Promise<void>).call(this);
           if (isPromiseLike(mountResult)) {
-            return mountResult as Promise<void>;
+            return Promise.resolve(mountResult as Promise<void>).then(() => {
+              finishDispatchOnlyMount();
+            }, (error: unknown) => {
+              this.__connectMountCompleted = false;
+              throw error;
+            });
           }
 
+          finishDispatchOnlyMount();
           return;
         }
 
@@ -544,6 +566,8 @@ function buildConnectHoc<S, P, R, A extends Action> (
        */
       public override onUnmount (): void | Promise<void> {
         this.disposeConnectSubscription();
+        // Cancels a pending post-mount kick-off (mapDispatch-only has no subscription).
+        this.__connectMountCompleted = false;
 
         const superOnUnmount = (Constructor.prototype as Record<string, unknown>)['onUnmount'];
         if (typeof superOnUnmount !== 'function') {
