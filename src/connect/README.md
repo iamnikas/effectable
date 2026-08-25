@@ -87,18 +87,20 @@ const ConnectedFeedsWithCreators = connect(undefined, {
 
 1. `new ConnectedCtor(props)`.
 2. HOC `onMount()`: merge dispatch → subscribe to state if needed → `super.onMount`.
-3. **Post-mount kick-off:** if `mapStateToProps` is set, after mount completes
+3. **Post-mount kick-off:** if `mapStateToProps` **or** `mapDispatchToProps` is set, after mount completes
    the HOC schedules **one** deferred `setState({})` via `queueMicrotask`. This yields exactly one
    `onUpdate` after mount even on a cold start (store already populated, no new emits) — without
-   `setTimeout`/`setState({})` in the consumer. Guards: not after unmount; do not duplicate if
+   `setTimeout`/`setState({})` in the consumer. That pass also rebuilds `compose()` so children
+   receive mapped props that were injected in `onMount` (GraphRuntime runs `compose()` before `onMount`).
+   Guards: not after unmount; do not duplicate if
    `onUpdate` was already delivered (pending flush / store emit); exactly once per mount.
 4. Store emits (if `mapStateToProps` is present) → merge → `setState` → `onUpdate`.
 5. `onUnmount` — unsubscribe and `super.onUnmount`.
 
 ### Migration note (post-mount kick-off)
 
-- **Behavior:** every connected component with `mapStateToProps` gets one extra
-  `onUpdate` after a successful mount (via microtask). Components without `mapStateToProps` are unaffected.
+- **Behavior:** every connected component with `mapStateToProps` and/or `mapDispatchToProps` gets one extra
+  `onUpdate` after a successful mount (via microtask). Components with neither mapper are unaffected.
 - **API compatibility:** signatures of `connect` / `Component` / `GraphRuntime.mount` did not change.
 - **Consumers:** `onUpdate` must be idempotent on a repeated pass (guards on state/props).
   An empty `setTimeout(() => this.setState({}), 0)` after `onMount` / inside `onUpdate` is no longer needed.
