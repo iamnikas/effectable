@@ -770,12 +770,22 @@ export class GraphRuntime {
     } finally {
       this.operationInProgress = false;
     }
+
+    // setState during reconcile/unmount defers the microtask (operationInProgress).
+    // Kick once the queue is idle so the flush cannot overlap in-flight graph mutations.
+    if (this.dirtyFibers.size > 0 && this._state === RUNTIME_STATE.ACTIVE) {
+      this.scheduleDirtyFlushMicrotask();
+    }
   }
 
   /**
    * Queues one dirty-flush microtask and publishes {@link activeFlush} for await from `reconcile`.
    *
-   * Skip scheduling when runtime is FAILED.
+   * Skip scheduling when runtime is not ACTIVE (IDLE / FAILED / UNMOUNTING / UNMOUNTED),
+   * a public graph operation is in flight, or an async flush is already running. Callers that
+   * mutate `dirtyFibers` during those windows must kick this method again after the tree is
+   * ACTIVE and idle ({@link GraphRuntime.mount} / {@link processOperationQueue}), or after the
+   * outer flush finishes (end-of-pass kick).
    *
    * @returns {void}
    */
@@ -785,9 +795,8 @@ export class GraphRuntime {
     if (
       this.flushScheduled ||
       this.flushing ||
-      this.state === RUNTIME_STATE.FAILED ||
-      this.state === RUNTIME_STATE.UNMOUNTING ||
-      this.state === RUNTIME_STATE.UNMOUNTED
+      this.operationInProgress ||
+      this.state !== RUNTIME_STATE.ACTIVE
     ) {
       return;
     }
@@ -835,6 +844,12 @@ export class GraphRuntime {
     // Re-entrant call while an async flush awaits: keep dirtyFibers for the outer
     // pass's end-of-flush kick. Clearing here would silently drop setState updates.
     if (this.flushing) {
+      return;
+    }
+
+    // Do not mutate the graph until mount has published currentRoot, and never
+    // overlap a public reconcile/unmount (those leave dirtyFibers queued).
+    if (this.state !== RUNTIME_STATE.ACTIVE || this.operationInProgress) {
       return;
     }
 
@@ -991,7 +1006,15 @@ export class GraphRuntime {
         initialScope,
       );
       rt.currentRoot = isThenable(res) ? await res : res;
+      if (rt._state === RUNTIME_STATE.FAILED) {
+        throw rt.terminalError ?? new Error(
+          '[Effectable] GraphRuntime: terminal failure during mount.'
+        );
+      }
       rt.state = RUNTIME_STATE.ACTIVE;
+      if (rt.dirtyFibers.size > 0) {
+        rt.scheduleDirtyFlushMicrotask();
+      }
       return rt;
     } catch (error: unknown) {
       // Fail-stop on unrecoverable mount error
