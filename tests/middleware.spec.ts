@@ -147,6 +147,22 @@ describe('Effectable store middleware', () => {
     expect(seen).toEqual(['mw:ENHANCER_ACTION']);
     expect(store.getState().events).toEqual(['ENHANCER_ACTION']);
   });
+
+  it('D07b: enhancer-mode — api.dispatch during middleware construction throws (no silent no-op)', () => {
+    const constructingMiddleware: Middleware<unknown, TestState> = (api) => {
+      expect(() => {
+        api.dispatch({ type: 'INIT_FROM_MW' });
+      }).toThrow(/Dispatching while constructing your middleware is not allowed/);
+
+      return (next) => (action: unknown) => next(action);
+    };
+
+    const store = createStore(testReducer, { events: [] }, applyMiddleware(constructingMiddleware));
+
+    expect(store.getState().events).toEqual([]);
+    store.dispatch({ type: 'AFTER_READY' });
+    expect(store.getState().events).toEqual(['AFTER_READY']);
+  });
 });
 
 describe('D03–D04 compose', () => {

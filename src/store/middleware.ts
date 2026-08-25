@@ -69,8 +69,11 @@ function wrapDispatch<S> (
   return chain;
 }
 
-function unboundDispatch (action: unknown): unknown {
-  return action;
+function dispatchWhileConstructing (_action: unknown): unknown {
+  throw new Error(
+    'Dispatching while constructing your middleware is not allowed. ' +
+    'Other middleware would not be applied to this dispatch.'
+  );
 }
 
 /**
@@ -102,7 +105,7 @@ export function applyMiddleware (...args: unknown[]): unknown {
       const store = createStore(reducer, initialState);
       const api: MiddlewareAPI<DispatchFn, unknown> = {
         getState: store.getState,
-        dispatch: unboundDispatch,
+        dispatch: dispatchWhileConstructing,
       };
       const dispatch = wrapDispatch(api, store.dispatch, args);
       return {
