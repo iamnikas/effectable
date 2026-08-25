@@ -854,4 +854,128 @@ describe('GraphRuntime fail-stop (issue #10)', () => {
       await runtime.unmount();
     });
   });
+
+  describe('dirty flush must not overlap mount or in-flight reconcile', () => {
+    it('setState during child onMount does not fail-stop while root is still mounting; mount does not overwrite FAILED with ACTIVE', async () => {
+      const errors: unknown[] = [];
+
+      class DirtyChild extends Component<{ n: number }, { id: string }> {
+        constructor (props: { id: string }) {
+          super(props);
+          this.state = { n: 0 };
+        }
+
+        public override onMount (): void {
+          this.setState({ n: 1 });
+        }
+
+        public override compose (): VirtualServiceNode | null {
+          if (this.state.n === 1) {
+            throw new Error('DirtyChild: compose after setState during mount');
+          }
+
+          return null;
+        }
+      }
+
+      class SlowSibling extends Component<Record<string, never>, { id: string }> {
+        public override async onMount (): Promise<void> {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 30);
+          });
+        }
+      }
+
+      class Host extends Component<Record<string, never>, Record<string, never>> {
+        public override compose (): VirtualServiceNode[] {
+          return [
+            h(DirtyChild, { id: 'dirty' }, 'dirty'),
+            h(SlowSibling, { id: 'slow' }, 'slow'),
+          ];
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(
+        h(Host),
+        undefined,
+        undefined,
+        (err: unknown) => {
+          errors.push(err);
+        }
+      );
+
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 50);
+      });
+      await drainMicrotasks();
+
+      expect(runtime.getState()).toBe('failed');
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getRootInstance()).toBeNull();
+      expect(errors.length).toBeGreaterThanOrEqual(1);
+      expect(String(errors[0])).toContain('DirtyChild: compose after setState during mount');
+
+      await expect(
+        runtime.reconcile(h(Host))
+      ).rejects.toThrow('DirtyChild: compose after setState during mount');
+
+      await runtime.unmount();
+    });
+
+    it('setState in onUpdate during reconcile does not double-PLACE an async sibling', async () => {
+      class SlowLeaf extends Component<Record<string, never>, { id: string }> {
+        public static mountCount = 0;
+        public static unmountCount = 0;
+
+        public override async onMount (): Promise<void> {
+          SlowLeaf.mountCount += 1;
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 30);
+          });
+        }
+
+        public override onUnmount (): void {
+          SlowLeaf.unmountCount += 1;
+        }
+      }
+
+      SlowLeaf.mountCount = 0;
+      SlowLeaf.unmountCount = 0;
+
+      class Host extends Component<{ tick: number }, { extra: boolean }> {
+        constructor (props: { extra: boolean }) {
+          super(props);
+          this.state = { tick: 0 };
+        }
+
+        public override onUpdate (): void {
+          if (this.props.extra && this.state.tick === 0) {
+            this.setState({ tick: 1 });
+          }
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          const children: VirtualServiceNode[] = [
+            h(TestLeaf, { value: this.state.tick }, 'stable'),
+          ];
+
+          if (this.props.extra || this.state.tick > 0) {
+            children.push(h(SlowLeaf, { id: 'slow' }, 'slow'));
+          }
+
+          return children;
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(h(Host, { extra: false }));
+      await runtime.reconcile(h(Host, { extra: true }));
+      await drainMicrotasks();
+
+      expect(SlowLeaf.mountCount).toBe(1);
+      expect(runtime.isActive()).toBe(true);
+
+      await runtime.unmount();
+      expect(SlowLeaf.unmountCount).toBe(1);
+    });
+  });
 });
