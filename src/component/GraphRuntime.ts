@@ -482,8 +482,9 @@ export class GraphRuntime {
     const cleanupErrors: Error[] = [];
     const instance = fiber.instance;
 
-    // 1. Disable scheduler hook
-    if (journal.schedulerHookAttached === true && instance !== null) {
+    // 1. Disable scheduler hook (pre-mount buffer may be attached before children,
+    // before journal.schedulerHookAttached is set after successful startup).
+    if (instance !== null) {
       try {
         this.clearUpdateHook(instance);
         this.dirtyFibers.delete(fiber);
@@ -636,10 +637,12 @@ export class GraphRuntime {
   }
 
   /**
-   * Pre-mount buffer: `setState` during `onMount` cannot yet schedule reconcile
-   * (the live hook is injected after startup). Marks the fiber; {@link injectUpdateHook}
-   * after startup will call {@link scheduleUpdate}
-   * (deferred until the mount pass completes).
+   * Pre-mount buffer: `setState` cannot yet schedule reconcile (the live hook is
+   * injected after startup). Marks the fiber; {@link injectUpdateHook} after
+   * startup will call {@link scheduleUpdate} (deferred until the mount pass completes).
+   *
+   * Injected before child materialization so descendant `onMount` callbacks that
+   * `setState` an ancestor are buffered instead of silently dropped.
    *
    * @param {Component<unknown, unknown>} instance - instance before/during startup
    * @param {RuntimeFiber<unknown>} fiber - instance fiber
@@ -1344,6 +1347,11 @@ export class GraphRuntime {
       },
     };
 
+    // Buffer setState before children mount: a descendant onMount may call
+    // ancestor setState (via props callback). Without this hook, that update
+    // mutates state but never schedules reconcile.
+    this.injectPreMountUpdateHook(instance, fiber);
+
     // Recursively materialize children before running the parent's lifecycle
     const childVnodes = this.getChildVnodes(instance, vnode.children);
 
@@ -1428,8 +1436,8 @@ export class GraphRuntime {
     }
 
     // Run lifecycle after all children are materialized.
-    // Pre-mount hook buffers setState from onMount until injectUpdateHook.
-    this.injectPreMountUpdateHook(instance, fiber);
+    // Pre-mount hook was injected before children (covers ancestor setState
+    // from descendant onMount and setState during this node's onMount).
     const startupRes = engine.runStartup(instance);
 
     if (isThenable(startupRes)) {
@@ -1541,7 +1549,7 @@ export class GraphRuntime {
       throw err;
     }
 
-    this.injectPreMountUpdateHook(instance, fiber);
+    // Pre-mount hook already injected at the start of materialize (before children).
     const startupRes = engine.runStartup(instance);
     const resolved = isThenable(startupRes) ? await startupRes : startupRes;
 
