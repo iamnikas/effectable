@@ -171,6 +171,71 @@ describe('GraphRuntime: setState inside onMount', () => {
     await runtime.unmount();
   });
 
+  test('ancestor setState from child onMount rebuilds compose after mount', async () => {
+    const mountedChildren: string[] = [];
+
+    interface AncestorHostState {
+      showExtra: boolean;
+    }
+
+    class NotifyingChild extends Component<object, { onReady: () => void }> {
+      public override onMount (): void {
+        // Parent is still mid-materialize (children before parent startup).
+        this.props.onReady();
+      }
+    }
+
+    class ExtraChild extends Component<object, { tag: string; onChildMount: (tag: string) => void }> {
+      public override onMount (): void {
+        this.props.onChildMount(this.props.tag);
+      }
+    }
+
+    class AncestorHost extends Component<AncestorHostState, { onChildMount: (tag: string) => void }> {
+      constructor (props: { onChildMount: (tag: string) => void }) {
+        super(props, { showExtra: false });
+      }
+
+      public override compose (): VirtualServiceNode[] {
+        const nodes: VirtualServiceNode[] = [
+          h(NotifyingChild, {
+            onReady: (): void => {
+              this.setState({ showExtra: true });
+            },
+          }, 'notifier'),
+        ];
+
+        if (this.state.showExtra) {
+          nodes.push(
+            h(ExtraChild, {
+              tag: 'extra',
+              onChildMount: this.props.onChildMount,
+            }, 'extra'),
+          );
+        }
+
+        return nodes;
+      }
+    }
+
+    const runtime = await GraphRuntime.mount(
+      h(AncestorHost, {
+        onChildMount: (tag: string): void => {
+          mountedChildren.push(tag);
+        },
+      })
+    );
+    await flushRuntimeTasks();
+
+    const host = runtime.getRootInstance() as AncestorHost | null;
+    expect(host).not.toBeNull();
+    expect(host!.state.showExtra).toBe(true);
+    expect(mountedChildren).toEqual(['extra']);
+    expect(runtime.inspectRootFiber()?.childCount).toBe(2);
+
+    await runtime.unmount();
+  });
+
   test('control scenario: a setTimeout empty setState after onMount still rebuilds the subtree', async () => {
     const mountedChildren: string[] = [];
 
