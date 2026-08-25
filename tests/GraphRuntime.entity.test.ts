@@ -2710,6 +2710,60 @@ describe('GraphRuntime', () => {
       });
     }
 
+    it('child onMount parent.setState during materialize still PLACE follow-up child', async () => {
+      const composedShowExtra: boolean[] = [];
+      let extraMounts = 0;
+      const parentBox: { current: Component<{ showExtra: boolean }, Record<string, never>> | null } = { current: null };
+
+      class ExtraChild extends Component<Record<string, never>, Record<string, never>> {
+        public override onMount (): void {
+          extraMounts += 1;
+        }
+      }
+
+      class BumpingChild extends Component<Record<string, never>, Record<string, never>> {
+        public override onMount (): void {
+          // Runs while parent is still materializing — before parent's live schedule hook.
+          parentBox.current?.setState({ showExtra: true });
+        }
+      }
+
+      class PremountHost extends Component<{ showExtra: boolean }, Record<string, never>> {
+        constructor () {
+          super({});
+          this.state = { showExtra: false };
+          parentBox.current = this;
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          composedShowExtra.push(this.state.showExtra);
+          const children: VirtualServiceNode[] = [
+            h(BumpingChild),
+          ];
+          if (this.state.showExtra) {
+            children.push(h(ExtraChild));
+          }
+          return children;
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(h(PremountHost));
+      const host = runtime.getRootInstance() as PremountHost | null;
+      expect(host).not.toBeNull();
+      if (host === null) {
+        throw new Error('expected PremountHost');
+      }
+
+      await drainMicrotasks();
+
+      expect(host.state.showExtra).toBe(true);
+      expect(composedShowExtra).toContain(true);
+      expect(extraMounts).toBe(1);
+      expect(runtime.inspectRootFiber()?.childCount).toBe(2);
+
+      await runtime.unmount();
+    });
+
     it('deep keyed tree — two consecutive reconciles without crash or pool leak', async () => {
       const poolDepth = 32;
 
