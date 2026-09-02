@@ -20,14 +20,16 @@ export class EventBus<TEvent extends RuntimeEvent = RuntimeEvent> {
    * @returns {void}
    */
   public publish (event: TEvent): void {
+    // Snapshot before invoke so unsubscribe of a not-yet-called handler during
+    // this publish cannot silently skip that handler for the current event.
     const typedHandlers = this.handlersByType.get(event.type);
     if (typeof typedHandlers !== 'undefined') {
-      for (const handler of typedHandlers) {
+      for (const handler of [...typedHandlers]) {
         handler(event);
       }
     }
 
-    for (const handler of this.anyHandlers) {
+    for (const handler of [...this.anyHandlers]) {
       handler(event);
     }
   }
