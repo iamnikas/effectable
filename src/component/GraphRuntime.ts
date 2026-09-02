@@ -1645,7 +1645,9 @@ export class GraphRuntime {
 
     // Type or key changed — destroy the old node, create a new one.
     // Sync fast-path if both destroy and materialize completed synchronously.
-    const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>);
+    // Collect cleanup errors (ref clear / disposer) so a throwing finalize cannot
+    // abort REPLACE and fail-stop the surviving tree — same best-effort contract as unmount.
+    const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
     if (isThenable(destroyRes)) {
       return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope));
     }
@@ -2047,9 +2049,11 @@ export class GraphRuntime {
             }
           }
 
-          // Destroy remaining unpaired current children (keyed)
+          // Destroy remaining unpaired current children (keyed).
+          // Best-effort: collect finalize errors so one throwing ref clear cannot
+          // skip remaining orphans and fail-stop the whole runtime.
           for (const [, orphan] of keyedCurrentMap) {
-            const d = this.destroyFiber(orphan);
+            const d = this.destroyFiber(orphan, []);
             if (isThenable(d)) {
               await d;
             }
@@ -2084,12 +2088,12 @@ export class GraphRuntime {
         }
       }
 
-      // Destroy remaining unpaired unkeyed children
+      // Destroy remaining unpaired unkeyed children (best-effort finalize errors).
       for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
         const orphan = unkeyedCurrent[i];
 
         if (orphan !== undefined) {
-          const d = this.destroyFiber(orphan);
+          const d = this.destroyFiber(orphan, []);
           if (isThenable(d)) {
             await d;
           }
