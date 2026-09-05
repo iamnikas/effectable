@@ -186,19 +186,28 @@ export class LifecycleEngine {
 
   /**
    * Startup phase: if present — call `onMount`, advance stages to `ready`.
-   * On exception: stage already `Mounted` → {@link runFailedCleanup}(`wasMounted=true`)
+   * On exception: stage already `Mounted` → by default {@link runFailedCleanup}(`wasMounted=true`)
    * (attempt `onUnmount` + teardown), result `{ ok: false, error }`.
+   *
+   * When `options.deferFailedCleanup` is true (GraphRuntime materialization), onMount failure
+   * marks the stage `failed` and returns `{ ok: false }` **without** calling `onUnmount`.
+   * The caller must destroy mounted children first, then invoke {@link runFailedCleanup}, so
+   * teardown order stays children → parent.
    *
    * Returns a synchronous {@link LifecycleTransitionResult} if `onMount` returned
    * a non-thenable value (sync fast-path); otherwise a Promise.
    * `await` works correctly with either union branch.
    *
    * @param {Component<unknown, unknown>} instance - component instance
+   * @param {{ deferFailedCleanup?: boolean }} [options] - startup options
    * @returns {LifecycleTransitionResult | Promise<LifecycleTransitionResult>}
    */
   public runStartup (
     instance: Component<unknown, unknown>,
+    options?: { deferFailedCleanup?: boolean },
   ): LifecycleTransitionResult | Promise<LifecycleTransitionResult> {
+    const deferFailedCleanup = options?.deferFailedCleanup === true;
+
     this.currentStage = STAGE.Resolved;
     this.currentStage = STAGE.Created;
 
@@ -215,13 +224,19 @@ export class LifecycleEngine {
       if (typeof instance.onMount === 'function') {
         const r = instance.onMount();
         if (isThenable(r)) {
-          return this.continueStartupAsync(instance, r);
+          return this.continueStartupAsync(instance, r, deferFailedCleanup);
         }
       }
 
       this.currentStage = STAGE.Ready;
       return { ok: true };
     } catch (error) {
+      if (deferFailedCleanup) {
+        // Leave stage `failed` so GraphRuntime can unmount children before onUnmount.
+        this.currentStage = STAGE.Failed;
+        return { ok: false, error };
+      }
+
       // Stage is already Mounted before onMount — cleanup must attempt onUnmount.
       const cleanupResult = this.runFailedCleanup(instance, true);
       if (isThenable(cleanupResult)) {
@@ -236,17 +251,24 @@ export class LifecycleEngine {
    *
    * @param {Component<unknown, unknown>} instance - component instance
    * @param {PromiseLike<unknown>} pending - Promise from onMount
+   * @param {boolean} deferFailedCleanup - when true, skip onUnmount (caller orders teardown)
    * @returns {Promise<LifecycleTransitionResult>}
    */
   private async continueStartupAsync (
     instance: Component<unknown, unknown>,
     pending: PromiseLike<unknown>,
+    deferFailedCleanup: boolean,
   ): Promise<LifecycleTransitionResult> {
     try {
       await pending;
       this.currentStage = STAGE.Ready;
       return { ok: true };
     } catch (error) {
+      if (deferFailedCleanup) {
+        this.currentStage = STAGE.Failed;
+        return { ok: false, error };
+      }
+
       const cleanupResult = this.runFailedCleanup(instance, true);
       if (isThenable(cleanupResult)) {
         await cleanupResult;
