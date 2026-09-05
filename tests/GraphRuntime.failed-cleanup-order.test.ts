@@ -3,6 +3,7 @@
  * onUnmount order, and must not call parent onUnmount when parent onMount never ran.
  */
 import { Component, GraphRuntime, h } from '../src/index';
+import type { RefObject } from '../src/index';
 
 describe('GraphRuntime failed-cleanup order', () => {
   it('child onMount fail does not call parent onUnmount when parent onMount never ran', async () => {
@@ -142,5 +143,47 @@ describe('GraphRuntime failed-cleanup order', () => {
     expect(
       (instance as unknown as Record<symbol, unknown>)[SCHEDULE_UPDATE_HOOK]
     ).toBeUndefined();
+  });
+
+  it('parent onMount fail: parent ref stays set until after child onUnmount', async () => {
+    const calls: string[] = [];
+    const parentRef: RefObject<Component> = { current: null };
+
+    class Child extends Component {
+      public override onMount (): void {
+        calls.push('child:onMount');
+      }
+
+      public override onUnmount (): void {
+        calls.push('child:onUnmount');
+        // Residual #69 hole: rollback cleared parent ref before destroying children.
+        calls.push(parentRef.current === null ? 'parentRef:null' : 'parentRef:alive');
+      }
+    }
+
+    class Parent extends Component {
+      public override onMount (): void {
+        calls.push('parent:onMount');
+        throw new Error('parent boom');
+      }
+
+      public override onUnmount (): void {
+        calls.push('parent:onUnmount');
+      }
+
+      public override compose () {
+        return [h(Child, {})];
+      }
+    }
+
+    await expect(GraphRuntime.mount(h(Parent, {}, parentRef))).rejects.toThrow('parent boom');
+    expect(calls).toEqual([
+      'child:onMount',
+      'parent:onMount',
+      'child:onUnmount',
+      'parentRef:alive',
+      'parent:onUnmount',
+    ]);
+    expect(parentRef.current).toBeNull();
   });
 });
