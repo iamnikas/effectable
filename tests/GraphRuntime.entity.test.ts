@@ -1882,6 +1882,48 @@ describe('GraphRuntime', () => {
       await runtime.unmount();
     });
 
+    it('throwing onAutoReconcileError still fail-stops (runtime not left ACTIVE)', async () => {
+      class BoomComposeRoot extends Component<{ boom: boolean }, Record<string, never>> {
+        constructor () {
+          super({});
+          this.state = { boom: false };
+        }
+
+        public override compose (): null {
+          if (this.state.boom) {
+            throw new Error('auto-flush compose boom');
+          }
+          return null;
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(
+        h(BoomComposeRoot, {}),
+        EMPTY_CONTEXT_SCOPE,
+        undefined,
+        () => {
+          throw new Error('observer boom');
+        },
+      );
+
+      const root = runtime.getRootInstance() as BoomComposeRoot | null;
+      expect(root).not.toBeNull();
+      if (root === null) {
+        throw new Error('expected BoomComposeRoot');
+      }
+
+      expect(runtime.isActive()).toBe(true);
+      root.setState({ boom: true });
+      await drainMicrotasks();
+
+      // Observer throw must not skip fail-stop / leave a half-cleaned ACTIVE tree.
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('failed');
+      expect(runtime.getRootInstance()).toBeNull();
+
+      await runtime.unmount();
+    });
+
     it('unkeyed shrink — excess tail receives onUnmount (orphan DELETE)', async () => {
       const unmountLog: string[] = [];
 
