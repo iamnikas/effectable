@@ -226,10 +226,31 @@ function buildConnectHoc<S, P, R, A extends Action> (
       private __connectOwnProps: Record<string, unknown>;
       private __connectStateProps: Record<string, unknown> | null = null;
       private __connectDispatchProps: Record<string, unknown> | null = null;
+      /**
+       * User `onMount` / `onUnmount` installed as class fields (own instance properties).
+       * Those shadow `Connected.prototype` hooks unless captured and reinstalled below.
+       */
+      private __connectOwnOnMount: (() => void | Promise<void>) | null = null;
+      private __connectOwnOnUnmount: (() => void | Promise<void>) | null = null;
 
       constructor (props: P) {
         super(props);
         this.__connectOwnProps = this.props as unknown as Record<string, unknown>;
+
+        // Class-field lifecycle hooks are own properties and shadow Connected.prototype.
+        // Capture them, then reinstall Connected wiring so GraphRuntime still runs connect.
+        const self = this as {
+          onMount?: unknown;
+          onUnmount?: unknown;
+        };
+        if (Object.prototype.hasOwnProperty.call(this, 'onMount') && typeof self.onMount === 'function') {
+          this.__connectOwnOnMount = self.onMount as () => void | Promise<void>;
+        }
+        if (Object.prototype.hasOwnProperty.call(this, 'onUnmount') && typeof self.onUnmount === 'function') {
+          this.__connectOwnOnUnmount = self.onUnmount as () => void | Promise<void>;
+        }
+        self.onMount = Connected.prototype.onMount;
+        self.onUnmount = Connected.prototype.onUnmount;
       }
 
       /**
@@ -498,7 +519,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
         const store = this.resolveConnectStore();
         this.refreshDispatchProps(store);
 
-        const superOnMount = (Constructor.prototype as Record<string, unknown>)['onMount'];
+        // Prefer class-field hooks captured in the constructor; else prototype methods.
+        const superOnMount = this.__connectOwnOnMount
+          ?? (Constructor.prototype as Record<string, unknown>)['onMount'];
         const hasSuperOnMount = typeof superOnMount === 'function';
 
         if (mapStateToProps == null) {
@@ -657,7 +680,8 @@ function buildConnectHoc<S, P, R, A extends Action> (
         this.__connectMountCompleted = false;
         this.disposeConnectSubscription();
 
-        const superOnUnmount = (Constructor.prototype as Record<string, unknown>)['onUnmount'];
+        const superOnUnmount = this.__connectOwnOnUnmount
+          ?? (Constructor.prototype as Record<string, unknown>)['onUnmount'];
         if (typeof superOnUnmount !== 'function') {
           return;
         }
