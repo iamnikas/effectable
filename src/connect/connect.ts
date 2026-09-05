@@ -469,7 +469,17 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * @returns {void | Promise<void>} synchronously or a Promise if the superclass `onMount` is async
        */
       public override onMount (): void | Promise<void> {
+        // Remount on the same instance must restart the first-pass / kick-off state machine.
+        // PR #59 reset only `__connectTornDown`; leaving `__connectFirstPass` false skipped
+        // user `onMount` and froze store→props delivery (`__connectMountCompleted` never set).
         this.__connectTornDown = false;
+        this.__connectFirstPass = true;
+        this.__connectKickoffScheduled = false;
+        this.__connectDeliveredUpdateAfterMount = false;
+        this.__connectPendingUpdate = false;
+        this.__connectMountCompleted = false;
+        this.__connectPrevMapped = undefined;
+        this.disposeConnectSubscription();
         const store = this.resolveConnectStore();
         this.refreshDispatchProps(store);
 
@@ -549,6 +559,12 @@ function buildConnectHoc<S, P, R, A extends Action> (
               }
 
               if (!isPromiseLike(mountResult)) {
+                // Nested store emit during sync super.onMount may have already errored the
+                // subscription (mapState throw). Do not complete mount / deliver onUpdate
+                // before the post-subscribe rethrow — that ordered onUpdate before failed cleanup.
+                if (syncSubscribeError !== null) {
+                  return;
+                }
                 this.completeConnectMount();
                 return;
               }
