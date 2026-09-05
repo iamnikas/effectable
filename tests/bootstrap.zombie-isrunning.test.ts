@@ -24,7 +24,7 @@ class BoomRoot extends Component<{ boom: boolean }, Record<string, never>> {
 
 describe('bootstrap isRunning after GraphRuntime fail-stop', () => {
   it('BOOT-ZOMBIE: isRunning false and reconcile no-op after auto-reconcile fail-stop', async () => {
-    const handle = await bootstrap(BoomRoot, {});
+    const handle = await bootstrap<Record<string, never>, BoomRoot>(BoomRoot, {});
     const root = handle.rootInstance;
 
     expect(handle.isRunning()).toBe(true);

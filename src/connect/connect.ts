@@ -487,6 +487,13 @@ function buildConnectHoc<S, P, R, A extends Action> (
         this.__connectPrevMapped = undefined;
         this.__connectMountGeneration += 1;
         const mountGeneration = this.__connectMountGeneration;
+        // Drop state props from the previous mount. Otherwise refreshDispatchProps
+        // rebuilds with stale mapped fields, and a first emission that returns a
+        // non-object (null/array) leaves those fields stuck on this.props.
+        this.__connectStateProps = null;
+        // Child-connected nodes cache the store resolved from context. Remount under a
+        // different provider must re-resolve; reset to the explicit store (null for children).
+        this.__connectStore = explicitStore;
         this.disposeConnectSubscription();
         const store = this.resolveConnectStore();
         this.refreshDispatchProps(store);

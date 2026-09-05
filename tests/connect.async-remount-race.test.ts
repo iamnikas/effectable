@@ -3,6 +3,7 @@
  * Old mount promise must not completeConnectMount / finishDispatchOnlyMount for the new generation.
  */
 import { Component, connect, createStore } from 'Effectable';
+import type { DispatchMethod } from 'Effectable';
 
 type S = { n: number };
 type A = { type: 'INC' };
@@ -50,15 +51,15 @@ describe('connect async remount race', () => {
     const Connected = connect(
       store,
       null,
-      (dispatch: (a: A) => A) => ({ inc: () => dispatch({ type: 'INC' }) }),
+      (dispatch: DispatchMethod<A>) => ({ inc: () => dispatch({ type: 'INC' }) }),
     )(C);
 
     const inst = new Connected({});
-    const p1 = inst.onMount();
+    const p1 = inst.onMount!();
     expect(p1).toBeInstanceOf(Promise);
 
-    inst.onUnmount();
-    const p2 = inst.onMount();
+    void inst.onUnmount!();
+    const p2 = inst.onMount!();
 
     // Stale first mount resolves while second onMount is still pending.
     resolveFirst();
@@ -124,11 +125,11 @@ describe('connect async remount race', () => {
     )(C);
 
     const inst = new Connected({});
-    const p1 = inst.onMount();
+    const p1 = inst.onMount!();
     expect(p1).toBeInstanceOf(Promise);
 
-    inst.onUnmount();
-    const p2 = inst.onMount();
+    void inst.onUnmount!();
+    const p2 = inst.onMount!();
 
     resolveFirst();
     await p1.catch(() => undefined);

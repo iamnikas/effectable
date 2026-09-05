@@ -4,6 +4,7 @@
  * Same-instance remount then skipped user onMount and froze store→props updates.
  */
 import { Component, connect, createStore } from 'Effectable';
+import type { DispatchMethod } from 'Effectable';
 
 type S = { n: number; mode: 'ok' | 'boom' };
 type A = { type: 'INC' } | { type: 'BOOM' };
@@ -34,12 +35,12 @@ describe('connect remount / subscribe-error residuals (PR #59)', () => {
       (s: S) => ({ v: s.n }),
     )(C);
     const inst = new Connected({});
-    inst.onMount();
+    void inst.onMount!();
     expect(userMounts).toBe(1);
     expect(inst.props.v).toBe(0);
 
-    inst.onUnmount();
-    inst.onMount();
+    void inst.onUnmount!();
+    void inst.onMount!();
     expect(userMounts).toBe(2);
 
     store.dispatch({ type: 'INC' });
@@ -57,15 +58,15 @@ describe('connect remount / subscribe-error residuals (PR #59)', () => {
     const Connected = connect(
       store,
       null,
-      (dispatch: (a: A) => A) => ({ inc: () => dispatch({ type: 'INC' }) }),
+      (dispatch: DispatchMethod<A>) => ({ inc: () => dispatch({ type: 'INC' }) }),
     )(C);
     const inst = new Connected({});
-    inst.onMount();
+    void inst.onMount!();
     await Promise.resolve();
     expect(updates).toBe(1);
 
-    inst.onUnmount();
-    inst.onMount();
+    void inst.onUnmount!();
+    void inst.onMount!();
     await Promise.resolve();
     expect(updates).toBe(2);
   });
@@ -97,9 +98,9 @@ describe('connect remount / subscribe-error residuals (PR #59)', () => {
     )(C);
     const inst = new Connected({});
     expect(() => {
-      inst.onMount();
+      void inst.onMount!();
     }).toThrow('map boom');
-    inst.onUnmount();
+    void inst.onUnmount!();
     expect(events).toEqual(['onMount', 'onUnmount']);
   });
 });
