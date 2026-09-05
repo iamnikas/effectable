@@ -653,13 +653,18 @@ function buildConnectHoc<S, P, R, A extends Action> (
           throw syncFirstPassError;
         }
 
+        // Prefer returning the in-flight async onMount Promise. A nested mapState
+        // throw during the async preamble sets syncSubscribeError while still
+        // producing pendingMountResult; throwing sync here would orphan that
+        // Promise (unhandled rejection). The .then handlers already rethrow
+        // syncSubscribeError / dispose the subscription.
+        if (pendingMountResult !== null) {
+          return pendingMountResult;
+        }
+
         if (syncSubscribeError !== null) {
           this.disposeConnectSubscription();
           throw syncSubscribeError;
-        }
-
-        if (pendingMountResult !== null) {
-          return pendingMountResult;
         }
       }
 
