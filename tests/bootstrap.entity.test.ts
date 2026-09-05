@@ -738,9 +738,9 @@ describe('bootstrap — P0/P1 reconcile and owned clear', () => {
     handle.rootInstance.forceComposeThrow = true;
 
     await expect(handle.reconcile()).rejects.toThrow('compose error during manual reconcile');
-    expect(handle.isRunning()).toBe(true);
+    // Fail-stop tears down GraphRuntime; handle must not claim it is still live.
+    expect(handle.isRunning()).toBe(false);
 
-    handle.rootInstance.forceComposeThrow = false;
     await handle.shutdown();
   });
 
