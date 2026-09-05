@@ -1,5 +1,5 @@
 /**
- * Residual after PR #64: remount reset prevMapped / flags but left
+ * Residual after remount flag resets: remount cleared prevMapped / flags but left
  * `__connectStateProps` from the previous mount. refreshDispatchProps then
  * rebuilt this.props with stale mapped fields; if the first remount emission
  * was a non-object, those fields stayed stuck.
@@ -24,7 +24,7 @@ function makeStore (initial: S = { n: 1, mode: 'obj' }) {
   }, initial);
 }
 
-describe('connect remount stale __connectStateProps (PR #64 residual)', () => {
+describe('connect remount stale __connectStateProps', () => {
   test('invalid first mapState emission after remount must not keep previous mount state props', () => {
     const store = makeStore();
 
@@ -41,12 +41,12 @@ describe('connect remount stale __connectStateProps (PR #64 residual)', () => {
     )(C);
 
     const inst = new Connected({});
-    inst.onMount();
+    void inst.onMount!();
     expect(inst.props.v).toBe(1);
 
-    inst.onUnmount();
+    void inst.onUnmount!();
     store.dispatch({ type: 'TO_NULL' });
-    inst.onMount();
+    void inst.onMount!();
 
     expect(inst.props.v).toBeUndefined();
   });
@@ -62,12 +62,12 @@ describe('connect remount stale __connectStateProps (PR #64 residual)', () => {
     )(C);
 
     const inst = new Connected({});
-    inst.onMount();
+    void inst.onMount!();
     expect(inst.props.v).toBe(1);
 
-    inst.onUnmount();
+    void inst.onUnmount!();
     store.dispatch({ type: 'INC' });
-    inst.onMount();
+    void inst.onMount!();
     expect(inst.props.v).toBe(2);
   });
 });

@@ -1,5 +1,5 @@
 /**
- * PR #64 residual: child-connected instances cache the store resolved from
+ * Residual: child-connected instances cache the store resolved from
  * context into `__connectStore` and never cleared it on remount, so remount
  * under a different provider kept driving props from the old store.
  */
@@ -8,7 +8,7 @@ import { Component, connect, createStore } from 'Effectable';
 type S = { n: number };
 type A = { type: 'INC' };
 
-describe('connect remount sticky context store (PR #64 residual)', () => {
+describe('connect remount sticky context store', () => {
   test('remount under a different context store re-resolves and tracks the new store', () => {
     const storeA = createStore<S, A>(
       (state = { n: 0 }, action) => (action.type === 'INC' ? { n: state.n + 1 } : state),
@@ -26,12 +26,12 @@ describe('connect remount sticky context store (PR #64 residual)', () => {
     };
 
     inst.__connectStoreFromContext = storeA;
-    inst.onMount();
+    void inst.onMount!();
     expect(inst.props.v).toBe(0);
 
-    inst.onUnmount();
+    void inst.onUnmount!();
     inst.__connectStoreFromContext = storeB;
-    inst.onMount();
+    void inst.onMount!();
     expect(inst.props.v).toBe(100);
 
     storeB.dispatch({ type: 'INC' });
