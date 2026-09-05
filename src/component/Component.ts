@@ -113,16 +113,26 @@ implements Lifecycle {
       for (const k in src) {
         target[k] = src[k];
       }
-      this.onUpdate(prev, prev);
-      (this as unknown as { [SCHEDULE_UPDATE_HOOK]?: () => void })[SCHEDULE_UPDATE_HOOK]?.();
+      // State is already committed: always schedule even if onUpdate throws,
+      // otherwise mounted compose/children stay stale after a successful write.
+      try {
+        this.onUpdate(prev, prev);
+      } finally {
+        (this as unknown as { [SCHEDULE_UPDATE_HOOK]?: () => void })[SCHEDULE_UPDATE_HOOK]?.();
+      }
       return;
     }
 
     // Shallow-copy previous state and delta to avoid mutating the original state
     const next = { ...prev, ...delta };
     this.state = next as S;
-    this.onUpdate(prev, next);
-    (this as unknown as { [SCHEDULE_UPDATE_HOOK]?: () => void })[SCHEDULE_UPDATE_HOOK]?.();
+    // State is already committed: always schedule even if onUpdate throws,
+    // otherwise mounted compose/children stay stale after a successful write.
+    try {
+      this.onUpdate(prev, next);
+    } finally {
+      (this as unknown as { [SCHEDULE_UPDATE_HOOK]?: () => void })[SCHEDULE_UPDATE_HOOK]?.();
+    }
   }
 
   /**
