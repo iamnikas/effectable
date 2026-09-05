@@ -20,7 +20,7 @@
 
 import type { Action } from '../store/types';
 import type { Store } from '../store/types';
-import { RUNTIME_PROPS_RECEIVER } from '../component/types';
+import { CONNECT_REBIND_LIFECYCLE, RUNTIME_PROPS_RECEIVER } from '../component/types';
 import {
   CONTEXT_FIELDS_META_KEY,
   HAS_CONTEXT_FIELDS_KEY,
@@ -247,19 +247,47 @@ function buildConnectHoc<S, P, R, A extends Action> (
         this.__connectOwnProps = this.props as unknown as Record<string, unknown>;
 
         // Class-field lifecycle hooks are own properties and shadow Connected.prototype.
-        // Capture them, then reinstall Connected wiring so GraphRuntime still runs connect.
+        // Capture BaseCtor fields here, then reinstall Connected wiring. Subclass-of-Connected
+        // class fields initialize *after* this constructor and can overwrite the wiring again;
+        // GraphRuntime calls CONNECT_REBIND_LIFECYCLE post-construct to re-capture those.
+        this.installConnectLifecycleHooks();
+        (this as unknown as Record<symbol, unknown>)[CONNECT_REBIND_LIFECYCLE] = () => {
+          this.installConnectLifecycleHooks();
+        };
+      }
+
+      /**
+       * Captures any own `onMount` / `onUnmount` that is not Connected wiring, then
+       * reinstalls `Connected.prototype` hooks as own properties.
+       *
+       * Safe to call from the Connected constructor (BaseCtor class fields) and again
+       * after full construction (subclass-of-Connected class fields).
+       *
+       * @returns {void}
+       */
+      private installConnectLifecycleHooks (): void {
         const self = this as {
           onMount?: unknown;
           onUnmount?: unknown;
         };
-        if (Object.prototype.hasOwnProperty.call(this, 'onMount') && typeof self.onMount === 'function') {
+        const protoMount = Connected.prototype.onMount;
+        const protoUnmount = Connected.prototype.onUnmount;
+        if (
+          Object.prototype.hasOwnProperty.call(this, 'onMount') &&
+          typeof self.onMount === 'function' &&
+          self.onMount !== protoMount
+        ) {
           this.__connectOwnOnMount = self.onMount as () => void | Promise<void>;
         }
-        if (Object.prototype.hasOwnProperty.call(this, 'onUnmount') && typeof self.onUnmount === 'function') {
+        if (
+          Object.prototype.hasOwnProperty.call(this, 'onUnmount') &&
+          typeof self.onUnmount === 'function' &&
+          self.onUnmount !== protoUnmount
+        ) {
           this.__connectOwnOnUnmount = self.onUnmount as () => void | Promise<void>;
         }
-        self.onMount = Connected.prototype.onMount;
-        self.onUnmount = Connected.prototype.onUnmount;
+        self.onMount = protoMount;
+        self.onUnmount = protoUnmount;
       }
 
       /**

@@ -40,7 +40,12 @@ import type {
   RuntimePropsReceiver,
   VirtualServiceNode,
 } from './types';
-import { FIBER_EFFECT_TAG, RUNTIME_PROPS_RECEIVER, SCHEDULE_UPDATE_HOOK } from './types';
+import {
+  CONNECT_REBIND_LIFECYCLE,
+  FIBER_EFFECT_TAG,
+  RUNTIME_PROPS_RECEIVER,
+  SCHEDULE_UPDATE_HOOK,
+} from './types';
 import { LifecycleEngine } from './lifecycle';
 import {
   ContextProvider,
@@ -1422,6 +1427,14 @@ export class GraphRuntime {
     // Constructor is stored as ComponentConstructor<unknown> for covariance,
     // but invoked with concrete props P. The cast is safe: P extends unknown.
     const instance = new vnode.type(vnode.props) as Component<unknown, P>;
+
+    // connect installs CONNECT_REBIND_LIFECYCLE so subclass-of-Connected class fields
+    // that overwrite own onMount/onUnmount after Connected's constructor can be
+    // re-captured before hookFlags / startup see the shadowed hooks.
+    const rebindConnectLifecycle = (instance as unknown as Record<symbol, unknown>)[CONNECT_REBIND_LIFECYCLE];
+    if (typeof rebindConnectLifecycle === 'function') {
+      (rebindConnectLifecycle as () => void).call(instance);
+    }
 
     // Cache hookFlags once for fast-exit in runStartup/runShutdown (1.15x)
     engine.initHookFlags(instance);
