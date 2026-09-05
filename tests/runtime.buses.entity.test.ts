@@ -326,6 +326,66 @@ describe('EventBus', () => {
     expect(hits).toContain('third');
   });
 
+  it('M07b: unsubscribing a not-yet-called typed handler mid-publish still delivers once', () => {
+    const bus = new EventBus<TestEvent>();
+    const hits: string[] = [];
+
+    let removeB: () => void = () => {
+      return;
+    };
+
+    bus.subscribe('EVT_C', () => {
+      hits.push('A');
+      removeB();
+    });
+
+    removeB = bus.subscribe('EVT_C', () => {
+      hits.push('B');
+    });
+
+    bus.subscribe('EVT_C', () => {
+      hits.push('C');
+    });
+
+    bus.publish({ type: 'EVT_C', payload: { flag: true } });
+
+    expect(hits).toEqual(['A', 'B', 'C']);
+
+    hits.length = 0;
+    bus.publish({ type: 'EVT_C', payload: { flag: false } });
+    expect(hits).toEqual(['A', 'C']);
+  });
+
+  it('M07c: unsubscribing a not-yet-called subscribeAll handler mid-publish still delivers once', () => {
+    const bus = new EventBus<TestEvent>();
+    const hits: string[] = [];
+
+    let removeB: () => void = () => {
+      return;
+    };
+
+    bus.subscribeAll(() => {
+      hits.push('A');
+      removeB();
+    });
+
+    removeB = bus.subscribeAll(() => {
+      hits.push('B');
+    });
+
+    bus.subscribeAll(() => {
+      hits.push('C');
+    });
+
+    bus.publish({ type: 'EVT_C', payload: { flag: true } });
+
+    expect(hits).toEqual(['A', 'B', 'C']);
+
+    hits.length = 0;
+    bus.publish({ type: 'EVT_C', payload: { flag: false } });
+    expect(hits).toEqual(['A', 'C']);
+  });
+
   it('double dispose of subscription is safe', () => {
     const bus = new EventBus<TestEvent>();
     let n = 0;
