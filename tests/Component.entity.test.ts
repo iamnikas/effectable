@@ -245,6 +245,54 @@ describe('Component standalone', () => {
     expect(c.state.n).toBe(1);
   });
 
+  it('SCHEDULE_UPDATE_HOOK still runs when onUpdate throws after state commit', () => {
+    class ThrowingUpdate extends Component<{ n: number }, Record<string, never>> {
+      constructor () {
+        super({});
+        this.state = { n: 0 };
+      }
+
+      public override onUpdate (): void {
+        throw new Error('boom');
+      }
+    }
+
+    const c = new ThrowingUpdate();
+    let hookCalls = 0;
+    (c as unknown as Record<symbol, unknown>)[SCHEDULE_UPDATE_HOOK] = (): void => {
+      hookCalls += 1;
+    };
+
+    expect(() => c.setState({ n: 99 })).toThrow('boom');
+    expect(c.state.n).toBe(99);
+    expect(hookCalls).toBe(1);
+  });
+
+  it('mutableState: SCHEDULE_UPDATE_HOOK still runs when onUpdate throws after in-place commit', () => {
+    class ThrowingMutable extends Component<{ n: number }, Record<string, never>> {
+      public static override readonly mutableState = true;
+
+      constructor () {
+        super({});
+        this.state = { n: 0 };
+      }
+
+      public override onUpdate (): void {
+        throw new Error('boom-mutable');
+      }
+    }
+
+    const c = new ThrowingMutable();
+    let hookCalls = 0;
+    (c as unknown as Record<symbol, unknown>)[SCHEDULE_UPDATE_HOOK] = (): void => {
+      hookCalls += 1;
+    };
+
+    expect(() => c.setState({ n: 7 })).toThrow('boom-mutable');
+    expect(c.state.n).toBe(7);
+    expect(hookCalls).toBe(1);
+  });
+
   it('compose is optional — without override it is absent on the instance', () => {
     class NoComposeLeaf extends Component<Record<string, never>, { tag: string }> {
       constructor (props: { tag: string }) {
