@@ -334,11 +334,34 @@ function buildConnectHoc<S, P, R, A extends Action> (
       /**
        * Publishes the resolved store into the connected component's subtree.
        *
+       * GraphRuntime calls this during materialization **before** the first `compose()`.
+       * Sync mapped props here so strict mode does not leak parent own-props into that
+       * compose (and so mapState/mapDispatch fields are visible without waiting for
+       * `onMount` + post-mount kick-off). Otherwise a gate that branches on own props
+       * can PLACE/onMount the wrong child subtree for one generation.
+       *
        * @param {ContextScope} parentScope - parent scope
        * @returns {ContextScope} scope for child nodes
        */
       public applyToScope (parentScope: ContextScope): ContextScope {
-        return extendScope(parentScope, CONNECT_STORE_CONTEXT, this.resolveConnectStore());
+        const store = this.resolveConnectStore();
+        this.syncConnectPropsBeforeCompose(store);
+        return extendScope(parentScope, CONNECT_STORE_CONTEXT, store);
+      }
+
+      /**
+       * Applies dispatch + current mapState props before the first `compose()`.
+       *
+       * @param {Store<S, A>} store - resolved store
+       * @returns {void}
+       */
+      private syncConnectPropsBeforeCompose (store: Store<S, A>): void {
+        this.refreshDispatchProps(store);
+        if (mapStateToProps != null) {
+          this.applyMappedStateProps(
+            mapStateToProps(store.getState(), this.__connectOwnProps as unknown as P)
+          );
+        }
       }
 
       /**

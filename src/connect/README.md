@@ -86,16 +86,18 @@ const ConnectedFeedsWithCreators = connect(undefined, {
 ## Connected class lifecycle
 
 1. `new ConnectedCtor(props)`.
-2. HOC `onMount()`: merge dispatch → subscribe to state if needed → `super.onMount`.
-3. **Post-mount kick-off:** if `mapStateToProps` **or** `mapDispatchToProps` is set, after mount completes
+2. **`applyToScope` (before first `compose()`):** GraphRuntime publishes the store into the subtree
+   and the HOC **synchronously** applies dispatch + current `mapStateToProps` into `this.props`.
+   In strict mode this also strips parent own-props so the first `compose()` cannot branch on
+   leaked secrets / unmapped fields (and cannot PLACE the wrong child for one generation).
+3. HOC `onMount()`: merge dispatch → subscribe to state if needed → `super.onMount`.
+4. **Post-mount kick-off:** if `mapStateToProps` **or** `mapDispatchToProps` is set, after mount completes
    the HOC schedules **one** deferred `setState({})` via `queueMicrotask`. This yields exactly one
    `onUpdate` after mount even on a cold start (store already populated, no new emits) — without
-   `setTimeout`/`setState({})` in the consumer. That pass also rebuilds `compose()` so children
-   receive mapped props that were injected in `onMount` (GraphRuntime runs `compose()` before `onMount`).
-   Guards: not after unmount; do not duplicate if
+   `setTimeout`/`setState({})` in the consumer. Guards: not after unmount; do not duplicate if
    `onUpdate` was already delivered (pending flush / store emit); exactly once per mount.
-4. Store emits (if `mapStateToProps` is present) → merge → `setState` → `onUpdate`.
-5. `onUnmount` — unsubscribe and `super.onUnmount`.
+5. Store emits (if `mapStateToProps` is present) → merge → `setState` → `onUpdate`.
+6. `onUnmount` — unsubscribe and `super.onUnmount`.
 
 ### Remount and class-field lifecycle
 
