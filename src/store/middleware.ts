@@ -97,7 +97,16 @@ export function applyMiddleware<S = unknown, A extends Action = Action> (
 export function applyMiddleware (...args: unknown[]): unknown {
   if (isWrapModeArgs(args)) {
     const [api, rawDispatch, ...middlewares] = args;
-    return wrapDispatch(api, rawDispatch, middlewares);
+    // Same construction invariant as enhancer mode (PR #55): while middleware
+    // factories run, api.dispatch must not reach rawDispatch / a half-built chain.
+    const previousDispatch = api.dispatch;
+    api.dispatch = dispatchWhileConstructing;
+    try {
+      return wrapDispatch(api, rawDispatch, middlewares);
+    } catch (error) {
+      api.dispatch = previousDispatch;
+      throw error;
+    }
   }
 
   return (createStore: StoreCreator<unknown, Action>) =>

@@ -168,6 +168,36 @@ describe('Effectable store middleware', () => {
     store.dispatch({ type: 'AFTER_READY' });
     expect(store.getState().events).toEqual(['AFTER_READY']);
   });
+
+  it('D07c: wrap-mode — api.dispatch during middleware construction throws (does not hit rawDispatch)', () => {
+    const store = createStore(testReducer, { events: [] });
+    const rawDispatch = store.dispatch.bind(store);
+    const api = {
+      getState: store.getState,
+      dispatch: rawDispatch as typeof store.dispatch,
+    };
+
+    const constructingMiddleware: Middleware<unknown, TestState> = (middlewareApi) => {
+      expect(() => {
+        middlewareApi.dispatch({ type: 'INIT_FROM_MW' });
+      }).toThrow(/Dispatching while constructing your middleware is not allowed/);
+
+      return (next) => (action: unknown) => {
+        if (typeof action !== 'object' || action === null || !('type' in action)) {
+          throw new Error('Expected action with type');
+        }
+        return next(action as AnyAction);
+      };
+    };
+
+    const dispatch = applyMiddleware(api, rawDispatch, constructingMiddleware);
+    api.dispatch = dispatch;
+    store.dispatch = dispatch;
+
+    expect(store.getState().events).toEqual([]);
+    store.dispatch({ type: 'AFTER_READY' });
+    expect(store.getState().events).toEqual(['AFTER_READY']);
+  });
 });
 
 describe('D03–D04 compose', () => {
