@@ -873,19 +873,26 @@ export class GraphRuntime {
       }
     } catch (error: unknown) {
       this.flushing = false;
-      
-      // Notify error handler before fail-stop
+
+      // Notify error handler before fail-stop. The hook must not be allowed to
+      // skip fail-stop: a throwing observer would leave the runtime ACTIVE with
+      // fibers already run through runFiberFailedCleanup, and the microtask
+      // `.catch(() => {})` would swallow the failure silently.
       if (this.onAutoReconcileError !== null) {
-        this.onAutoReconcileError(error);
+        try {
+          this.onAutoReconcileError(error);
+        } catch {
+          // Observer/logging failures are non-fatal relative to fail-stop.
+        }
       }
-      
+
       // Fail-stop on unrecoverable dirty-flush error
       const failError = error instanceof Error ? error : new Error(String(error));
       const failRes = this.failStop(failError);
       if (isThenable(failRes)) {
         await failRes;
       }
-      
+
       throw failError;
     } finally {
       this.flushing = false;
@@ -899,18 +906,22 @@ export class GraphRuntime {
         const loopError = new Error(
           `GraphRuntime: dirty flush exceeded ${String(GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES)} passes (anti-loop)`
         );
-        
-        // Notify error handler before fail-stop
+
+        // Same contract as the catch path: observer throw must not skip fail-stop.
         if (this.onAutoReconcileError !== null) {
-          this.onAutoReconcileError(loopError);
+          try {
+            this.onAutoReconcileError(loopError);
+          } catch {
+            // Observer/logging failures are non-fatal relative to fail-stop.
+          }
         }
-        
+
         // Fail-stop on loop limit
         const failRes = this.failStop(loopError);
         if (isThenable(failRes)) {
           await failRes;
         }
-        
+
         throw loopError;
       }
       this.scheduleDirtyFlushMicrotask();
