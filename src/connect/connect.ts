@@ -215,6 +215,12 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * `completeConnectMount` / `deliverConnectUpdate` after teardown.
        */
       private __connectTornDown = false;
+      /**
+       * Bumped at the start of every `onMount`. Async `super.onMount` completions capture the
+       * generation so a stale promise from a previous mount cannot complete / kick off after
+       * remount cleared `__connectTornDown` while the new mount is still pending.
+       */
+      private __connectMountGeneration = 0;
       private __connectStore: Store<S, A> | null = explicitStore;
       private __connectStoreFromContext: unknown = undefined;
       private __connectOwnProps: Record<string, unknown>;
@@ -479,6 +485,8 @@ function buildConnectHoc<S, P, R, A extends Action> (
         this.__connectPendingUpdate = false;
         this.__connectMountCompleted = false;
         this.__connectPrevMapped = undefined;
+        this.__connectMountGeneration += 1;
+        const mountGeneration = this.__connectMountGeneration;
         this.disposeConnectSubscription();
         const store = this.resolveConnectStore();
         this.refreshDispatchProps(store);
@@ -494,8 +502,8 @@ function buildConnectHoc<S, P, R, A extends Action> (
            * @returns {void}
            */
           const finishDispatchOnlyMount = (): void => {
-            // Unmounted while async super.onMount was still pending: do not revive kick-off.
-            if (this.__connectTornDown) {
+            // Unmounted or superseded by a newer onMount while async super.onMount was pending.
+            if (this.__connectTornDown || this.__connectMountGeneration !== mountGeneration) {
               return;
             }
 
@@ -515,7 +523,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
             return Promise.resolve(mountResult as Promise<void>).then(() => {
               finishDispatchOnlyMount();
             }, (error: unknown) => {
-              this.__connectMountCompleted = false;
+              if (this.__connectMountGeneration === mountGeneration) {
+                this.__connectMountCompleted = false;
+              }
               throw error;
             });
           }
@@ -570,6 +580,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
               }
 
               pendingMountResult = Promise.resolve(mountResult as Promise<void>).then(() => {
+                if (this.__connectMountGeneration !== mountGeneration) {
+                  return;
+                }
                 if (syncSubscribeError !== null) {
                   this.disposeConnectSubscription();
                   this.__connectPendingUpdate = false;
@@ -577,6 +590,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
                 }
                 this.completeConnectMount();
               }, (error: unknown) => {
+                if (this.__connectMountGeneration !== mountGeneration) {
+                  throw error;
+                }
                 this.disposeConnectSubscription();
                 this.__connectPendingUpdate = false;
                 throw error;
