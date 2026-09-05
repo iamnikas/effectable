@@ -548,7 +548,12 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this.__connectOwnProps as unknown as P
         );
 
-        this.__connectSubscription = store.select(selector).subscribe({
+        // BehaviorSubject emits the first value synchronously inside subscribe().
+        // Nested onUnmount/onMount during that first next can install a newer
+        // subscription on `this` before subscribe() returns — a blind assign would
+        // orphan that nested sub (zombie) and keep the outer one instead.
+        const subscriptionBeforeSubscribe = this.__connectSubscription;
+        const localSubscription = store.select(selector).subscribe({
           next: (mapped: R) => {
             this.applyMappedStateProps(mapped);
 
@@ -622,6 +627,20 @@ function buildConnectHoc<S, P, R, A extends Action> (
             // The component keeps last mapped props; callers should treat mapper throws as bugs.
           },
         });
+
+        if (this.__connectSubscription !== subscriptionBeforeSubscribe) {
+          // Nested remount already owns `__connectSubscription` — drop this outer sub.
+          localSubscription.unsubscribe();
+        } else if (
+          this.__connectTornDown ||
+          this.__connectMountGeneration !== mountGeneration
+        ) {
+          // Torn down or superseded during first next without installing a replacement.
+          localSubscription.unsubscribe();
+          this.__connectSubscription = null;
+        } else {
+          this.__connectSubscription = localSubscription;
+        }
 
         if (syncFirstPassError !== null) {
           this.disposeConnectSubscription();
