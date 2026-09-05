@@ -119,4 +119,29 @@ describe('GraphRuntime failed-cleanup order', () => {
     expect(parentUn).toBeGreaterThanOrEqual(0);
     expect(childUn).toBeLessThan(parentUn);
   });
+
+  it('compose throw after pre-mount hook clears SCHEDULE_UPDATE_HOOK via rollback', async () => {
+    const { SCHEDULE_UPDATE_HOOK } = await import('../src/component/types');
+
+    class BoomCompose extends Component {
+      public override compose (): never {
+        throw new Error('compose boom');
+      }
+    }
+
+    let instance: BoomCompose | null = null;
+    const Original = BoomCompose;
+    class Capture extends Original {
+      constructor (props: Record<string, never>) {
+        super(props);
+        instance = this;
+      }
+    }
+
+    await expect(GraphRuntime.mount(h(Capture, {}))).rejects.toThrow('compose boom');
+    expect(instance).not.toBeNull();
+    expect(
+      (instance as unknown as Record<symbol, unknown>)[SCHEDULE_UPDATE_HOOK]
+    ).toBeUndefined();
+  });
 });

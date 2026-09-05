@@ -1399,16 +1399,30 @@ export class GraphRuntime {
     // mutates state but never schedules reconcile.
     this.injectPreMountUpdateHook(instance, fiber);
 
-    // Recursively materialize children before running the parent's lifecycle
-    const childVnodes = this.getChildVnodes(instance, vnode.children);
+    // compose() / duplicate-key validation can throw after the pre-mount hook is
+    // attached. Roll back so the hook is cleared (otherwise the failed fiber is
+    // abandoned with a live SCHEDULE_UPDATE_HOOK and no teardown).
+    let childVnodes: VirtualServiceNode[];
+    try {
+      childVnodes = this.getChildVnodes(instance, vnode.children);
 
-    // Validate unique keys BEFORE materialization (Option A: React v16.5 contract)
-    // Prevent partial tree construction when duplicate keys are present
-    this.validateUniqueKeys(
-      childVnodes.map(vnode => ({ vnode, instance: null })),
-      fiber as RuntimeFiber<unknown>,
-      'current'
-    );
+      // Validate unique keys BEFORE materialization (Option A: React v16.5 contract)
+      // Prevent partial tree construction when duplicate keys are present
+      this.validateUniqueKeys(
+        childVnodes.map(vnode => ({ vnode, instance: null })),
+        fiber as RuntimeFiber<unknown>,
+        'current'
+      );
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        return rollbackRes.then(() => {
+          throw error;
+        }) as Promise<RuntimeFiber<P>>;
+      }
+      throw error;
+    }
 
     for (let i = 0; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
