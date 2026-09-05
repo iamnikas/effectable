@@ -548,15 +548,26 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this.__connectOwnProps as unknown as P
         );
 
-        this.__connectSubscription = store.select(selector).subscribe({
+        // Assign only after subscribe() returns. Sync first-pass onMount may call
+        // onUnmount / remount before that, when disposeConnectSubscription still no-ops
+        // (__connectSubscription is null). Capture locally and drop a superseded sub
+        // without clobbering a newer mount generation's subscription.
+        const subscription = store.select(selector).subscribe({
           next: (mapped: R) => {
+            // Stale emission from a subscription superseded by remount / tear-down.
+            if (this.__connectMountGeneration !== mountGeneration) {
+              return;
+            }
+
             this.applyMappedStateProps(mapped);
 
             if (this.__connectFirstPass) {
               this.__connectFirstPass = false;
 
               if (!hasSuperOnMount) {
-                this.completeConnectMount();
+                if (!this.__connectTornDown) {
+                  this.completeConnectMount();
+                }
                 return;
               }
 
@@ -572,7 +583,12 @@ function buildConnectHoc<S, P, R, A extends Action> (
                 // Nested store emit during sync super.onMount may have already errored the
                 // subscription (mapState throw). Do not complete mount / deliver onUpdate
                 // before the post-subscribe rethrow — that ordered onUpdate before failed cleanup.
-                if (syncSubscribeError !== null) {
+                // Also skip if onMount tore down or remounted (generation bumped) mid-call.
+                if (
+                  syncSubscribeError !== null
+                  || this.__connectTornDown
+                  || this.__connectMountGeneration !== mountGeneration
+                ) {
                   return;
                 }
                 this.completeConnectMount();
@@ -580,7 +596,10 @@ function buildConnectHoc<S, P, R, A extends Action> (
               }
 
               pendingMountResult = Promise.resolve(mountResult as Promise<void>).then(() => {
-                if (this.__connectMountGeneration !== mountGeneration) {
+                if (
+                  this.__connectMountGeneration !== mountGeneration
+                  || this.__connectTornDown
+                ) {
                   return;
                 }
                 if (syncSubscribeError !== null) {
@@ -614,6 +633,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
           error: (error: unknown) => {
             // First-pass or pre-complete failures must fail mount (handled after subscribe returns
             // when sync, or via the pending mount promise when async).
+            if (this.__connectMountGeneration !== mountGeneration) {
+              return;
+            }
             if (this.__connectFirstPass || !this.__connectMountCompleted) {
               syncSubscribeError = error;
               return;
@@ -622,6 +644,23 @@ function buildConnectHoc<S, P, R, A extends Action> (
             // The component keeps last mapped props; callers should treat mapper throws as bugs.
           },
         });
+
+        if (this.__connectMountGeneration !== mountGeneration || this.__connectTornDown) {
+          subscription.unsubscribe();
+          // Remount already installed its own subscription — do not clear that slot.
+          if (this.__connectMountGeneration === mountGeneration) {
+            this.__connectSubscription = null;
+            if (syncFirstPassError !== null) {
+              throw syncFirstPassError;
+            }
+            if (syncSubscribeError !== null) {
+              throw syncSubscribeError;
+            }
+          }
+          return;
+        }
+
+        this.__connectSubscription = subscription;
 
         if (syncFirstPassError !== null) {
           this.disposeConnectSubscription();
