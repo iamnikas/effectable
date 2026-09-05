@@ -511,11 +511,16 @@ export class GraphRuntime {
       }
     }
 
-    // 4. Run failed-startup cleanup (if instance exists)
+    // 4. Run failed-startup cleanup (if instance exists).
+    // wasMounted must reflect whether runStartup entered Mounted. Pre-startup
+    // failures (compose/validateUniqueKeys/child materialize/ref/bus) leave the
+    // engine at `registered`; hard-coding true incorrectly invoked onUnmount
+    // without a matching onMount.
     let cleanupPromise: Promise<void> | null = null;
     if (instance !== null) {
       try {
-        const cleanupRes = fiber.engine.runFailedCleanup(instance, true);
+        const wasMounted = fiber.engine.getStatus() !== 'registered';
+        const cleanupRes = fiber.engine.runFailedCleanup(instance, wasMounted);
         if (isThenable(cleanupRes)) {
           cleanupPromise = cleanupRes;
         }
@@ -1362,16 +1367,31 @@ export class GraphRuntime {
     // mutates state but never schedules reconcile.
     this.injectPreMountUpdateHook(instance, fiber);
 
-    // Recursively materialize children before running the parent's lifecycle
-    const childVnodes = this.getChildVnodes(instance, vnode.children);
+    // Recursively materialize children before running the parent's lifecycle.
+    // compose()/validateUniqueKeys can throw after the premount hook is attached.
+    // Self-rollback here: the parent catch only rolls back the parent and never
+    // sees this fiber (it is not yet in journal.mountedChildren).
+    let childVnodes: VirtualServiceNode[];
+    try {
+      childVnodes = this.getChildVnodes(instance, vnode.children);
 
-    // Validate unique keys BEFORE materialization (Option A: React v16.5 contract)
-    // Prevent partial tree construction when duplicate keys are present
-    this.validateUniqueKeys(
-      childVnodes.map(vnode => ({ vnode, instance: null })),
-      fiber as RuntimeFiber<unknown>,
-      'current'
-    );
+      // Validate unique keys BEFORE materialization (Option A: React v16.5 contract)
+      // Prevent partial tree construction when duplicate keys are present
+      this.validateUniqueKeys(
+        childVnodes.map(child => ({ vnode: child, instance: null })),
+        fiber as RuntimeFiber<unknown>,
+        'current'
+      );
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        return rollbackRes.then(() => {
+          throw error;
+        }) as Promise<RuntimeFiber<P>>;
+      }
+      throw error;
+    }
 
     for (let i = 0; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
