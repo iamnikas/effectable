@@ -29,6 +29,7 @@ import {
   extendScope,
 } from '../component/context';
 import type { ContextFieldMeta, ContextScope } from '../component/context';
+import { CONNECT_REBIND_LIFECYCLE } from '../component/connectBrand';
 import type {
   MapStateToProps,
   MapDispatchToProps,
@@ -245,21 +246,54 @@ function buildConnectHoc<S, P, R, A extends Action> (
       constructor (props: P) {
         super(props);
         this.__connectOwnProps = this.props as unknown as Record<string, unknown>;
+        // Capture wrapped-class fields (initialized before this body). Subclass
+        // class fields run after `super()` returns and overwrite these installs;
+        // GraphRuntime calls {@link CONNECT_REBIND_LIFECYCLE} after `new` completes.
+        this.rebindConnectLifecycleHooks();
+      }
 
-        // Class-field lifecycle hooks are own properties and shadow Connected.prototype.
-        // Capture them, then reinstall Connected wiring so GraphRuntime still runs connect.
+      /**
+       * Captures own `onMount` / `onUnmount` (class fields) and reinstalls Connected
+       * wiring as own properties so GraphRuntime does not skip store subscribe/teardown.
+       *
+       * Safe to call again after subclass field initializers (see {@link CONNECT_REBIND_LIFECYCLE}).
+       *
+       * @returns {void}
+       */
+      private rebindConnectLifecycleHooks (): void {
         const self = this as {
           onMount?: unknown;
           onUnmount?: unknown;
         };
-        if (Object.prototype.hasOwnProperty.call(this, 'onMount') && typeof self.onMount === 'function') {
+        const wiredMount = Connected.prototype.onMount;
+        const wiredUnmount = Connected.prototype.onUnmount;
+
+        if (
+          Object.prototype.hasOwnProperty.call(this, 'onMount') &&
+          typeof self.onMount === 'function' &&
+          self.onMount !== wiredMount
+        ) {
           this.__connectOwnOnMount = self.onMount as () => void | Promise<void>;
         }
-        if (Object.prototype.hasOwnProperty.call(this, 'onUnmount') && typeof self.onUnmount === 'function') {
+        if (
+          Object.prototype.hasOwnProperty.call(this, 'onUnmount') &&
+          typeof self.onUnmount === 'function' &&
+          self.onUnmount !== wiredUnmount
+        ) {
           this.__connectOwnOnUnmount = self.onUnmount as () => void | Promise<void>;
         }
-        self.onMount = Connected.prototype.onMount;
-        self.onUnmount = Connected.prototype.onUnmount;
+
+        self.onMount = wiredMount;
+        self.onUnmount = wiredUnmount;
+      }
+
+      /**
+       * GraphRuntime brand: rebind after full construction (subclass class fields).
+       *
+       * @returns {void}
+       */
+      public [CONNECT_REBIND_LIFECYCLE] (): void {
+        this.rebindConnectLifecycleHooks();
       }
 
       /**

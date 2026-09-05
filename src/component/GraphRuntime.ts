@@ -42,6 +42,7 @@ import type {
 } from './types';
 import { FIBER_EFFECT_TAG, RUNTIME_PROPS_RECEIVER, SCHEDULE_UPDATE_HOOK } from './types';
 import { LifecycleEngine } from './lifecycle';
+import { CONNECT_REBIND_LIFECYCLE } from './connectBrand';
 import {
   ContextProvider,
   EMPTY_CONTEXT_SCOPE,
@@ -1391,6 +1392,15 @@ export class GraphRuntime {
     // Constructor is stored as ComponentConstructor<unknown> for covariance,
     // but invoked with concrete props P. The cast is safe: P extends unknown.
     const instance = new vnode.type(vnode.props) as Component<unknown, P>;
+
+    // connect: subclass class fields overwrite Connected constructor wiring (DefineOwnProperty).
+    // Rebind after full `new` so store subscribe / mapState / teardown still run.
+    const rebindConnectLifecycle = (
+      instance as unknown as Record<symbol, unknown>
+    )[CONNECT_REBIND_LIFECYCLE];
+    if (typeof rebindConnectLifecycle === 'function') {
+      (rebindConnectLifecycle as (this: Component<unknown, P>) => void).call(instance);
+    }
 
     // Cache hookFlags once for fast-exit in runStartup/runShutdown (1.15x)
     engine.initHookFlags(instance);
