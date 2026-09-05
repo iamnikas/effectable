@@ -102,6 +102,14 @@ export function UseRef (): PropertyDecorator {
  */
 export class HandleRegistry {
   private readonly handles = new Map<string, unknown>();
+  /**
+   * Monotonic registration id per key. Disposers capture the id from their
+   * `register` call and only delete when it still matches — so re-registering
+   * the *same handle object* (as `autoRegister` does across remounts) cannot
+   * be torn down by a stale disposer from the previous mount generation.
+   */
+  private readonly registrationIds = new Map<string, number>();
+  private nextRegistrationId = 1;
 
   private getInheritedMetadata<T> (ctor: Function, metaKey: string): T | undefined {
     let current: Function | null = ctor;
@@ -219,15 +227,24 @@ export class HandleRegistry {
    * Prefer keeping the disposer and calling it from the component's `onUnmount()`,
    * so stale handles are not left after the runtime instance stops.
    *
+   * The disposer is generation-scoped: after a later `register`/`autoRegister` for
+   * the same key (even with the same handle object identity), the previous disposer
+   * is a no-op. This matches remount-safe teardown for `autoRegister`, which reuses
+   * the instance's `@UseRef` object across mounts.
+   *
    * @param {string} key - handle key
    * @param {THandle} handle - imperative API object
-   * @returns {() => void} unregister function; no-op if a different handle is now registered under the same key
+   * @returns {() => void} unregister function; no-op if this registration was superseded
    */
   public register<THandle> (key: string, handle: THandle): () => void {
+    const registrationId = this.nextRegistrationId;
+    this.nextRegistrationId += 1;
     this.handles.set(key, handle);
+    this.registrationIds.set(key, registrationId);
     return () => {
-      if (this.handles.get(key) === handle) {
+      if (this.registrationIds.get(key) === registrationId) {
         this.handles.delete(key);
+        this.registrationIds.delete(key);
       }
     };
   }
@@ -243,6 +260,7 @@ export class HandleRegistry {
    */
   public unregister (key: string): void {
     this.handles.delete(key);
+    this.registrationIds.delete(key);
   }
 
   /**
@@ -311,5 +329,6 @@ export class HandleRegistry {
    */
   public clear (): void {
     this.handles.clear();
+    this.registrationIds.clear();
   }
 }
