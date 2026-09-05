@@ -1725,10 +1725,10 @@ export class GraphRuntime {
       }
     }
 
-    // Commit ref transition: clear old ref if changed, bind new ref
-    this.commitRef(current.vnode.ref, instance, nextVnode.ref, instance);
-
     // Reconcile child nodes (sync fast-path if all children are sync).
+    // Ref commit is deferred to applyFiberUpdate so a compose()/child-reconcile
+    // failure cannot leave nextRef.current pointing at an instance that failStop
+    // will destroy while fiber.vnode.ref still holds the previous ref.
     let nextChildVnodes: VirtualServiceNode[];
     try {
       nextChildVnodes = this.getChildVnodes(instance, nextVnode.children);
@@ -1807,6 +1807,12 @@ export class GraphRuntime {
     parentScope: ContextScope,
     nextChildren: RuntimeFiber<unknown>[],
   ): void {
+    const instance = current.instance;
+    if (instance !== null) {
+      // Commit ref only after compose + child reconcile succeeded.
+      this.commitRef(current.vnode.ref, instance, nextVnode.ref, instance);
+    }
+
     current.vnode = nextVnode;
     current.parentFiber = parentFiber as RuntimeFiber<unknown> | null;
     current.children = nextChildren as Fiber[];
