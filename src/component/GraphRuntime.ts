@@ -454,13 +454,15 @@ export class GraphRuntime {
 
   /**
    * Transactional rollback for failed fiber materialization.
-   * Releases acquired resources in reverse acquisition order:
+   * Releases acquired resources in reverse acquisition order, matching
+   * {@link destroyFiber} / {@link runFiberFailedCleanup} teardown:
    * 1. disable scheduler hook
-   * 2. dispose runtime bus registrations
-   * 3. clear bound ref (identity-safe)
-   * 4. run failed-startup cleanup
-   * 5. destroy mounted children in reverse order
-   * 6. unlink the partial fiber
+   * 2. destroy mounted children in reverse order
+   * 3. run failed-startup cleanup (parent onUnmount when startup ran)
+   * 4. dispose runtime bus registrations
+   * 5. clear bound ref (identity-safe)
+   * Bus dispose must run AFTER children destroy: child onUnmount may publish
+   * events handled by parent @OnEvent (same contract as normal unmount).
    * Cleanup is best-effort: one failure does not skip remaining steps.
    * Preserves the original materialization error; cleanup errors are attached.
    * Rollback is idempotent.
@@ -493,28 +495,8 @@ export class GraphRuntime {
       }
     }
 
-    // 2. Dispose runtime bus registrations
-    if (journal.busWiringAttached === true) {
-      try {
-        this.disposeEffectableRuntimeBusWiring(fiber);
-      } catch (err: unknown) {
-        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
-      }
-    }
-
-    // 3. Clear bound ref (identity-safe)
-    if (journal.refBound === true && fiber.vnode.ref !== undefined && journal.refOwner !== undefined) {
-      try {
-        this.commitRef(fiber.vnode.ref, journal.refOwner, undefined, null);
-      } catch (err: unknown) {
-        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
-      }
-    }
-
-    // 4. Destroy mounted children in reverse order BEFORE parent onUnmount.
-    // Documented teardown contract is children → parent; running parent
-    // runFailedCleanup first left children alive during parent onUnmount and
-    // also called parent onUnmount when startup never ran (wasMounted=true).
+    // 2. Destroy mounted children in reverse order BEFORE parent onUnmount / bus dispose.
+    // Documented teardown contract is children → parent → bus dispose (see destroyFiber).
     // Pass cleanupErrors so nested destroy is best-effort: a throwing
     // ref-clear/disposer on one grandchild must not skip remaining siblings.
     // Those nodes were never attached to currentRoot, so failStop cannot reclaim them.
@@ -596,7 +578,9 @@ export class GraphRuntime {
 
   /**
    * After rollback destroyed children: run parent failed-cleanup only when startup
-   * actually ran (`status !== 'registered'`), then attach cleanup errors and rethrow.
+   * actually ran (`status !== 'registered'`), then dispose bus wiring + clear ref
+   * (same order as {@link destroyFiber}: children → onUnmount → bus/ref), then
+   * attach cleanup errors and rethrow.
    *
    * @param {RuntimeFiber<unknown>} fiber - parent fiber being rolled back
    * @param {Component<unknown, unknown> | null} instance - parent instance
@@ -620,10 +604,12 @@ export class GraphRuntime {
           if (isThenable(cleanupRes)) {
             return cleanupRes.then(
               () => {
+                this.releaseRollbackFiberResources(fiber, cleanupErrors);
                 this.finalizeRollback(primaryError, cleanupErrors);
               },
               (err: unknown) => {
                 cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+                this.releaseRollbackFiberResources(fiber, cleanupErrors);
                 this.finalizeRollback(primaryError, cleanupErrors);
               },
             );
@@ -635,7 +621,44 @@ export class GraphRuntime {
       fiber.lifecycleStatus = fiber.engine.getStatus();
     }
 
+    this.releaseRollbackFiberResources(fiber, cleanupErrors);
     this.finalizeRollback(primaryError, cleanupErrors);
+  }
+
+  /**
+   * Disposes construction-journal bus wiring and clears the bound ref after
+   * children + parent cleanup. Kept separate so async failed-cleanup can share it.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber being rolled back
+   * @param {Error[]} cleanupErrors - accumulated cleanup errors
+   * @returns {void}
+   */
+  private releaseRollbackFiberResources (
+    fiber: RuntimeFiber<unknown>,
+    cleanupErrors: Error[],
+  ): void {
+    const journal = fiber.constructionJournal;
+    if (journal === undefined) {
+      return;
+    }
+
+    if (journal.busWiringAttached === true) {
+      try {
+        this.disposeEffectableRuntimeBusWiring(fiber);
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+      journal.busWiringAttached = false;
+    }
+
+    if (journal.refBound === true && fiber.vnode.ref !== undefined && journal.refOwner !== undefined) {
+      try {
+        this.commitRef(fiber.vnode.ref, journal.refOwner, undefined, null);
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+      journal.refBound = false;
+    }
   }
 
   /**
