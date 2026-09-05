@@ -97,6 +97,12 @@ const ConnectedFeedsWithCreators = connect(undefined, {
 4. Store emits (if `mapStateToProps` is present) → merge → `setState` → `onUpdate`.
 5. `onUnmount` — unsubscribe and `super.onUnmount`.
 
+### Remount and class-field lifecycle
+
+- **Same-instance remount** (GraphRuntime reuses the connected instance): mount flags and generation reset so store wiring and the post-mount kick-off run again; stale async `onMount` from a prior generation is ignored; stale `__connectStateProps` are cleared and the context store is re-resolved when needed.
+- **Class-field hooks:** declaring `onMount` / `onUnmount` as class fields (own instance properties) does **not** skip connect subscribe / unsubscribe — the HOC still wraps lifecycle through its wiring path.
+- **Subscribe failures:** errors from `mapStateToProps` subscription fail the mount (tear-down guards apply).
+
 ### Migration note (post-mount kick-off)
 
 - **Behavior:** every connected component with `mapStateToProps` and/or `mapDispatchToProps` gets one extra

@@ -75,6 +75,8 @@ const dispatch = applyMiddleware(
 );
 ```
 
+**Construction invariant:** calling `api.dispatch` while middleware factories are still running throws (wrap-mode and enhancer-style). Matches the Redux “do not dispatch while constructing your middleware” rule.
+
 **Middleware signature:**
 
 ```typescript

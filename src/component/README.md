@@ -78,6 +78,10 @@ public override compose(): VirtualServiceNode[] {
 
 `GraphRuntime.unmount()` tears the tree down children-before-parent. By default the returned promise **resolves** even if cleanup or `onUnmount` fails (best-effort). Pass `{ rejectOnCleanupError: true }` to reject with `Error` (one failure) or `AggregateError` (several). `bootstrap().shutdown()` forwards the same option to `unmount()` and uses the same default.
 
+### GraphRuntime fail-safe
+
+Unrecoverable errors during reconcile or automatic dirty-fiber flush **fail-stop** the runtime: state becomes `FAILED`, the tree is torn down children→parent, and later `reconcile` rejects. `onAutoReconcileError` is optional observability — if the observer throws, fail-stop still runs. Dirty flush is gated on `ACTIVE` + an idle operation queue; `setState` during child materialization is buffered until the pass completes. UPDATE refs commit only after successful compose; compose/key rollback does not leave phantom parent `onUnmount` calls.
+
 ## Example: class without connect, without GraphRuntime
 
 ```typescript

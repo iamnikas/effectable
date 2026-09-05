@@ -282,6 +282,9 @@ function unwindDisposers (disposers: Array<() => void>): { primaryError?: Error;
  * are unwound in reverse order and the wiring error is rethrown. The returned disposer is idempotent
  * and continues cleanup even if an individual disposer throws.
  *
+ * EventBus fan-out: every distinct `@OnEvent` method for the same type is subscribed (unlike
+ * Command/Query last-write-wins). Delivery itself uses {@link EventBus.publish} handler snapshots.
+ *
  * @template TCommand
  * @template TQuery
  * @template TEvent

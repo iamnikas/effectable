@@ -82,6 +82,10 @@ function dispatchWhileConstructing (_action: unknown): unknown {
  * 2. `applyMiddleware(...middlewares)` — legacy enhancer-style for compatibility
  * 3. Middleware may arrive as default-export functions from slice modules.
  *
+ * Construction invariant (both modes): while middleware factories run, `api.dispatch`
+ * must not reach `rawDispatch` or a half-built chain. Calling `dispatch` during
+ * construction throws (Redux-compatible). Applies to wrap-mode and enhancer-style.
+ *
  * Wrap-mode overload is first so `applyMiddleware(api, rawDispatch, ...)` is not
  * parsed as enhancer-style rest middlewares.
  */

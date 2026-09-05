@@ -1,6 +1,11 @@
 /**
  * Lightweight event bus implementation.
  *
+ * Delivery contract: each `publish` snapshots typed and any-handlers before invoke so a
+ * subscriber that unsubscribes mid-delivery cannot silently skip a not-yet-called handler
+ * for the current event. Combined with `wireRuntimeBuses` EventBus fan-out (every distinct
+ * `@OnEvent` method for a type receives the event), this is the public delivery guarantee.
+ *
  * @module Effectable/runtime/EventBus
  */
 
@@ -8,6 +13,8 @@ import type { EventHandler, RuntimeEvent } from './types';
 
 /**
  * Event bus with per-type and global subscriptions.
+ *
+ * {@link EventBus.publish} uses handler snapshots; see the module overview for the delivery contract.
  */
 export class EventBus<TEvent extends RuntimeEvent = RuntimeEvent> {
   private readonly handlersByType = new Map<string, Set<EventHandler<TEvent>>>();
@@ -15,6 +22,11 @@ export class EventBus<TEvent extends RuntimeEvent = RuntimeEvent> {
 
   /**
    * Publishes an event to all matching subscribers.
+   *
+   * Snapshots both the typed-handler set and the any-handler set before invoke. Mid-publish
+   * unsubscribe cannot drop a not-yet-called handler for this event; any-handlers are
+   * snapshotted before typed handlers run so a typed handler cannot remove an any-handler
+   * from the current delivery.
    *
    * @param {TEvent} event - runtime event
    * @returns {void}

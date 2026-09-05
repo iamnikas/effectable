@@ -10,8 +10,17 @@
  * - Inject contexts (@UseContext) and bind refs on mount.
  * - Pass updated props into existing instances during reconcile.
  * - Serialize all graph operations through a single operation queue.
- * - Fail-stop on unrecoverable errors: mark runtime FAILED, reject later reconcile,
- *   unmount stays safe.
+ *
+ * Fail-safe contracts (public behavior):
+ * - Unrecoverable reconcile / dirty-flush errors **fail-stop**: mark runtime FAILED, tear the
+ *   tree down children→parent, reject later `reconcile`. `onAutoReconcileError` is best-effort
+ *   observability — a throwing observer cannot skip fail-stop.
+ * - Dirty flush runs only while ACTIVE and the operation queue is idle; `setState` during child
+ *   materialization is buffered and applied after the mount/reconcile pass.
+ * - UPDATE `commitRef` runs only after successful compose + child reconcile; compose/key
+ *   validation failure rolls back the fiber (including premount hooks) without leaving phantoms.
+ * - Failed cleanup is children-first and does not invoke a phantom parent `onUnmount`.
+ * - Orphan DELETE finalize is best-effort so survivors are not fail-stopped for cleanup noise.
  *
  * Current limitations:
  * - Work loop is synchronous (no priority lanes — next increment).
@@ -142,6 +151,9 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
 
 /**
  * Runtime engine for a declarative component tree.
+ *
+ * After fail-stop the instance is terminal (`FAILED`): further `reconcile` rejects;
+ * `unmount` remains safe. See the module overview for the fail-safe contracts.
  *
  * Usage:
  * ```typescript

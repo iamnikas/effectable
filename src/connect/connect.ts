@@ -6,6 +6,15 @@
  * Third argument: full function `(dispatch, props) => …`, short `(dispatch) => …`,
  * or an object of action creators `{ key: (...args) => action }` (see `resolveMapDispatchProps`).
  *
+ * Correctness contracts (public behavior, no signature change):
+ * - Same-instance remount resets mount flags / generation so store wiring and post-mount kick-off
+ *   run again; stale async `onMount` from a previous generation is ignored.
+ * - Remount clears stale mapped state props and re-resolves the context store when needed.
+ * - Class-field `onMount` / `onUnmount` (own instance properties) still go through connect wiring
+ *   and do not shadow store subscribe / unsubscribe.
+ * - `mapStateToProps` subscribe failures fail the mount; mapDispatch-only hosts still get the
+ *   post-mount kick-off after a successful mount.
+ *
  * @module Effectable/connect/connect
  */
 
@@ -723,6 +732,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
  * Supports two forms:
  * - `connect(store, mapState?, mapDispatch?)` for a root connected component;
  * - `connect(mapState?, mapDispatch?)` for a child connected component that receives the store from context.
+ *
+ * Remount and class-field lifecycle follow the module contracts above (identity-safe wiring,
+ * no skipped subscribe/unsubscribe when hooks are declared as class fields).
  *
  * @template S store state type
  * @template P props type of the connected component
