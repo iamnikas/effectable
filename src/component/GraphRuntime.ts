@@ -1812,14 +1812,115 @@ export class GraphRuntime {
     );
 
     if (isThenable(childrenRes)) {
-      return childrenRes.then((nextChildren) => {
-        this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
-        return current;
-      });
+      return childrenRes.then(
+        (nextChildren) => {
+          try {
+            this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
+            return current;
+          } catch (error: unknown) {
+            // commitRef (or later apply steps) can throw AFTER reconcileChildren
+            // already materialised PLACE/REPLACE nodes that are not yet linked to
+            // current.children. failStop only walks the old tree — orphans leak.
+            const cleanupResult = this.failUpdateAfterChildrenReconciled(
+              current as RuntimeFiber<unknown>,
+              nextChildren,
+              error,
+            );
+            if (isThenable(cleanupResult)) {
+              return cleanupResult.then(() => {
+                throw error;
+              });
+            }
+            throw error;
+          }
+        },
+        (error: unknown) => {
+          const cleanupResult = this.runFiberFailedCleanup(
+            current as RuntimeFiber<unknown>,
+            error,
+          );
+          if (isThenable(cleanupResult)) {
+            return cleanupResult.then(() => {
+              throw error;
+            });
+          }
+          throw error;
+        },
+      );
     }
 
-    this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, childrenRes);
-    return current;
+    try {
+      this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, childrenRes);
+      return current;
+    } catch (error: unknown) {
+      const cleanupResult = this.failUpdateAfterChildrenReconciled(
+        current as RuntimeFiber<unknown>,
+        childrenRes,
+        error,
+      );
+      if (isThenable(cleanupResult)) {
+        return cleanupResult.then(() => {
+          throw error;
+        });
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * After `reconcileChildren` succeeded but `applyFiberUpdate` failed (typically
+   * `commitRef` throw): destroy PLACE/REPLACE fibers in `nextChildren` that are not
+   * identity-in `fiber.children`, then {@link runFiberFailedCleanup} on the update fiber.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber whose update failed after children reconciled
+   * @param {RuntimeFiber<unknown>[]} nextChildren - reconciled child list (may include orphans)
+   * @param {unknown} error - apply/commit error
+   * @returns {void | Promise<void>}
+   */
+  private failUpdateAfterChildrenReconciled (
+    fiber: RuntimeFiber<unknown>,
+    nextChildren: RuntimeFiber<unknown>[],
+    error: unknown,
+  ): void | Promise<void> {
+    const previousChildren = fiber.children as RuntimeFiber<unknown>[];
+    const previousSet = new Set(previousChildren);
+    const orphanErrors: Error[] = [];
+
+    const destroyOrphansFrom = (index: number): void | Promise<void> => {
+      for (let i = index; i < nextChildren.length; i += 1) {
+        const child = nextChildren[i] as RuntimeFiber<unknown>;
+        if (previousSet.has(child)) {
+          continue;
+        }
+        try {
+          const destroyRes = this.destroyFiber(child, orphanErrors);
+          if (isThenable(destroyRes)) {
+            return destroyRes.then(
+              () => destroyOrphansFrom(i + 1),
+              (err: unknown) => {
+                orphanErrors.push(err instanceof Error ? err : new Error(String(err)));
+                return destroyOrphansFrom(i + 1);
+              },
+            );
+          }
+        } catch (err: unknown) {
+          orphanErrors.push(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+
+      if (
+        orphanErrors.length > 0 &&
+        error instanceof Error
+      ) {
+        const existing = (error as Error & { rollbackErrors?: Error[] }).rollbackErrors;
+        (error as Error & { rollbackErrors?: Error[] }).rollbackErrors =
+          existing !== undefined ? existing.concat(orphanErrors) : orphanErrors.slice();
+      }
+
+      return this.runFiberFailedCleanup(fiber, error);
+    };
+
+    return destroyOrphansFrom(0);
   }
 
   /**
