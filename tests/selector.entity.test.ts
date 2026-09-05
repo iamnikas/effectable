@@ -358,3 +358,28 @@ describe('multi-input selectors, structured selector, and params memoization', (
     expect(selectObj.recomputations()).toBe(1);
   });
 });
+
+describe('createSelector combiner throw must not poison memo cache', () => {
+  it('retry after combiner throw for the same inputs throws again (no stale hit)', () => {
+    const selectDoubled = createSelector(
+      (s: CounterState) => s.count,
+      (count) => {
+        if (count === 2) {
+          throw new Error('combiner-boom');
+        }
+        return count * 10;
+      },
+    );
+
+    expect(selectDoubled({ count: 1 })).toBe(10);
+
+    expect(() => selectDoubled({ count: 2 })).toThrow('combiner-boom');
+    // Bug: defaultMemoize updated lastArg before func threw, so the next call with
+    // count===2 shallow-equal-hit and returned the stale 10 from count===1.
+    expect(() => selectDoubled({ count: 2 })).toThrow('combiner-boom');
+
+    expect(selectDoubled({ count: 3 })).toBe(30);
+    // Successful computes only: count=1 and count=3 (throws do not commit cache).
+    expect(selectDoubled.recomputations()).toBe(2);
+  });
+});

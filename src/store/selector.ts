@@ -45,10 +45,14 @@ function defaultMemoize<F extends (arg: any) => any> (func: F): MemoizationResul
   let recomputationCount = 0;
 
   const memoized = (arg: any) => {
-    // If never called or the argument changed — recompute
+    // If never called or the argument changed — recompute.
+    // Only commit cache slots after `func` succeeds: if `func` throws after
+    // `lastArg` was already updated, a later call with the same arg would
+    // shallow-equal-hit and return a stale `lastResult` (silent wrong value).
     if (!called || !shallowEqual(arg, lastArg)) {
+      const nextResult = func(arg);
       lastArg = arg;
-      lastResult = func(arg);
+      lastResult = nextResult;
       called = true;
       recomputationCount++;
     }
