@@ -126,6 +126,34 @@ class ParentWithCleanupFailures extends Component<Record<string, never>, Record<
   }
 }
 
+class ParentTrackingUnmountWithoutMount extends Component<
+  Record<string, never>,
+  { childBFailsOnMount?: boolean }
+> {
+  public static mountCount = 0;
+  public static unmountCount = 0;
+
+  public static reset (): void {
+    ParentTrackingUnmountWithoutMount.mountCount = 0;
+    ParentTrackingUnmountWithoutMount.unmountCount = 0;
+  }
+
+  public override onMount (): void {
+    ParentTrackingUnmountWithoutMount.mountCount += 1;
+  }
+
+  public override onUnmount (): void {
+    ParentTrackingUnmountWithoutMount.unmountCount += 1;
+  }
+
+  public override compose () {
+    return [
+      h(ChildA),
+      h(ChildB, { shouldFailOnMount: this.props.childBFailsOnMount }),
+    ];
+  }
+}
+
 describe('GraphRuntime materialization rollback (issue #12)', () => {
   describe('synchronous child failure', () => {
     it('SYNC-CHILD: later sync child constructor fails → earlier sibling unmounted', async () => {
@@ -152,6 +180,26 @@ describe('GraphRuntime materialization rollback (issue #12)', () => {
 
       expect(error).not.toBeNull();
       expect(error?.message).toBe('ChildB onMount failure');
+    });
+
+    it('PARENT-NOT-MOUNTED: later child onMount fails → parent onUnmount must not run', async () => {
+      ParentTrackingUnmountWithoutMount.reset();
+      let error: Error | null = null;
+
+      try {
+        await GraphRuntime.mount(
+          h(ParentTrackingUnmountWithoutMount, { childBFailsOnMount: true }),
+        );
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).not.toBeNull();
+      expect(error?.message).toBe('ChildB onMount failure');
+      // Parent never reached runStartup / onMount (children mount first).
+      expect(ParentTrackingUnmountWithoutMount.mountCount).toBe(0);
+      // Regression: rollback used wasMounted=true and called onUnmount anyway.
+      expect(ParentTrackingUnmountWithoutMount.unmountCount).toBe(0);
     });
   });
 

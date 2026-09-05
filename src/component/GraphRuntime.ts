@@ -511,11 +511,16 @@ export class GraphRuntime {
       }
     }
 
-    // 4. Run failed-startup cleanup (if instance exists)
+    // 4. Run failed-startup cleanup (if instance exists).
+    // `wasMounted` must reflect whether this fiber completed startup. Passing
+    // `true` unconditionally called `onUnmount` for parents that never ran
+    // `onMount` (e.g. a later sibling's materialize threw during the parent's
+    // child loop). `schedulerHookAttached` is set only after successful startup.
     let cleanupPromise: Promise<void> | null = null;
     if (instance !== null) {
       try {
-        const cleanupRes = fiber.engine.runFailedCleanup(instance, true);
+        const wasMounted = journal.schedulerHookAttached === true;
+        const cleanupRes = fiber.engine.runFailedCleanup(instance, wasMounted);
         if (isThenable(cleanupRes)) {
           cleanupPromise = cleanupRes;
         }
