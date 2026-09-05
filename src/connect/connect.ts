@@ -643,6 +643,17 @@ function buildConnectHoc<S, P, R, A extends Action> (
             // Post-mount selector errors terminate this subscription (RxJS contract).
             // The component keeps last mapped props; callers should treat mapper throws as bugs.
           },
+          complete: () => {
+            // Destroyed store (or any completed-without-next select): BehaviorSubject.complete()
+            // means new subscribers get complete only — no first `next`. Without this, connect
+            // would return successfully, skip user onMount, and leave GraphRuntime ACTIVE.
+            if (this.__connectFirstPass || !this.__connectMountCompleted) {
+              syncSubscribeError = new Error(
+                '[Effectable.connect] Store select completed before the first state emission ' +
+                '(store may have been destroyed).'
+              );
+            }
+          },
         });
 
         if (this.__connectMountGeneration !== mountGeneration) {
