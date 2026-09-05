@@ -548,7 +548,10 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this.__connectOwnProps as unknown as P
         );
 
-        this.__connectSubscription = store.select(selector).subscribe({
+        // BehaviorSubject emits synchronously inside subscribe(), so super.onMount may
+        // run onUnmount / nested onMount before this assignment. Capture the Subscription
+        // first; only install it if this mount generation is still current.
+        const subscription = store.select(selector).subscribe({
           next: (mapped: R) => {
             this.applyMappedStateProps(mapped);
 
@@ -622,6 +625,28 @@ function buildConnectHoc<S, P, R, A extends Action> (
             // The component keeps last mapped props; callers should treat mapper throws as bugs.
           },
         });
+
+        // Nested remount during sync first next bumped generation and installed its own sub.
+        // Do not overwrite it with this superseded Subscription.
+        if (this.__connectMountGeneration !== mountGeneration) {
+          subscription.unsubscribe();
+          if (syncFirstPassError !== null) {
+            throw syncFirstPassError;
+          }
+          return;
+        }
+
+        this.__connectSubscription = subscription;
+
+        // onUnmount during sync first next left tornDown set while sub was still null —
+        // dispose now that the Subscription exists.
+        if (this.__connectTornDown) {
+          this.disposeConnectSubscription();
+          if (syncFirstPassError !== null) {
+            throw syncFirstPassError;
+          }
+          return;
+        }
 
         if (syncFirstPassError !== null) {
           this.disposeConnectSubscription();
