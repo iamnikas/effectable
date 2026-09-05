@@ -210,6 +210,11 @@ function buildConnectHoc<S, P, R, A extends Action> (
       private __connectDeliveredUpdateAfterMount = false;
       /** Kick-off via `queueMicrotask` has already been queued (exactly once per mount). */
       private __connectKickoffScheduled = false;
+      /**
+       * Set in `onUnmount` so an in-flight async `super.onMount` cannot call
+       * `completeConnectMount` / `deliverConnectUpdate` after teardown.
+       */
+      private __connectTornDown = false;
       private __connectStore: Store<S, A> | null = explicitStore;
       private __connectStoreFromContext: unknown = undefined;
       private __connectOwnProps: Record<string, unknown>;
@@ -273,6 +278,13 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * @returns {void}
        */
       private completeConnectMount (): void {
+        // Unmounted while async super.onMount was still pending: drop deferred work.
+        if (this.__connectTornDown) {
+          this.__connectPendingUpdate = false;
+          this.__connectMountCompleted = false;
+          return;
+        }
+
         this.__connectMountCompleted = true;
 
         if (this.__connectPendingUpdate) {
@@ -457,6 +469,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * @returns {void | Promise<void>} synchronously or a Promise if the superclass `onMount` is async
        */
       public override onMount (): void | Promise<void> {
+        this.__connectTornDown = false;
         const store = this.resolveConnectStore();
         this.refreshDispatchProps(store);
 
@@ -471,6 +484,11 @@ function buildConnectHoc<S, P, R, A extends Action> (
            * @returns {void}
            */
           const finishDispatchOnlyMount = (): void => {
+            // Unmounted while async super.onMount was still pending: do not revive kick-off.
+            if (this.__connectTornDown) {
+              return;
+            }
+
             this.__connectMountCompleted = true;
             if (mapDispatchToProps != null) {
               this.schedulePostMountKickoff();
@@ -501,57 +519,86 @@ function buildConnectHoc<S, P, R, A extends Action> (
         // this.__connectSubscription is assigned (subscribe has not yet returned a Subscription) —
         // store the error and dispose after assignment, without rethrowing inside RxJS next.
         let syncFirstPassError: unknown = null;
+        // Selector / mapStateToProps throw during subscribe (first BehaviorSubject emission)
+        // or before mount completes: surface as onMount failure instead of a zombie ACTIVE tree.
+        let syncSubscribeError: unknown = null;
 
         const selector = (state: S): R => mapStateToProps(
           state,
           this.__connectOwnProps as unknown as P
         );
 
-        this.__connectSubscription = store.select(selector).subscribe((mapped: R) => {
-          this.applyMappedStateProps(mapped);
+        this.__connectSubscription = store.select(selector).subscribe({
+          next: (mapped: R) => {
+            this.applyMappedStateProps(mapped);
 
-          if (this.__connectFirstPass) {
-            this.__connectFirstPass = false;
+            if (this.__connectFirstPass) {
+              this.__connectFirstPass = false;
 
-            if (!hasSuperOnMount) {
-              this.completeConnectMount();
+              if (!hasSuperOnMount) {
+                this.completeConnectMount();
+                return;
+              }
+
+              let mountResult: void | Promise<void>;
+              try {
+                mountResult = (superOnMount as () => void | Promise<void>).call(this);
+              } catch (error) {
+                syncFirstPassError = error;
+                return;
+              }
+
+              if (!isPromiseLike(mountResult)) {
+                this.completeConnectMount();
+                return;
+              }
+
+              pendingMountResult = Promise.resolve(mountResult as Promise<void>).then(() => {
+                if (syncSubscribeError !== null) {
+                  this.disposeConnectSubscription();
+                  this.__connectPendingUpdate = false;
+                  throw syncSubscribeError;
+                }
+                this.completeConnectMount();
+              }, (error: unknown) => {
+                this.disposeConnectSubscription();
+                this.__connectPendingUpdate = false;
+                throw error;
+              });
               return;
             }
 
-            let mountResult: void | Promise<void>;
-            try {
-              mountResult = (superOnMount as () => void | Promise<void>).call(this);
-            } catch (error) {
-              syncFirstPassError = error;
+            if (this.__connectTornDown) {
               return;
             }
 
-            if (!isPromiseLike(mountResult)) {
-              this.completeConnectMount();
+            if (!this.__connectMountCompleted) {
+              this.__connectPendingUpdate = true;
               return;
             }
 
-            pendingMountResult = Promise.resolve(mountResult as Promise<void>).then(() => {
-              this.completeConnectMount();
-            }, (error: unknown) => {
-              this.disposeConnectSubscription();
-              this.__connectPendingUpdate = false;
-              throw error;
-            });
-            return;
-          }
-
-          if (!this.__connectMountCompleted) {
-            this.__connectPendingUpdate = true;
-            return;
-          }
-
-          this.deliverConnectUpdate();
+            this.deliverConnectUpdate();
+          },
+          error: (error: unknown) => {
+            // First-pass or pre-complete failures must fail mount (handled after subscribe returns
+            // when sync, or via the pending mount promise when async).
+            if (this.__connectFirstPass || !this.__connectMountCompleted) {
+              syncSubscribeError = error;
+              return;
+            }
+            // Post-mount selector errors terminate this subscription (RxJS contract).
+            // The component keeps last mapped props; callers should treat mapper throws as bugs.
+          },
         });
 
         if (syncFirstPassError !== null) {
           this.disposeConnectSubscription();
           throw syncFirstPassError;
+        }
+
+        if (syncSubscribeError !== null) {
+          this.disposeConnectSubscription();
+          throw syncSubscribeError;
         }
 
         if (pendingMountResult !== null) {
@@ -565,9 +612,11 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * @returns {void | Promise<void>}
        */
       public override onUnmount (): void | Promise<void> {
-        this.disposeConnectSubscription();
-        // Cancels a pending post-mount kick-off (mapDispatch-only has no subscription).
+        this.__connectTornDown = true;
+        this.__connectPendingUpdate = false;
+        // Cancels a pending post-mount kick-off (mapDispatch-only has no subscription to null out).
         this.__connectMountCompleted = false;
+        this.disposeConnectSubscription();
 
         const superOnUnmount = (Constructor.prototype as Record<string, unknown>)['onUnmount'];
         if (typeof superOnUnmount !== 'function') {
