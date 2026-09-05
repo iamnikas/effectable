@@ -555,7 +555,12 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this.__connectOwnProps as unknown as P
         );
 
-        this.__connectSubscription = store.select(selector).subscribe({
+        // Assign only AFTER subscribe returns. BehaviorSubject emits the first `next`
+        // synchronously inside subscribe(), so super.onMount / onUnmount can run while
+        // `__connectSubscription` is still null — disposeConnectSubscription would no-op.
+        // If tear-down or a nested remount happened during that first pass, drop this
+        // subscription instead of clobbering a newer `__connectSubscription` (zombie / double-sub).
+        const subscription = store.select(selector).subscribe({
           next: (mapped: R) => {
             this.applyMappedStateProps(mapped);
 
@@ -630,13 +635,25 @@ function buildConnectHoc<S, P, R, A extends Action> (
           },
         });
 
+        if (this.__connectTornDown || this.__connectMountGeneration !== mountGeneration) {
+          subscription.unsubscribe();
+        } else {
+          this.__connectSubscription = subscription;
+        }
+
+        // Dispose only when this mount generation still owns the instance. A nested remount
+        // during the first pass may already hold a newer live subscription.
         if (syncFirstPassError !== null) {
-          this.disposeConnectSubscription();
+          if (this.__connectMountGeneration === mountGeneration) {
+            this.disposeConnectSubscription();
+          }
           throw syncFirstPassError;
         }
 
         if (syncSubscribeError !== null) {
-          this.disposeConnectSubscription();
+          if (this.__connectMountGeneration === mountGeneration) {
+            this.disposeConnectSubscription();
+          }
           throw syncSubscribeError;
         }
 
