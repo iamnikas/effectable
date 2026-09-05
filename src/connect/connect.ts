@@ -573,11 +573,6 @@ function buildConnectHoc<S, P, R, A extends Action> (
           return;
         }
 
-        let pendingMountResult: void | Promise<void> | null = null;
-        // A sync throw in super.onMount on the first pass happens before
-        // this.__connectSubscription is assigned (subscribe has not yet returned a Subscription) —
-        // store the error and dispose after assignment, without rethrowing inside RxJS next.
-        let syncFirstPassError: unknown = null;
         // Selector / mapStateToProps throw during subscribe (first BehaviorSubject emission)
         // or before mount completes: surface as onMount failure instead of a zombie ACTIVE tree.
         let syncSubscribeError: unknown = null;
@@ -587,60 +582,20 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this.__connectOwnProps as unknown as P
         );
 
-        // Capture the Subscription before assigning to the instance field. The first
-        // BehaviorSubject emission runs `super.onMount` synchronously inside `subscribe()`,
-        // so the user may call `onUnmount` / nested `onMount` while `__connectSubscription`
-        // is still null. Assigning blindly after `subscribe()` returns would resurrect a
-        // torn-down subscription or overwrite a newer remount's handle (leaking the new one).
+        // First select emission only applies mapped props. User `onMount` runs AFTER
+        // `subscribe()` returns so a nested `dispatch` + throwing `mapStateToProps` is not a
+        // reentrant observer error (RxJS `reportUnhandledError` / process crash) and cannot
+        // orphan a Promise that `onMount` never returned to the caller.
+        //
+        // Capture the Subscription locally before assigning to the instance field (#83): a
+        // teardown or nested remount during the sync first emission must not resurrect a
+        // disposed handle or overwrite a newer remount's subscription.
         const subscription = store.select(selector).subscribe({
           next: (mapped: R) => {
             this.applyMappedStateProps(mapped);
 
             if (this.__connectFirstPass) {
               this.__connectFirstPass = false;
-
-              if (!hasSuperOnMount) {
-                this.completeConnectMount();
-                return;
-              }
-
-              let mountResult: void | Promise<void>;
-              try {
-                mountResult = (superOnMount as () => void | Promise<void>).call(this);
-              } catch (error) {
-                syncFirstPassError = error;
-                return;
-              }
-
-              if (!isPromiseLike(mountResult)) {
-                // Nested store emit during sync super.onMount may have already errored the
-                // subscription (mapState throw). Do not complete mount / deliver onUpdate
-                // before the post-subscribe rethrow — that ordered onUpdate before failed cleanup.
-                if (syncSubscribeError !== null) {
-                  return;
-                }
-                this.completeConnectMount();
-                return;
-              }
-
-              pendingMountResult = Promise.resolve(mountResult as Promise<void>).then(() => {
-                if (this.__connectMountGeneration !== mountGeneration) {
-                  return;
-                }
-                if (syncSubscribeError !== null) {
-                  this.disposeConnectSubscription();
-                  this.__connectPendingUpdate = false;
-                  throw syncSubscribeError;
-                }
-                this.completeConnectMount();
-              }, (error: unknown) => {
-                if (this.__connectMountGeneration !== mountGeneration) {
-                  throw error;
-                }
-                this.disposeConnectSubscription();
-                this.__connectPendingUpdate = false;
-                throw error;
-              });
               return;
             }
 
@@ -674,24 +629,72 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this.__connectSubscription = subscription;
           if (
             this.__connectTornDown ||
-            syncFirstPassError !== null ||
             syncSubscribeError !== null
           ) {
             this.disposeConnectSubscription();
           }
         }
 
-        if (syncFirstPassError !== null) {
-          throw syncFirstPassError;
-        }
-
         if (syncSubscribeError !== null) {
           throw syncSubscribeError;
         }
 
-        if (pendingMountResult !== null) {
-          return pendingMountResult;
+        // Nested remount during subscribe owns the instance — do not run this mount's onMount.
+        if (this.__connectMountGeneration !== mountGeneration) {
+          return;
         }
+
+        if (!hasSuperOnMount) {
+          this.completeConnectMount();
+          return;
+        }
+
+        let mountResult: void | Promise<void>;
+        try {
+          mountResult = (superOnMount as () => void | Promise<void>).call(this);
+        } catch (error: unknown) {
+          this.disposeConnectSubscription();
+          throw error;
+        }
+
+        // Nested remount during user onMount owns the instance.
+        if (this.__connectMountGeneration !== mountGeneration) {
+          return;
+        }
+
+        // Nested store emit during sync super.onMount may have errored the subscription.
+        if (syncSubscribeError !== null) {
+          this.disposeConnectSubscription();
+          if (isPromiseLike(mountResult)) {
+            // Suppress orphan rejection — caller receives the syncSubscribeError throw instead.
+            void Promise.resolve(mountResult as Promise<void>).then(() => undefined, () => undefined);
+          }
+          throw syncSubscribeError;
+        }
+
+        if (!isPromiseLike(mountResult)) {
+          this.completeConnectMount();
+          return;
+        }
+
+        return Promise.resolve(mountResult as Promise<void>).then(() => {
+          if (this.__connectMountGeneration !== mountGeneration) {
+            return;
+          }
+          if (syncSubscribeError !== null) {
+            this.disposeConnectSubscription();
+            this.__connectPendingUpdate = false;
+            throw syncSubscribeError;
+          }
+          this.completeConnectMount();
+        }, (error: unknown) => {
+          if (this.__connectMountGeneration !== mountGeneration) {
+            throw error;
+          }
+          this.disposeConnectSubscription();
+          this.__connectPendingUpdate = false;
+          throw error;
+        });
       }
 
       /**
