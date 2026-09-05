@@ -511,24 +511,14 @@ export class GraphRuntime {
       }
     }
 
-    // 4. Run failed-startup cleanup (if instance exists)
-    let cleanupPromise: Promise<void> | null = null;
-    if (instance !== null) {
-      try {
-        const cleanupRes = fiber.engine.runFailedCleanup(instance, true);
-        if (isThenable(cleanupRes)) {
-          cleanupPromise = cleanupRes;
-        }
-      } catch (err: unknown) {
-        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
-      }
-    }
-
-    // 5. Destroy mounted children in reverse order.
+    // 4. Destroy mounted children in reverse order BEFORE parent onUnmount.
+    // Documented teardown contract is children → parent; running parent
+    // runFailedCleanup first left children alive during parent onUnmount and
+    // also called parent onUnmount when startup never ran (wasMounted=true).
     // Pass cleanupErrors so nested destroy is best-effort: a throwing
     // ref-clear/disposer on one grandchild must not skip remaining siblings.
     // Those nodes were never attached to currentRoot, so failStop cannot reclaim them.
-    const destroyChildrenAndFinalize = (): void | Promise<void> => {
+    const destroyChildrenThenParentCleanup = (): void | Promise<void> => {
       const children = journal.mountedChildren;
       for (let i = children.length - 1; i >= 0; i -= 1) {
         try {
@@ -540,6 +530,8 @@ export class GraphRuntime {
               destroyRes,
               primaryError,
               cleanupErrors,
+              fiber as RuntimeFiber<unknown>,
+              instance,
             );
           }
         } catch (err) {
@@ -547,21 +539,10 @@ export class GraphRuntime {
         }
       }
 
-      // 6. Finalize: attach cleanup errors to primary error
-      this.finalizeRollback(primaryError, cleanupErrors);
+      return this.finishRollbackParentCleanup(fiber, instance, primaryError, cleanupErrors);
     };
 
-    if (cleanupPromise !== null) {
-      return cleanupPromise.then(
-        () => destroyChildrenAndFinalize(),
-        (err) => {
-          cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
-          return destroyChildrenAndFinalize();
-        },
-      );
-    }
-
-    return destroyChildrenAndFinalize();
+    return destroyChildrenThenParentCleanup();
   }
 
   /**
@@ -572,6 +553,8 @@ export class GraphRuntime {
    * @param {Promise<void>} pending - Promise from destroying the previous child
    * @param {Error} primaryError - original materialization error
    * @param {Error[]} cleanupErrors - accumulated cleanup errors
+   * @param {RuntimeFiber<unknown>} fiber - parent fiber being rolled back
+   * @param {Component<unknown, unknown> | null} instance - parent instance (for post-child cleanup)
    * @returns {Promise<void>}
    */
   private async continueRollbackDestroyAsync (
@@ -580,6 +563,8 @@ export class GraphRuntime {
     pending: Promise<void>,
     primaryError: Error,
     cleanupErrors: Error[],
+    fiber: RuntimeFiber<unknown>,
+    instance: Component<unknown, unknown> | null,
   ): Promise<void> {
     try {
       await pending;
@@ -596,6 +581,58 @@ export class GraphRuntime {
       } catch (err: unknown) {
         cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
       }
+    }
+
+    const cleanupRes = this.finishRollbackParentCleanup(
+      fiber,
+      instance,
+      primaryError,
+      cleanupErrors,
+    );
+    if (isThenable(cleanupRes)) {
+      await cleanupRes;
+    }
+  }
+
+  /**
+   * After rollback destroyed children: run parent failed-cleanup only when startup
+   * actually ran (`status !== 'registered'`), then attach cleanup errors and rethrow.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - parent fiber being rolled back
+   * @param {Component<unknown, unknown> | null} instance - parent instance
+   * @param {Error} primaryError - original materialization error
+   * @param {Error[]} cleanupErrors - accumulated cleanup errors
+   * @returns {void | Promise<void>} always rejects via {@link finalizeRollback}
+   */
+  private finishRollbackParentCleanup (
+    fiber: RuntimeFiber<unknown>,
+    instance: Component<unknown, unknown> | null,
+    primaryError: Error,
+    cleanupErrors: Error[],
+  ): void | Promise<void> {
+    if (instance !== null) {
+      // `registered` ⇒ runStartup never entered; do not invent an onUnmount.
+      // `failed` (deferFailedCleanup) / other post-startup statuses ⇒ wasMounted.
+      const wasMounted = fiber.engine.getStatus() !== 'registered';
+      if (wasMounted) {
+        try {
+          const cleanupRes = fiber.engine.runFailedCleanup(instance, true);
+          if (isThenable(cleanupRes)) {
+            return cleanupRes.then(
+              () => {
+                this.finalizeRollback(primaryError, cleanupErrors);
+              },
+              (err: unknown) => {
+                cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+                this.finalizeRollback(primaryError, cleanupErrors);
+              },
+            );
+          }
+        } catch (err: unknown) {
+          cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+      fiber.lifecycleStatus = fiber.engine.getStatus();
     }
 
     this.finalizeRollback(primaryError, cleanupErrors);
@@ -955,7 +992,7 @@ export class GraphRuntime {
             fiber.children = nextChildren as Fiber[];
           },
           (error: unknown) => {
-            const cleanupResult = this.runFiberFailedCleanup(fiber);
+            const cleanupResult = this.runFiberFailedCleanup(fiber, error);
             if (isThenable(cleanupResult)) {
               return cleanupResult.then(() => {
                 throw error;
@@ -968,7 +1005,7 @@ export class GraphRuntime {
 
       fiber.children = childrenRes as Fiber[];
     } catch (error: unknown) {
-      const cleanupResult = this.runFiberFailedCleanup(fiber);
+      const cleanupResult = this.runFiberFailedCleanup(fiber, error);
       if (isThenable(cleanupResult)) {
         return cleanupResult.then(() => {
           throw error;
@@ -1448,7 +1485,7 @@ export class GraphRuntime {
     // Run lifecycle after all children are materialized.
     // Pre-mount hook was injected before children (covers ancestor setState
     // from descendant onMount and setState during this node's onMount).
-    const startupRes = engine.runStartup(instance);
+    const startupRes = engine.runStartup(instance, { deferFailedCleanup: true });
 
     if (isThenable(startupRes)) {
       return this.finalizeMaterializeAsync(fiber, engine, startupRes);
@@ -1560,7 +1597,7 @@ export class GraphRuntime {
     }
 
     // Pre-mount hook already injected at the start of materialize (before children).
-    const startupRes = engine.runStartup(instance);
+    const startupRes = engine.runStartup(instance, { deferFailedCleanup: true });
     const resolved = isThenable(startupRes) ? await startupRes : startupRes;
 
     if (!resolved.ok) {
@@ -1696,7 +1733,7 @@ export class GraphRuntime {
       try {
         contextChanged = injectContextFields(instance, parentScope);
       } catch (error: unknown) {
-        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>);
+        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
         if (isThenable(cleanupResult)) {
           return cleanupResult.then(() => {
             throw error;
@@ -1715,7 +1752,7 @@ export class GraphRuntime {
       try {
         instance.onUpdate(prevProps, instance.props);
       } catch (error: unknown) {
-        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>);
+        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
         if (isThenable(cleanupResult)) {
           return cleanupResult.then(() => {
             throw error;
@@ -1733,7 +1770,7 @@ export class GraphRuntime {
     try {
       nextChildVnodes = this.getChildVnodes(instance, nextVnode.children);
     } catch (error: unknown) {
-      const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>);
+      const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
       if (isThenable(cleanupResult)) {
         return cleanupResult.then(() => {
           throw error;
@@ -1761,13 +1798,19 @@ export class GraphRuntime {
   }
 
   /**
-   * Fiber cleanup after update/compose error: `runFailedCleanup` + bus dispose.
-   * Does not leave the node in `ready`.
+   * Fiber cleanup after update/compose error: destroy children first (children → parent),
+   * then `runFailedCleanup` + bus dispose. Does not leave the node in `ready`.
+   * Child destroy / disposer errors are attached to `primaryError.rollbackErrors` when provided
+   * so fail-stop observability still surfaces them (children are no longer destroyed in failStop).
    *
    * @param {RuntimeFiber<unknown>} fiber - fiber that failed
+   * @param {unknown} [primaryError] - originating error to attach cleanup failures onto
    * @returns {void | Promise<void>}
    */
-  private runFiberFailedCleanup (fiber: RuntimeFiber<unknown>): void | Promise<void> {
+  private runFiberFailedCleanup (
+    fiber: RuntimeFiber<unknown>,
+    primaryError?: unknown,
+  ): void | Promise<void> {
     const instance = fiber.instance;
     if (instance === null) {
       return;
@@ -1776,16 +1819,85 @@ export class GraphRuntime {
     this.clearUpdateHook(instance);
     this.dirtyFibers.delete(fiber);
 
-    const cleanupResult = fiber.engine.runFailedCleanup(instance, true);
-    if (isThenable(cleanupResult)) {
-      return cleanupResult.then(() => {
-        this.disposeEffectableRuntimeBusWiring(fiber);
-        fiber.lifecycleStatus = fiber.engine.getStatus();
-      });
+    const cleanupErrors: Error[] = [];
+    const children = fiber.children as RuntimeFiber<unknown>[];
+
+    const attachCleanupErrors = (): void => {
+      if (
+        cleanupErrors.length > 0 &&
+        primaryError instanceof Error
+      ) {
+        const existing = (primaryError as Error & { rollbackErrors?: Error[] }).rollbackErrors;
+        (primaryError as Error & { rollbackErrors?: Error[] }).rollbackErrors =
+          existing !== undefined ? existing.concat(cleanupErrors) : cleanupErrors.slice();
+      }
+    };
+
+    const finishParent = (): void | Promise<void> => {
+      fiber.children = [];
+      const cleanupResult = fiber.engine.runFailedCleanup(instance, true);
+      if (isThenable(cleanupResult)) {
+        return cleanupResult.then(
+          () => {
+            this.disposeEffectableRuntimeBusWiring(fiber);
+            fiber.lifecycleStatus = fiber.engine.getStatus();
+            attachCleanupErrors();
+          },
+          (err: unknown) => {
+            cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+            this.disposeEffectableRuntimeBusWiring(fiber);
+            fiber.lifecycleStatus = fiber.engine.getStatus();
+            attachCleanupErrors();
+            throw err;
+          },
+        );
+      }
+
+      this.disposeEffectableRuntimeBusWiring(fiber);
+      fiber.lifecycleStatus = fiber.engine.getStatus();
+      attachCleanupErrors();
+    };
+
+    for (let i = children.length - 1; i >= 0; i -= 1) {
+      try {
+        const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, cleanupErrors);
+        if (isThenable(destroyRes)) {
+          return destroyRes.then(
+            async () => {
+              for (let j = i - 1; j >= 0; j -= 1) {
+                try {
+                  const r = this.destroyFiber(children[j] as RuntimeFiber<unknown>, cleanupErrors);
+                  if (isThenable(r)) {
+                    await r;
+                  }
+                } catch (err: unknown) {
+                  cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+                }
+              }
+              return finishParent();
+            },
+            async (err: unknown) => {
+              cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+              for (let j = i - 1; j >= 0; j -= 1) {
+                try {
+                  const r = this.destroyFiber(children[j] as RuntimeFiber<unknown>, cleanupErrors);
+                  if (isThenable(r)) {
+                    await r;
+                  }
+                } catch (inner: unknown) {
+                  cleanupErrors.push(inner instanceof Error ? inner : new Error(String(inner)));
+                }
+              }
+              return finishParent();
+            },
+          );
+        }
+      } catch (err: unknown) {
+        cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
     }
 
-    this.disposeEffectableRuntimeBusWiring(fiber);
-    fiber.lifecycleStatus = fiber.engine.getStatus();
+    return finishParent();
   }
 
   /**
