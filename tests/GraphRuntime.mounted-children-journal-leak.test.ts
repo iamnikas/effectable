@@ -24,7 +24,7 @@ describe('GraphRuntime constructionJournal.mountedChildren leak', () => {
     }
 
     public override compose () {
-      return this.props.ids.map((id) => h(Child, { id, key: id }));
+      return this.props.ids.map((id) => h(Child, { id }, id));
     }
   }
 
