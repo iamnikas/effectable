@@ -5,6 +5,11 @@
  * Holds `state`, updates it via {@link Component.setState}, and after each update calls
  * {@link Component.onUpdate}.
  *
+ * **Single writer:** only {@link Component.setState} may change state after construction
+ * (triggers `onUpdate` and reconcile schedule). Direct `this.state = …` after init emits
+ * `console.warn`. Constructor init (`super(props, initial)` or `this.state = …` in the
+ * constructor body) is allowed without warning. If reconciliation is not needed, use a ref.
+ *
  * **Modes:**
  * - **Standalone** — `Component` as a lightweight stateful object without GraphRuntime: `setState`
  *   immediately leads to `onUpdate`, with no “only after mount” restriction.
@@ -32,6 +37,12 @@ import { SCHEDULE_UPDATE_HOOK } from './types';
 export type SetStateUpdate<S, P = unknown> =
   | Partial<S>
   | ((prevState: S, props: P) => Partial<S>);
+
+/** Warn text for forbidden direct `this.state =` after construction. */
+const DIRECT_STATE_ASSIGNMENT_WARN =
+  '[Effectable] Component: direct assignment to `state` is not supported. ' +
+  'Use `setState(...)` so `onUpdate` and reconcile run. ' +
+  'If you do not need reconciliation, store the value in a ref (`@UseRef`) instead of state.';
 
 /**
  * Abstract base class with state and lifecycle.
@@ -74,11 +85,37 @@ implements Lifecycle {
    */
   public static readonly mutableState: boolean = false;
 
-  /** Current instance state after the last assignment in {@link Component.setState}. */
-  public state: S;
+  /** Backing store for {@link Component.state}. Written only by init, setter, or {@link Component.setState}. */
+  #state: S;
+
+  /**
+   * When `true`, direct `this.state =` does not warn (constructor init window).
+   * Closed after the full `new` constructor chain finishes (microtask).
+   */
+  #allowDirectStateWrite: boolean;
 
   /** Instance inputs: filled by GraphRuntime, connect-HOC, or calling code. */
   public props: P;
+
+  /**
+   * Current instance state after the last commit in {@link Component.setState}
+   * (or constructor init). Read freely; do not assign after construction — use `setState`.
+   */
+  public get state (): S {
+    return this.#state;
+  }
+
+  /**
+   * Direct assignment after construction is forbidden: emits {@link console.warn} and still
+   * writes the backing store (no `onUpdate`, no reconcile). Prefer {@link Component.setState}.
+   * Allowed without warning during construction (`super(props, initial)` or subclass ctor body).
+   */
+  public set state (value: S) {
+    if (!this.#allowDirectStateWrite) {
+      console.warn(DIRECT_STATE_ASSIGNMENT_WARN);
+    }
+    this.#state = value;
+  }
 
   /**
    * @param {P} props Props available in the {@link Component.setState} callback and in the subclass.
@@ -86,7 +123,13 @@ implements Lifecycle {
    */
   constructor (props: P, initialState?: S) {
     this.props = props;
-    this.state = (initialState ?? {}) as S;
+    this.#allowDirectStateWrite = true;
+    this.#state = (initialState ?? {}) as S;
+    // Subclass constructor bodies run synchronously after `super()` and may assign `this.state`.
+    // Close the gate once the full `new` constructor chain has finished.
+    queueMicrotask(() => {
+      this.#allowDirectStateWrite = false;
+    });
   }
 
   /**
@@ -100,7 +143,7 @@ implements Lifecycle {
    * @returns {void}
    */
   public setState (update: SetStateUpdate<S, P>): void {
-    const prev = this.state;
+    const prev = this.#state;
     const delta = typeof update === 'function'
       ? (update as (prev: S, props: P) => Partial<S>)(prev, this.props)
       : update;
@@ -125,7 +168,7 @@ implements Lifecycle {
 
     // Shallow-copy previous state and delta to avoid mutating the original state
     const next = { ...prev, ...delta };
-    this.state = next as S;
+    this.#state = next as S;
     // State is already committed: always schedule even if onUpdate throws,
     // otherwise mounted compose/children stay stale after a successful write.
     try {
