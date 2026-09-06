@@ -428,10 +428,26 @@ export class GraphRuntime {
     if (previousRef !== undefined && previousRef !== nextRef && expectedPreviousOwner !== null) {
       this.clearRefSafe(previousRef, expectedPreviousOwner);
     }
-    
-    // Bind next ref to instance (Component | null → unknown | null, no cast)
+
+    // Bind next ref to instance (Component | null → unknown | null, no cast).
+    // Custom setters may assign `current` then throw. Without a catch, UPDATE ref-swap
+    // leaves the new ref holding the instance while `fiber.vnode.ref` still points at the
+    // previous ref object — fail-stop finalize clears only the old ref (zombie nextRef).
+    // Materialize assign-then-throw is covered by journal.refBound (#96); this path covers
+    // the UPDATE swap hole and is a safe no-op when the setter never assigned.
     if (nextRef !== undefined) {
-      nextRef.current = instance;
+      try {
+        nextRef.current = instance;
+      } catch (error: unknown) {
+        if (instance !== null) {
+          try {
+            this.clearRefSafe(nextRef, instance);
+          } catch {
+            // Best-effort: do not mask the original setter error.
+          }
+        }
+        throw error;
+      }
     }
   }
 
