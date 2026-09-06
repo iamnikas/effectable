@@ -484,13 +484,35 @@ export class GraphRuntime {
     // the previous ref object — fail-stop finalize clears only the old ref (zombie nextRef).
     // Materialize assign-then-throw is covered by journal.refBound (#96/#98); this path covers
     // the UPDATE swap hole and is a safe no-op when the setter never assigned.
+    //
+    // Same-ref + @UseImperativeHandle throw-BEFORE-assign is a separate hole:
+    // resolveRefCurrentValue replaces imperativeRefByOwner with a new handle before the
+    // setter runs; if the setter throws without storing, clearRefSafe compares ref.current
+    // (still the old handle) to the new map entry, skips clearing, then deletes the map —
+    // fail-stop finalize can no longer match and leaves a zombie handle in ref.current.
     if (nextRef !== undefined) {
+      const previousBoundHandle = instance !== null
+        ? this.imperativeRefByOwner.get(instance)
+        : undefined;
+      let nextValue: unknown;
+      let resolved = false;
       try {
-        nextRef.current = instance === null ? null : this.resolveRefCurrentValue(instance);
+        nextValue = instance === null ? null : this.resolveRefCurrentValue(instance);
+        resolved = true;
+        nextRef.current = nextValue;
       } catch (error: unknown) {
-        if (instance !== null) {
+        if (instance !== null && resolved) {
           try {
-            this.clearRefSafe(nextRef, instance);
+            if (nextRef.current === nextValue) {
+              // Setter assigned then threw — clear the new binding.
+              this.clearRefSafe(nextRef, instance);
+            } else if (previousBoundHandle !== undefined) {
+              // Setter threw before assign — restore prior handle so fail-stop can clear.
+              this.imperativeRefByOwner.set(instance, previousBoundHandle);
+            } else {
+              // resolve deleted any prior map entry (full-instance path); nothing to restore.
+              this.imperativeRefByOwner.delete(instance);
+            }
           } catch {
             // Best-effort: do not mask the original setter error.
           }
