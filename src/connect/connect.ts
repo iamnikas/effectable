@@ -257,6 +257,12 @@ function buildConnectHoc<S, P, R, A extends Action> (
        */
       private __connectTornDown = false;
       /**
+       * Set when the store observable completes (typically `store.destroy()`).
+       * Reconcile must not call `getState()` on a destroyed store — that throw fail-stops
+       * the entire GraphRuntime. Last mapped props are kept until unmount/remount.
+       */
+      private __connectStoreDestroyed = false;
+      /**
        * Bumped at the start of every `onMount`. Async `super.onMount` completions capture the
        * generation so a stale promise from a previous mount cannot complete / kick off after
        * remount cleared `__connectTornDown` while the new mount is still pending.
@@ -404,18 +410,36 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * After mount, props stay current via the store subscription and
        * {@link RUNTIME_PROPS_RECEIVER}; post-mount `applyToScope` only republishes the store.
        *
+       * After `store.destroy()`, skip live `getState()` / mapDispatch refresh — that throw
+       * would fail-stop the entire GraphRuntime on the next parent `setState`. Keep last
+       * mapped props and still publish the cached store reference for context identity.
+       *
        * @param {ContextScope} parentScope - parent scope
        * @returns {ContextScope} scope for child nodes
        */
       public applyToScope (parentScope: ContextScope): ContextScope {
-        const store = this.resolveConnectStore();
-        // Pre-mount only (#91): first compose runs before onMount, so own-props must
-        // be stripped / mapped here. Never re-sync on dirty/update flushes after mount —
-        // a mapDispatch factory that dispatches as a side effect would loop with select.
-        if (!this.__connectMountCompleted) {
-          this.syncConnectPropsBeforeCompose(store);
+        const store = this.tryResolveConnectStore();
+        if (store !== null) {
+          // Pre-mount only (#91): first compose runs before onMount, so own-props must
+          // be stripped / mapped here. Never re-sync on dirty/update flushes after mount —
+          // a mapDispatch factory that dispatches as a side effect would loop with select.
+          if (!this.__connectMountCompleted) {
+            this.syncConnectPropsBeforeCompose(store);
+          }
+          return extendScope(parentScope, CONNECT_STORE_CONTEXT, store);
         }
-        return extendScope(parentScope, CONNECT_STORE_CONTEXT, store);
+
+        // Destroyed store: do not call getState(); keep last mapped props.
+        if (this.__connectStoreDestroyed && this.__connectStore !== null) {
+          return extendScope(parentScope, CONNECT_STORE_CONTEXT, this.__connectStore);
+        }
+
+        // Missing store (never resolved) — same public error as before.
+        const resolved = this.resolveConnectStore();
+        if (!this.__connectMountCompleted) {
+          this.syncConnectPropsBeforeCompose(resolved);
+        }
+        return extendScope(parentScope, CONNECT_STORE_CONTEXT, resolved);
       }
 
       /**
@@ -464,7 +488,20 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * @returns {Store<S, A> | null}
        */
       private tryResolveConnectStore (): Store<S, A> | null {
+        // After store.destroy(), getState()/dispatch throw. Treat as unresolved for reconcile
+        // so RUNTIME_PROPS_RECEIVER rebuilds from last mapped props instead of fail-stopping.
+        if (this.__connectStoreDestroyed) {
+          return null;
+        }
+
         if (this.__connectStore !== null) {
+          // Belt-and-suspenders: if subscription was already dropped, complete may not run.
+          try {
+            this.__connectStore.getState();
+          } catch {
+            this.__connectStoreDestroyed = true;
+            return null;
+          }
           return this.__connectStore;
         }
 
@@ -613,6 +650,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
         // PR #59 reset only `__connectTornDown`; leaving `__connectFirstPass` false skipped
         // user `onMount` and froze store→props delivery (`__connectMountCompleted` never set).
         this.__connectTornDown = false;
+        this.__connectStoreDestroyed = false;
         this.__connectFirstPass = true;
         this.__connectKickoffScheduled = false;
         this.__connectDeliveredUpdateAfterMount = false;
@@ -725,6 +763,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
             // The component keeps last mapped props; callers should treat mapper throws as bugs.
           },
           complete: () => {
+            // store.destroy() completes select(); mark dead so later reconcile skips getState().
+            this.__connectStoreDestroyed = true;
+            this.__connectSubscription = null;
             // Destroyed store (or any completed-without-next select): BehaviorSubject.complete()
             // means new subscribers get complete only — no first `next`. Without this, connect
             // would return successfully, skip user onMount, and leave GraphRuntime ACTIVE.
