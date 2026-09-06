@@ -3773,6 +3773,7 @@ export class GraphRuntime {
         nextChildren,
         fullDiffOrphans,
         fullDiffReplaceVictims,
+        deferPendingBatchFlush,
       );
     } finally {
       this.pendingExclusiveHandoffFibers = previousExclusiveHandoff;
@@ -3794,6 +3795,7 @@ export class GraphRuntime {
    * @param {RuntimeFiber<unknown>[]} nextChildren - output buffer (mutated)
    * @param {RuntimeFiber<unknown>[]} fullDiffOrphans - unpaired current fibers
    * @param {RuntimeFiber<unknown>[]} fullDiffReplaceVictims - REPLACE victims
+   * @param {boolean} [deferPendingBatchFlush=false] - hold nested onUpdate/onMount for ancestor
    * @returns {Promise<RuntimeFiber<unknown>[]>}
    */
   private async reconcileChildrenFullDiffWithHandoff (
@@ -3807,6 +3809,7 @@ export class GraphRuntime {
     nextChildren: RuntimeFiber<unknown>[],
     fullDiffOrphans: RuntimeFiber<unknown>[],
     fullDiffReplaceVictims: RuntimeFiber<unknown>[],
+    deferPendingBatchFlush: boolean = false,
   ): Promise<RuntimeFiber<unknown>[]> {
     let unkeyedIdx = 0;
 
