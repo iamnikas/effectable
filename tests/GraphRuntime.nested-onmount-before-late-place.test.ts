@@ -2,7 +2,7 @@
  * Regression: Early UPDATE nested PLACE `onMount` publish must reach Late UPDATE
  * nested PLACE `@OnEvent` handlers.
  *
- * Sibling PLACE batches already defer onMount until later peers wire (#108 control).
+ * Sibling PLACE batches already defer onMount until later peers wire (control case).
  * But a nested PLACE under Early still flushed deferred lifecycle inside Early's own
  * `reconcileChildren` → `flushSiblingBatchHooks` — before Late nested PLACE registered
  * `@OnEvent`. Silent event loss (stable + full-diff).
