@@ -11,19 +11,23 @@ import {
   connect,
   createStore,
   createStructuredSelector,
-} from 'effectable';
+} from 'Effectable';
 
 describe('store/connect __proto__ key assignment safety', () => {
   test('createStructuredSelector: __proto__ selector stays an own result field', () => {
-    const selectors: Record<string, (s: { n: number }) => unknown> = Object.create(null);
+    type S = { n: number };
+    const selectors: Record<string, (s: S) => unknown> = Object.create(null) as Record<
+      string,
+      (s: S) => unknown
+    >;
     selectors['__proto__'] = () => ({ admin: true, role: 'root' });
     selectors['n'] = (s) => s.n;
 
-    const select = createStructuredSelector(selectors as {
-      __proto__: (s: { n: number }) => { admin: boolean; role: string };
-      n: (s: { n: number }) => number;
-    });
-    const result = select({ n: 1 }) as Record<string, unknown>;
+    // Index signature bags cannot name `__proto__` as a typed key; pass as Selector map.
+    const select = createStructuredSelector<S, Record<string, unknown>>(
+      selectors as { [key: string]: (state: S) => unknown },
+    );
+    const result = select({ n: 1 });
 
     expect(Object.keys(result).sort()).toEqual(['__proto__', 'n'].sort());
     expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
