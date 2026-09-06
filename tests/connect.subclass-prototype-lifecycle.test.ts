@@ -129,4 +129,69 @@ describe('connect subclass-of-Connected prototype lifecycle', () => {
     expect(selectorRuns - before).toBe(1);
     void inst.onUnmount?.();
   });
+
+  it('subclass prototype onMount wins over wrapped base class-field capture', async () => {
+    const store = makeStore();
+    const calls: string[] = [];
+
+    class Base extends Component<Record<string, never>, { n?: number }> {
+      public override onMount = (): void => {
+        calls.push('base-field');
+      };
+    }
+
+    const Connected = connect(store, (s: S) => ({ n: s.n }))(Base);
+
+    class Ext extends Connected {
+      public override onMount (): void {
+        calls.push(`ext:n=${String(this.props.n)}`);
+      }
+    }
+
+    const rt = await GraphRuntime.mount(h(Ext, {}));
+    expect(calls).toEqual(['ext:n=0']);
+    store.dispatch({ type: 'INC' });
+    await Promise.resolve();
+    expect((rt.getRootInstance() as InstanceType<typeof Ext>).props.n).toBe(1);
+    await rt.unmount();
+  });
+
+  it('subclass prototype onUnmount wins over wrapped base class-field capture', async () => {
+    const store = makeStore();
+    const calls: string[] = [];
+
+    class Base extends Component<Record<string, never>, { n?: number }> {
+      public override onUnmount = (): void => {
+        calls.push('base-unmount-field');
+      };
+    }
+
+    const Connected = connect(store, (s: S) => ({ n: s.n }))(Base);
+
+    class Ext extends Connected {
+      public override onUnmount (): void {
+        calls.push('ext-unmount');
+      }
+    }
+
+    const rt = await GraphRuntime.mount(h(Ext, {}));
+    await rt.unmount();
+    expect(calls).toEqual(['ext-unmount']);
+  });
+
+  it('wrapped base class-field still runs when Connected is not subclassed', async () => {
+    const store = makeStore();
+    const calls: string[] = [];
+
+    class Base extends Component<Record<string, never>, { n?: number }> {
+      public override onMount = (): void => {
+        calls.push(`base-field:n=${String(this.props.n)}`);
+      };
+    }
+
+    const Connected = connect(store, (s: S) => ({ n: s.n }))(Base);
+    const rt = await GraphRuntime.mount(h(Connected, {}));
+    expect(calls).toEqual(['base-field:n=0']);
+    await rt.unmount();
+  });
 });
