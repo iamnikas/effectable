@@ -246,9 +246,9 @@ describe('GraphRuntime: setState inside onMount', () => {
       }
 
       public override onMount (): void {
-        // Replica of the production hack: direct state update in mount...
-        this.state = { ...this.state, show: true };
-        // ...and an empty setState on the next tick, when the update hook is already injected.
+        // Direct this.state = after construction warns and does not apply — use setState.
+        this.setState({ show: true });
+        // Control: empty setState on the next tick, when the update hook is already injected.
         setTimeout(() => {
           this.setState({});
         }, 0);
@@ -386,8 +386,8 @@ describe('connect + GraphRuntime: kick-off after mount with pre-populated store 
       }
 
       public override onMount (): void {
-        // Direct state mutation WITHOUT setState. The consumer does not call setState —
-        // the library must deliver post-mount kick-off.
+        // Illicit direct this.state = after construction: warns and does not apply.
+        // Consumer still does not call setState — library must deliver post-mount kick-off.
         this.state = { ...this.state, projectId: 'project-1' };
       }
 
@@ -417,7 +417,7 @@ describe('connect + GraphRuntime: kick-off after mount with pre-populated store 
 
     // Post-mount kick-off from connect: exactly one deferred onUpdate after mount
     // without setState/setTimeout in the consumer (hack model #1 / handleInitProjectId).
-    expect(engineRef.current.updateLog).toEqual(['update:project-1:synced']);
+    expect(engineRef.current.updateLog).toEqual(['update:null:synced']);
 
     await runtime.unmount();
   });

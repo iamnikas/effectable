@@ -26,7 +26,7 @@ Import from `effectable` or from subpaths: `effectable/bootstrap`, `effectable/s
 
 ## Component and GraphRuntime
 
-- `Component` — long-lived node with `state` / `setState` (single writer after construction; direct `this.state =` warns), `onMount` / `onUpdate` / `onUnmount`, optional `compose()`.
+- `Component` — long-lived node with `state` / `setState` (single writer after construction; direct `this.state =` warns and does not apply), `onMount` / `onUpdate` / `onUnmount`, optional `compose()`.
 - `h(...)` — declarative virtual node factory for the runtime graph.
 - `GraphRuntime` — materialize, reconcile (keyed/unkeyed), lifecycle orchestration, dirty-fiber auto-flush after `setState`.
 - Fail-safe: unrecoverable reconcile / dirty-flush → `FAILED`, children→parent teardown; throwing `onAutoReconcileError` cannot skip fail-stop.

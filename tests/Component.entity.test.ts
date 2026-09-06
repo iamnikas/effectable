@@ -312,7 +312,7 @@ describe('Component single writer (state)', () => {
     await Promise.resolve();
   }
 
-  it('warns on direct this.state = after construction', async () => {
+  it('warns on direct this.state = after construction and leaves state unchanged', async () => {
     class Probe extends Component<{ n: number }, Record<string, never>> {
       constructor () {
         super({});
@@ -332,7 +332,8 @@ describe('Component single writer (state)', () => {
       );
       expect(warnSpy.mock.calls[0]?.[0]).toEqual(expect.stringContaining('setState'));
       expect(warnSpy.mock.calls[0]?.[0]).toEqual(expect.stringContaining('ref'));
-      expect(c.state.n).toBe(7);
+      // Illicit assignment must not mutate state.
+      expect(c.state.n).toBe(0);
     } finally {
       warnSpy.mockRestore();
     }

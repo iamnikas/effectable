@@ -7,8 +7,9 @@
  *
  * **Single writer:** only {@link Component.setState} may change state after construction
  * (triggers `onUpdate` and reconcile schedule). Direct `this.state = …` after init emits
- * `console.warn`. Constructor init (`super(props, initial)` or `this.state = …` in the
- * constructor body) is allowed without warning. If reconciliation is not needed, use a ref.
+ * `console.warn` and does **not** change `#state`. Constructor init (`super(props, initial)`
+ * or `this.state = …` in the constructor body) is allowed without warning. If reconciliation
+ * is not needed, use a ref.
  *
  * **Modes:**
  * - **Standalone** — `Component` as a lightweight stateful object without GraphRuntime: `setState`
@@ -106,13 +107,14 @@ implements Lifecycle {
   }
 
   /**
-   * Direct assignment after construction is forbidden: emits {@link console.warn} and still
-   * writes the backing store (no `onUpdate`, no reconcile). Prefer {@link Component.setState}.
+   * Direct assignment after construction is forbidden: emits {@link console.warn} and leaves
+   * `#state` unchanged (no write, no `onUpdate`, no reconcile). Prefer {@link Component.setState}.
    * Allowed without warning during construction (`super(props, initial)` or subclass ctor body).
    */
   public set state (value: S) {
     if (!this.#allowDirectStateWrite) {
       console.warn(DIRECT_STATE_ASSIGNMENT_WARN);
+      return;
     }
     this.#state = value;
   }
