@@ -18,7 +18,7 @@ import {
   createStore,
   h,
 } from 'Effectable';
-import type { VirtualServiceNode } from 'Effectable';
+import type { DispatchMethod, VirtualServiceNode } from 'Effectable';
 
 interface State {
   n: number;
@@ -88,7 +88,7 @@ describe('connect: destroyed store mount', () => {
     const Connected = connect(
       store,
       null,
-      (dispatch) => ({
+      (dispatch: DispatchMethod<TestAction>) => ({
         ping: (): void => {
           dispatch({ type: 'PING' });
         },
