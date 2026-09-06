@@ -1969,19 +1969,6 @@ export class GraphRuntime {
   }
 
   /**
-   * Applies the reconcile result to the current fiber in-place.
-   * In-place mutation instead of spread: 0 heap allocations on UPDATE
-   * (3.09x speedup). Safe: RuntimeFiber is private.
-   *
-   * @param {RuntimeFiber<P>} current - current fiber
-   * @param {VirtualServiceNode<P>} nextVnode - new vnode
-   * @param {RuntimeFiber<unknown> | null} parentFiber - parent fiber
-   * @param {ContextScope} parentScope - parent scope
-   * @param {RuntimeFiber<unknown>[]} nextChildren - new child fibers
-   * @returns {void}
-   */
-
-  /**
    * Destroys PLACE/REPLACE fibers in `nextChildren` that are not identity-in `currentChildren`.
    * Used when child reconcile succeeded but a later step (e.g. ref commit in
    * {@link applyFiberUpdate}) throws — those new fibers are not linked onto the parent
@@ -2063,7 +2050,19 @@ export class GraphRuntime {
     attachRollbackErrors();
   }
 
-    private applyFiberUpdate<P> (
+  /**
+   * Applies the reconcile result to the current fiber in-place.
+   * In-place mutation instead of spread: 0 heap allocations on UPDATE
+   * (3.09x speedup). Safe: RuntimeFiber is private.
+   *
+   * @param {RuntimeFiber<P>} current - current fiber
+   * @param {VirtualServiceNode<P>} nextVnode - new vnode
+   * @param {RuntimeFiber<unknown> | null} parentFiber - parent fiber
+   * @param {ContextScope} parentScope - parent scope
+   * @param {RuntimeFiber<unknown>[]} nextChildren - new child fibers
+   * @returns {void}
+   */
+  private applyFiberUpdate<P> (
     current: RuntimeFiber<P>,
     nextVnode: VirtualServiceNode<P>,
     parentFiber: RuntimeFiber<unknown> | null,
