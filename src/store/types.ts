@@ -143,7 +143,8 @@ export interface Store<S = any, A extends Action = Action> {
    * Observable of the current state (RxJS extension)
    *
    * Emits a new value on every state change.
-   * Starts with the current state (BehaviorSubject).
+   * New subscribers receive the current state first (attach-then-replay),
+   * then subsequent commits.
    *
    * @example
    * store.state$.subscribe(state => {

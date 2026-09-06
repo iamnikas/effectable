@@ -189,7 +189,7 @@ function isConnectOptions (value: unknown): value is ConnectOptions {
  * Connected installs own lifecycle properties that shadow subclass prototype methods for
  * GraphRuntime entry; without (2), Ext.prototype overrides are skipped while store wiring
  * still runs. (2) must precede (3): a wrapped base class-field in `ownCaptured` would
- * otherwise permanently hide Ext.prototype (#93 left that gap). (1) must precede (2):
+ * otherwise permanently hide Ext.prototype (left that gap). (1) must precede (2):
  * preferring every above-Connected prototype over any ownCaptured makes an intermediate
  * Mid.prototype beat Ext's class-field (CONNECT_REBIND capture).
  *
@@ -371,7 +371,7 @@ function resolveMapDispatchProps<S, P, A extends Action> (
       return null;
     }
 
-    // Same class as mapState thenable (#156): `typeof promise === 'object'`, so an
+    // Same class as mapState thenable: `typeof promise === 'object'`, so an
     // async mapDispatch factory was installed as `__connectDispatchProps`. Spreading
     // a Promise into props yields no callbacks and can leak thenable identity into
     // `this.props`. Reject synchronously — async mapDispatch is not supported.
@@ -791,10 +791,10 @@ function buildConnectHoc<S, P, R, A extends Action> (
       public applyToScope (parentScope: ContextScope): ContextScope {
         // Pre-mount prop sync MUST run before the wrapped class's applyToScope.
         // Providers often publish from this.props (ContextProvider.value or custom
-        // tokens). Calling super first (#111) left mapped-only fields undefined on
+        // tokens). Calling super first left mapped-only fields undefined on
         // first materialize — children got wrong DI with no throw.
         //
-        // Pre-mount only (#91): never re-sync on dirty/update flushes after mount —
+        // Pre-mount only: never re-sync on dirty/update flushes after mount —
         // a mapDispatch factory that dispatches as a side effect would loop with select.
         const store = this.tryResolveConnectStore();
         let publishStore: Store<S, A>;
@@ -899,7 +899,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
         if (isStoreLike(this.__connectStoreFromContext)) {
           this.__connectStore = this.__connectStoreFromContext as Store<S, A>;
           // Same liveness probe as the cached-store branch: a destroyed store may
-          // still be republished into CONNECT_STORE_CONTEXT (#106). Calling
+          // still be republished into CONNECT_STORE_CONTEXT. Calling
           // getState() during pre-compose sync would fail-stop GraphRuntime.
           try {
             this.__connectStore.getState();
@@ -1036,7 +1036,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
         // when own-props are shallow-equal re-enters factories that dispatch as a
         // side effect: dispatch → parent select → setState → dirty parent → child
         // UPDATE → RUNTIME_PROPS_RECEIVER → dispatch → … → GraphRuntime fail-stop.
-        // Distinct from applyToScope dirty re-sync (#91): this path is props receive.
+        // Distinct from applyToScope dirty re-sync: this path is props receive.
         const ownPropsChanged = !shallowEqualOwnProps(this.__connectOwnProps, nextOwnProps);
         this.__connectOwnProps = nextOwnProps;
         const store = this.tryResolveConnectStore();
@@ -1071,7 +1071,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
        */
       public override onMount (): void | Promise<void> {
         // Sync reentry: subclass `super.onMount()` while Connected wiring is on the stack.
-        // Remount via `this.onMount()` uses `__connectEntryOnMount` (#114); do not
+        // Remount via `this.onMount` uses `__connectEntryOnMount`; do not
         // weaken this gate with a torn-down exception.
         if (this.__connectMountReentry) {
           return;
@@ -1095,7 +1095,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
        */
       private runConnectOnMount (): void | Promise<void> {
         // Remount on the same instance must restart the first-pass / kick-off state machine.
-        // PR #59 reset only `__connectTornDown`; leaving `__connectFirstPass` false skipped
+        // reset only `__connectTornDown`; leaving `__connectFirstPass` false skipped
         // user `onMount` and froze store→props delivery (`__connectMountCompleted` never set).
         this.__connectTornDown = false;
         this.__connectStoreDestroyed = false;
@@ -1118,9 +1118,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
         const store = this.resolveConnectStore();
 
         // Destroyed-store liveness probe before dispatch wiring / select subscribe.
-        // Root-connected (explicit store): throw so GraphRuntime.mount rejects (#87 / #112).
+        // Root-connected (explicit store): throw so GraphRuntime.mount rejects.
         // Child-connected (context store): soft-complete so a PLACE under a destroyed
-        // context republished by #106 cannot fail-stop an already-ACTIVE tree.
+        // context republished by cannot fail-stop an already-ACTIVE tree.
         try {
           store.getState();
         } catch {
@@ -1142,7 +1142,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
         const hasSuperOnMount = typeof superOnMount === 'function';
 
         if (mapStateToProps == null) {
-          // Parity with mapState destroyed-store mount (#87): without a select subscription
+          // Parity with mapState destroyed-store mount: without a select subscription
           // there is no complete-without-next signal, so probe getState() here as well
           // (covers mounts that skipped applyToScope sync).
           store.getState();
@@ -1186,7 +1186,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
           return;
         }
 
-        // Selector / mapStateToProps throw during subscribe (first BehaviorSubject emission)
+        // Selector / mapStateToProps throw during subscribe (first state$/select emission)
         // or before mount completes: surface as onMount failure instead of a zombie ACTIVE tree.
         let syncSubscribeError: unknown = null;
 
@@ -1200,7 +1200,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
         // reentrant observer error (RxJS `reportUnhandledError` / process crash) and cannot
         // orphan a Promise that `onMount` never returned to the caller.
         //
-        // Capture the Subscription locally before assigning to the instance field (#83): a
+        // Capture the Subscription locally before assigning to the instance field: a
         // teardown or nested remount during the sync first emission must not resurrect a
         // disposed handle or overwrite a newer remount's subscription.
         const subscription = store.select(selector).subscribe({
@@ -1245,7 +1245,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
             // store.destroy() completes select(); mark dead so later reconcile skips getState().
             this.__connectStoreDestroyed = true;
             this.__connectSubscription = null;
-            // Destroyed store (or any completed-without-next select): BehaviorSubject.complete()
+            // Destroyed store (or any completed-without-next select): store select complete()
             // means new subscribers get complete only — no first `next`. Without this, connect
             // would return successfully, skip user onMount, and leave GraphRuntime ACTIVE.
             if (this.__connectFirstPass || !this.__connectMountCompleted) {
@@ -1295,7 +1295,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
         // Nested remount during user onMount owns the instance for wiring/complete.
         // Still return an in-flight user Promise: dropping it made enterConnectOnMount
         // look sync, so `__connectMountAsyncInFlight` never claimed the outer await and
-        // a later `await super.onMount()` re-entered after the nested remount settled (#160).
+        // a later `await super.onMount` re-entered after the nested remount settled.
         if (this.__connectMountGeneration !== mountGeneration) {
           if (isPromiseLike(mountResult)) {
             return mountResult as Promise<void>;
@@ -1464,7 +1464,7 @@ export function connect<S, P = unknown, R = unknown, A extends Action = Action> 
     store = storeOrMapStateToProps as Store<S, A>;
     // connect(store, options[, mapDispatch[, options]]) — options in the mapState slot.
     // Must still bind a following mapDispatch; dropping it silently loses callbacks on a
-    // type-legal call after ConnectOptions was added to the 2nd-arg union (#129).
+    // type-legal call after ConnectOptions was added to the 2nd-arg union.
     if (isConnectOptions(mapStateToPropsOrMapDispatchToProps)) {
       options = mapStateToPropsOrMapDispatchToProps;
       if (isConnectOptions(mapDispatchToPropsOrOptions) && maybeOptions === undefined) {
