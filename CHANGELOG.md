@@ -1,3 +1,5 @@
+## [1.2.0-canary.8](https://github.com/iamnikas/effectable/compare/v1.2.0-canary.7...v1.2.0-canary.8) (2026-09-06)
+
 ## [1.2.0-canary.7](https://github.com/iamnikas/effectable/compare/v1.2.0-canary.6...v1.2.0-canary.7) (2026-09-06)
 
 ## [1.2.0-canary.6](https://github.com/iamnikas/effectable/compare/v1.2.0-canary.5...v1.2.0-canary.6) (2026-09-06)
