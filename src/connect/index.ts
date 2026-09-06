@@ -4,7 +4,7 @@
  * @module Effectable/connect
  */
 
-export { connect } from './connect';
+export { connect, CONNECT_HOC_BRAND } from './connect';
 export type {
   MapStateToProps,
   MapDispatchToProps,

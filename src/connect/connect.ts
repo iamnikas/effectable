@@ -16,6 +16,9 @@
  *   (own Connected hooks shadow Ext.prototype for GraphRuntime entry; connect re-resolves them).
  * - `mapStateToProps` subscribe failures fail the mount; mapDispatch-only hosts still get the
  *   post-mount kick-off after a successful mount.
+ * - Nested HOC wrap `connect(...)(connect(...)(Ctor))` is rejected: inheritance shares one
+ *   instance and collides connect fields, which previously stack-overflowed in `onMount`.
+ *   Nest stores via parent/child context (`connect(store)(Parent)` + `connect(mapState)(Child)`).
  *
  * @module Effectable/connect/connect
  */
@@ -45,6 +48,12 @@ const CONNECT_STORE_CONTEXT = createContext<unknown | null>('EFFECTABLE_CONNECT_
 const CONNECT_STORE_CONTEXT_FIELD = '__connectStoreFromContext';
 
 /**
+ * Brand on constructors returned by {@link connect}. Used to reject nested HOC wraps
+ * (`connect(...)(AlreadyConnected)`), which share one instance and recurse in `onMount`.
+ */
+export const CONNECT_HOC_BRAND = Symbol('effectable.connect.hocBrand');
+
+/**
  * Default props filtering mode for `connect` when not set explicitly via {@link ConnectOptions}.
  *
  * Target `Effectable` contract: `'strict'` — parent props do not leak into public `this.props`;
@@ -53,6 +62,30 @@ const CONNECT_STORE_CONTEXT_FIELD = '__connectStoreFromContext';
  * as a documented transitional mode.
  */
 const DEFAULT_OWN_PROPS_MODE: OwnPropsMode = 'strict';
+
+/**
+ * Whether `ctor` (or a superclass) was produced by {@link connect}.
+ *
+ * @param {Function} ctor - component constructor
+ * @returns {boolean}
+ */
+function isConnectHocConstructor (ctor: Function): boolean {
+  let current: Function | null = ctor;
+  const seen = new Set<Function>();
+
+  while (current !== null && typeof current === 'function' && !seen.has(current)) {
+    seen.add(current);
+    if (
+      (current as { [CONNECT_HOC_BRAND]?: boolean })[CONNECT_HOC_BRAND] === true
+    ) {
+      return true;
+    }
+    const next = Object.getPrototypeOf(current);
+    current = typeof next === 'function' ? next : null;
+  }
+
+  return false;
+}
 
 /**
  * Checks that a value looks like a Promise (thenable) and can be awaited asynchronously.
@@ -280,6 +313,18 @@ function buildConnectHoc<S, P, R, A extends Action> (
   return function connectHoc<C extends ConnectableHocTarget> (
     Constructor: C
   ): C {
+    // Nested `connect(...)(connect(...)(Ctor))` shares one instance: outer field
+    // initializers wipe inner connect state, and capturing the inner own `onMount`
+    // as `__connectOwnOnMount` makes `onMount` recurse until the stack overflows.
+    // Parent/child context nesting remains the supported pattern.
+    if (isConnectHocConstructor(Constructor)) {
+      throw new Error(
+        '[Effectable.connect] Cannot wrap an already-connected component. ' +
+        'Combine mapState/mapDispatch in a single connect() call, or nest via ' +
+        'parent/child context (connect(store)(Parent) + connect(mapState)(Child)).'
+      );
+    }
+
     type BaseShape = {
       props: Record<string, unknown>;
       setState (u: object): void;
@@ -1020,6 +1065,13 @@ function buildConnectHoc<S, P, R, A extends Action> (
     Object.defineProperty(Connected, 'name', {
       value: Constructor.name,
       configurable: true,
+    });
+
+    Object.defineProperty(Connected, CONNECT_HOC_BRAND, {
+      value: true,
+      writable: false,
+      enumerable: false,
+      configurable: false,
     });
 
     return Connected as unknown as C;
