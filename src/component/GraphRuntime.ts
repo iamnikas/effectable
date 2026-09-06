@@ -288,6 +288,18 @@ export class GraphRuntime {
   private dirtyFlushPassCount = 0;
 
   /**
+   * Full-diff orphans + REPLACE victims that may still hold exclusive Command/Query
+   * slots while pass-1 PLACE/REPLACE and pass-2 UPDATE nested PLACE wire buses.
+   *
+   * {@link attachEffectableRuntimeBusWiring} releases only the types the new instance
+   * declares from these fibers before register — covers nested handlers under a PLACE
+   * wrapper or under a deferred UPDATE whose root type declares no exclusives (sibling
+   * {@link releaseOrphanExclusiveForIncoming} only inspects the incoming root type).
+   * Cleared when the full-diff batch finishes (success or rollback).
+   */
+  private pendingExclusiveHandoffFibers: RuntimeFiber<unknown>[] | null = null;
+
+  /**
    * Optional hook invoked when automatic reconcile (dirty-fiber flush) fails.
    * Set via the fourth argument of {@link GraphRuntime.mount}.
    */
@@ -412,6 +424,31 @@ export class GraphRuntime {
   ): void {
     if (this.effectableRuntimeBuses === null) {
       return;
+    }
+
+    // Nested PLACE under a wrapper / deferred UPDATE claims exclusive types that
+    // sibling-root releaseOrphanExclusiveForIncoming never saw (it only reads the
+    // incoming root constructor). Free matching slots on pending orphans/victims
+    // immediately before this instance registers.
+    const handoff = this.pendingExclusiveHandoffFibers;
+    if (handoff !== null && handoff.length > 0) {
+      const onlyTypes = collectExclusiveHandlerTypesFromType(
+        (instance as { constructor: unknown }).constructor,
+      );
+      if (onlyTypes.commandTypes.size > 0 || onlyTypes.queryTypes.size > 0) {
+        const buses = this.effectableRuntimeBuses;
+        for (let i = 0; i < handoff.length; i += 1) {
+          const leaving = handoff[i];
+          if (leaving === undefined) {
+            continue;
+          }
+          try {
+            this.releaseExclusiveRuntimeBusHandlersSubtree(leaving, buses, onlyTypes);
+          } catch {
+            // Best-effort: destroyFiber still runs the full bus disposer later.
+          }
+        }
+      }
     }
 
     const disposer = wireRuntimeBusesIfDecorated(instance, this.effectableRuntimeBuses);
@@ -3631,7 +3668,6 @@ export class GraphRuntime {
 
     const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
     const nextChildren: RuntimeFiber<unknown>[] = [];
-    let unkeyedIdx = 0;
 
     // Leaving fibers that can still hold exclusive slots during pass-1:
     // - orphans (unpaired) — type-scoped release so UPDATE→orphan execute/query survives
@@ -3651,6 +3687,64 @@ export class GraphRuntime {
       nextVnodes,
       hasKeyedCurrent,
     );
+
+    // Publish leaving fibers for attachEffectableRuntimeBusWiring so nested PLACE
+    // under a wrapper / deferred UPDATE can free exclusive slots the sibling-root
+    // releaseOrphanExclusiveForIncoming never sees. Nest with any outer full-diff
+    // handoff (parent orphan must stay visible while an UPDATE child materializes).
+    const previousExclusiveHandoff = this.pendingExclusiveHandoffFibers;
+    this.pendingExclusiveHandoffFibers = previousExclusiveHandoff === null
+      ? [...fullDiffOrphans, ...fullDiffReplaceVictims]
+      : [...previousExclusiveHandoff, ...fullDiffOrphans, ...fullDiffReplaceVictims];
+
+    try {
+      return await this.reconcileChildrenFullDiffWithHandoff(
+        currentChildren,
+        nextVnodes,
+        parentFiber,
+        childScope,
+        hasKeyedCurrent,
+        currentChildrenSet,
+        unkeyedCurrent,
+        nextChildren,
+        fullDiffOrphans,
+        fullDiffReplaceVictims,
+      );
+    } finally {
+      this.pendingExclusiveHandoffFibers = previousExclusiveHandoff;
+    }
+  }
+
+  /**
+   * Full-diff body after {@link pendingExclusiveHandoffFibers} is installed.
+   * Split so the handoff list is always restored via `finally` (including nested
+   * full-diff under an UPDATE).
+   *
+   * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
+   * @param {VirtualServiceNode[]} nextVnodes - next child vnodes
+   * @param {RuntimeFiber<unknown>} parentFiber - parent fiber
+   * @param {ContextScope} childScope - children scope
+   * @param {boolean} hasKeyedCurrent - whether any current child is keyed
+   * @param {Set<RuntimeFiber<unknown>>} currentChildrenSet - identity set for rollback
+   * @param {RuntimeFiber<unknown>[]} unkeyedCurrent - unkeyed current buffer (mutated)
+   * @param {RuntimeFiber<unknown>[]} nextChildren - output buffer (mutated)
+   * @param {RuntimeFiber<unknown>[]} fullDiffOrphans - unpaired current fibers
+   * @param {RuntimeFiber<unknown>[]} fullDiffReplaceVictims - REPLACE victims
+   * @returns {Promise<RuntimeFiber<unknown>[]>}
+   */
+  private async reconcileChildrenFullDiffWithHandoff (
+    currentChildren: RuntimeFiber<unknown>[],
+    nextVnodes: VirtualServiceNode[],
+    parentFiber: RuntimeFiber<unknown>,
+    childScope: ContextScope,
+    hasKeyedCurrent: boolean,
+    currentChildrenSet: Set<RuntimeFiber<unknown>>,
+    unkeyedCurrent: RuntimeFiber<unknown>[],
+    nextChildren: RuntimeFiber<unknown>[],
+    fullDiffOrphans: RuntimeFiber<unknown>[],
+    fullDiffReplaceVictims: RuntimeFiber<unknown>[],
+  ): Promise<RuntimeFiber<unknown>[]> {
+    let unkeyedIdx = 0;
 
     /**
      * Free leaving exclusive slots that `nextVnode` will register, right before
