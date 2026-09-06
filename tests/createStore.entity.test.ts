@@ -442,6 +442,81 @@ describe('createStore', () => {
       subSelect.unsubscribe();
       store.destroy();
     });
+
+    it('after nested subscriber dispatch, new state$/select subscribers replay getState() (not a stale buffer)', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      let midGetState: number | undefined;
+      let midStateReplay: number | undefined;
+      let midSelectReplay: number | undefined;
+
+      const subA = store.state$.subscribe((state) => {
+        if (state.count === 1) {
+          store.dispatch({ type: 'SET', payload: 99 });
+          midGetState = store.getState().count;
+          store.state$.subscribe((s) => {
+            midStateReplay = s.count;
+          }).unsubscribe();
+          store.select((s) => s.count).subscribe((n) => {
+            midSelectReplay = n;
+          }).unsubscribe();
+        }
+      });
+
+      store.dispatch({ type: 'INC' });
+
+      expect(midGetState).toBe(99);
+      expect(midStateReplay).toBe(99);
+      expect(midSelectReplay).toBe(99);
+      expect(store.getState().count).toBe(99);
+
+      subA.unsubscribe();
+      store.destroy();
+    });
+
+    it('dispatch during initial state$/select replay still notifies the same subscriber', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      const seenState: number[] = [];
+      const seenSelect: number[] = [];
+
+      const subState = store.state$.subscribe((state) => {
+        seenState.push(state.count);
+        if (state.count === 0) {
+          store.dispatch({ type: 'SET', payload: 1 });
+        }
+      });
+
+      expect(store.getState().count).toBe(1);
+      expect(seenState).toEqual([0, 1]);
+
+      subState.unsubscribe();
+      store.destroy();
+
+      const storeSelect = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      const subSelect = storeSelect.select((s) => s.count).subscribe((count) => {
+        seenSelect.push(count);
+        if (count === 0) {
+          storeSelect.dispatch({ type: 'SET', payload: 7 });
+        }
+      });
+
+      expect(storeSelect.getState().count).toBe(7);
+      expect(seenSelect).toEqual([0, 7]);
+
+      subSelect.unsubscribe();
+      storeSelect.destroy();
+    });
   });
 
   describe('enhancer (B07)', () => {

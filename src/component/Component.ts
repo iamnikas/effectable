@@ -166,8 +166,17 @@ implements Lifecycle {
     if ((this.constructor as { mutableState?: boolean }).mutableState === true) {
       const target = prev as unknown as Record<string, unknown>;
       const src = delta as unknown as Record<string, unknown>;
-      for (const k in src) {
-        target[k] = src[k];
+      // Own keys only (matches `{ ...prev, ...delta }`). Use defineProperty —
+      // `target[k] =` invokes the Object.prototype `__proto__` setter when
+      // `k === '__proto__'` (e.g. JSON.parse payloads), replacing state's
+      // [[Prototype]] and leaking inherited phantom fields.
+      for (const k of Object.keys(src)) {
+        Object.defineProperty(target, k, {
+          value: src[k],
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
       }
       // State is already committed: always schedule even if onUpdate throws,
       // otherwise mounted compose/children stay stale after a successful write.

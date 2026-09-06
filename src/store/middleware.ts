@@ -124,7 +124,7 @@ export function applyMiddleware<S = unknown, A extends Action = Action> (
 export function applyMiddleware (...args: unknown[]): unknown {
   if (isWrapModeArgs(args)) {
     const [api, rawDispatch, ...middlewares] = args;
-    // Same construction invariant as enhancer mode (PR #55 / Redux): while
+    // Same construction invariant as enhancer mode (Redux): while
     // middleware factories run, the late-bound `api.dispatch` forwarder must not
     // reach rawDispatch / a half-built chain. `wrapDispatch` installs that
     // forwarder; restore the caller's previous `api.dispatch` if setup throws.

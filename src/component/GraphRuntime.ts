@@ -17,8 +17,11 @@
  *   observability — a throwing observer cannot skip fail-stop.
  * - Dirty flush runs only while ACTIVE and the operation queue is idle; `setState` during child
  *   materialization is buffered and applied after the mount/reconcile pass.
- * - UPDATE `commitRef` runs only after successful compose + child reconcile; compose/key
- *   validation failure rolls back the fiber (including premount hooks) without leaving phantoms.
+ * - UPDATE `commitRef` runs after successful compose and *before* child reconcile so
+ *   same-pass PLACE `onMount` observes parent `nextRef` (mount path already commits before
+ *   deferred onMount flush). Child-reconcile failure and root `onUpdate` failure (before
+ *   `applyFiberUpdate` publishes `nextRef` onto `fiber.vnode.ref`) roll the early commit
+ *   back; compose failure never touches refs.
  * - Failed cleanup is children-first and does not invoke a phantom parent `onUnmount`.
  * - Orphan DELETE finalize is best-effort so survivors are not fail-stopped for cleanup noise.
  *
@@ -30,6 +33,8 @@
  *
  * @module Effectable/component/GraphRuntime
  */
+
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 import type { Component } from './Component';
 import type {
@@ -61,7 +66,11 @@ import type {
   RuntimeQuery,
 } from '../runtime/types';
 import type { RuntimeBusesBundle } from '../runtime/BusDecorators';
-import { wireRuntimeBusesIfDecorated } from '../runtime/BusDecorators';
+import {
+  collectExclusiveHandlerTypesFromType,
+  releaseExclusiveRuntimeBusHandlers,
+  wireRuntimeBusesIfDecorated,
+} from '../runtime/BusDecorators';
 import { GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES } from './graphRuntime.constants';
 
 /**
@@ -126,6 +135,13 @@ interface FiberConstructionJournal {
    * `onMount` publishes — depth-first materialize otherwise drops those events.
    */
   lifecycleDeferred?: boolean;
+  /**
+   * Prior fiber kept alive during sibling-batch REPLACE until later siblings finish
+   * bus wiring. Destroyed in {@link GraphRuntime.flushPendingReplaceVictims} before
+   * deferred onUpdate/onMount (and before orphan DELETE) so onUnmount publishes are
+   * not silently dropped or dual-delivered.
+   */
+  pendingReplaceVictim?: RuntimeFiber<unknown>;
   /** Successfully mounted child fibers (in acquisition order). */
   mountedChildren: RuntimeFiber<unknown>[];
   /** Original ref owner (for identity-safe clearing during rollback). */
@@ -157,6 +173,30 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
    * Used for transactional rollback on failure.
    */
   constructionJournal?: FiberConstructionJournal;
+  /**
+   * When set, `onUpdate(prevProps, props)` was deferred during a sibling reconcile
+   * batch (`deferLifecycle`) so later PLACE/REPLACE peers can finish `@On*` bus
+   * wiring first. Cleared by {@link GraphRuntime.flushPendingOnUpdateTree}.
+   */
+  pendingOnUpdatePrevProps?: unknown;
+  /** True when {@link pendingOnUpdatePrevProps} holds a deferred onUpdate. */
+  hasPendingOnUpdate?: boolean;
+  /**
+   * Exclusive Command/Query slots for this fiber were already freed by a pre-PLACE
+   * release under an UPDATE child-diff preview (full-diff / stable fast-path).
+   * A later orphan/victim pass must not release again in a way that could interact
+   * with a same-batch PLACE owner.
+   */
+  exclusiveRuntimeBusHandlersReleased?: boolean;
+  /**
+   * Orphans from a nested full-diff whose DELETE was deferred because the parent
+   * UPDATE is in a sibling batch (`deferPendingBatchFlush`). Exclusive Command/Query
+   * slots are released when stashed; EventBus stays until ancestor flush destroys
+   * them after later sibling PLACE wires. Cleared by
+   * {@link GraphRuntime.flushPendingDeferredOrphansTree}.
+   */
+  pendingDeferredOrphans?: RuntimeFiber<unknown>[];
+
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +297,19 @@ export class GraphRuntime {
   private dirtyFlushPassCount = 0;
 
   /**
+   * Full-diff orphans + REPLACE victims that may still hold exclusive Command/Query
+   * slots while pass-1 PLACE/REPLACE and pass-2 UPDATE nested PLACE wire buses.
+   *
+   * {@link attachEffectableRuntimeBusWiring} releases only the types the new instance
+   * declares from these fibers before register — covers nested handlers under a PLACE
+   * wrapper or under a deferred UPDATE whose root type declares no exclusives (sibling
+   * root claimed-type union only inspects the incoming root type).
+   * Restored when the full-diff batch finishes (success or rollback), nested with any
+   * outer full-diff handoff.
+   */
+  private pendingExclusiveHandoffFibers: RuntimeFiber<unknown>[] | null = null;
+
+  /**
    * Optional hook invoked when automatic reconcile (dirty-fiber flush) fails.
    * Set via the fourth argument of {@link GraphRuntime.mount}.
    */
@@ -272,6 +325,14 @@ export class GraphRuntime {
    * Whether an operation is currently running.
    */
   private operationInProgress = false;
+
+  /**
+   * Async context bound for the currently executing queued graph operation.
+   * Distinguishes true reentrancy (onMount/onUpdate → reconcile/unmount on the same
+   * async chain) from concurrent external callers that must only enqueue.
+   * Awaiting a nested queue entry from inside the running op deadlocks the queue.
+   */
+  private readonly operationAsyncContext = new AsyncLocalStorage<true>();
 
   /**
    * Cached unmount promise for concurrent unmount callers.
@@ -375,6 +436,31 @@ export class GraphRuntime {
       return;
     }
 
+    // Nested PLACE under a wrapper / deferred UPDATE claims exclusive types that
+    // sibling-root claimed-type union never saw (it only reads the incoming root
+    // constructor). Free matching slots on pending orphans/victims immediately
+    // before this instance registers.
+    const handoff = this.pendingExclusiveHandoffFibers;
+    if (handoff !== null && handoff.length > 0) {
+      const onlyTypes = collectExclusiveHandlerTypesFromType(
+        (instance as { constructor: unknown }).constructor,
+      );
+      if (onlyTypes.commandTypes.size > 0 || onlyTypes.queryTypes.size > 0) {
+        const buses = this.effectableRuntimeBuses;
+        for (let i = 0; i < handoff.length; i += 1) {
+          const leaving = handoff[i];
+          if (leaving === undefined) {
+            continue;
+          }
+          try {
+            this.releaseExclusiveRuntimeBusHandlersSubtree(leaving, buses, onlyTypes);
+          } catch {
+            // Best-effort: destroyFiber still runs the full bus disposer later.
+          }
+        }
+      }
+    }
+
     const disposer = wireRuntimeBusesIfDecorated(instance, this.effectableRuntimeBuses);
     if (disposer !== null) {
       fiber.effectableRuntimeBusDisposer = disposer;
@@ -397,6 +483,386 @@ export class GraphRuntime {
   }
 
   /**
+   * Releases exclusive Command/Query registrations for `fiber` and every mounted
+   * descendant. Root-only release is not enough when `@OnCommand` / `@OnQuery` live
+   * on nested children under a keyed wrapper that is about to be orphaned.
+   * EventBus subscriptions are left intact (see exclusive pre-PLACE release below).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - orphan root (or any subtree root)
+   * @param {RuntimeBusesBundle<RuntimeCommand, RuntimeQuery, RuntimeEvent>} buses - runtime buses
+   * @param {{ commandTypes?: ReadonlySet<string>; queryTypes?: ReadonlySet<string> }} [onlyTypes]
+   *   optional filter of types an incoming PLACE/REPLACE will claim
+   * @returns {void}
+   */
+  private releaseExclusiveRuntimeBusHandlersSubtree (
+    fiber: RuntimeFiber<unknown>,
+    buses: NonNullable<GraphRuntime['effectableRuntimeBuses']>,
+    onlyTypes?: {
+      commandTypes?: ReadonlySet<string>;
+      queryTypes?: ReadonlySet<string>;
+    },
+  ): void {
+    if (fiber.exclusiveRuntimeBusHandlersReleased === true && onlyTypes === undefined) {
+      return;
+    }
+    const children = fiber.children;
+    for (let i = 0; i < children.length; i += 1) {
+      const child = children[i];
+      if (child !== undefined) {
+        this.releaseExclusiveRuntimeBusHandlersSubtree(
+          child as RuntimeFiber<unknown>,
+          buses,
+          onlyTypes,
+        );
+      }
+    }
+    const instance = fiber.instance;
+    if (instance !== null) {
+      releaseExclusiveRuntimeBusHandlers(instance, buses, onlyTypes);
+    }
+    if (onlyTypes === undefined) {
+      fiber.exclusiveRuntimeBusHandlersReleased = true;
+    }
+  }
+
+  /**
+   * Applies `props` the same way UPDATE does (props receiver or assign).
+   *
+   * @template P
+   * @param {Component<unknown, P>} instance - target instance
+   * @param {P} props - props to apply
+   * @returns {void}
+   */
+  private applyInstanceProps<P> (
+    instance: Component<unknown, P>,
+    props: P,
+  ): void {
+    const propsReceiver = (
+      instance as Component<unknown, P> & RuntimePropsReceiver<P>
+    )[RUNTIME_PROPS_RECEIVER];
+
+    if (typeof propsReceiver === 'function') {
+      propsReceiver.call(
+        instance as Component<unknown, P> & RuntimePropsReceiver<P>,
+        props,
+      );
+    } else {
+      instance.props = props;
+    }
+  }
+
+  /**
+   * Before nested PLACE under an earlier sibling UPDATE, release exclusive Command/Query
+   * slots that a later sibling UPDATE will free only when it runs. Used by:
+   * - full-diff pass-1: deferred UPDATEs keep nested handlers across PLACE peers
+   * - stable fast-path: left-to-right UPDATE fully reconciles (nested PLACE) before the
+   *   next sibling UPDATE — same clash without ever entering full-diff preview
+   *
+   * Mirrors real {@link updateFiber} wiring for the preview: next props, `@UseContext`
+   * inject when `parentScope` identity changed, then {@link buildChildScope} for nested
+   * recursion. Without inject, compose that depends on injected fields can miss orphans
+   * that the real UPDATE will drop — exclusive PLACE then fail-stops. EventBus stays intact.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - UPDATE fiber whose next child diff is previewed
+   * @param {VirtualServiceNode<unknown>} nextVnode - next vnode for that fiber
+   * @param {NonNullable<GraphRuntime['effectableRuntimeBuses']>} buses - runtime buses
+   * @param {ContextScope} parentScope - scope the real UPDATE will receive
+   * @returns {void}
+   */
+  private releaseExclusiveUnderDeferredUpdate (
+    fiber: RuntimeFiber<unknown>,
+    nextVnode: VirtualServiceNode<unknown>,
+    buses: NonNullable<GraphRuntime['effectableRuntimeBuses']>,
+    parentScope: ContextScope,
+  ): void {
+    const instance = fiber.instance;
+    if (instance === null) {
+      return;
+    }
+
+    const prevProps = instance.props;
+    const scopeChanged = fiber.scope !== parentScope;
+    this.applyInstanceProps(instance, nextVnode.props as never);
+
+    try {
+      if (scopeChanged) {
+        injectContextFields(instance, parentScope);
+      }
+      const childScope = this.buildChildScope(
+        instance as Component<unknown, unknown>,
+        parentScope,
+      );
+
+      const nextChildVnodes = this.getChildVnodes(
+        instance as Component<unknown, unknown>,
+        nextVnode.children as VirtualServiceNode[],
+      );
+      const currentChildren = fiber.children as RuntimeFiber<unknown>[];
+
+      let hasKeyedCurrent = false;
+      for (const child of currentChildren) {
+        if (child.vnode.key !== undefined) {
+          hasKeyedCurrent = true;
+          break;
+        }
+      }
+
+      const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
+      let unkeyedIdx = 0;
+
+      if (hasKeyedCurrent) {
+        const keyedCurrentMap = new Map<string | number, RuntimeFiber<unknown>>();
+        for (const child of currentChildren) {
+          const key = child.vnode.key;
+          if (key !== undefined) {
+            keyedCurrentMap.set(key, child);
+          } else {
+            unkeyedCurrent.push(child);
+          }
+        }
+
+        for (const nextChild of nextChildVnodes) {
+          const nextKey = nextChild.key;
+          if (nextKey !== undefined && keyedCurrentMap.has(nextKey)) {
+            const currentChild = keyedCurrentMap.get(nextKey);
+            keyedCurrentMap.delete(nextKey);
+            if (currentChild !== undefined) {
+              this.releaseExclusiveForMatchedDeferredChild(
+                currentChild,
+                nextChild as VirtualServiceNode<unknown>,
+                buses,
+                childScope,
+              );
+            }
+          } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
+            const currentChild = unkeyedCurrent[unkeyedIdx];
+            unkeyedIdx += 1;
+            if (currentChild !== undefined) {
+              this.releaseExclusiveForMatchedDeferredChild(
+                currentChild,
+                nextChild as VirtualServiceNode<unknown>,
+                buses,
+                childScope,
+              );
+            }
+          }
+        }
+
+        for (const [, orphan] of keyedCurrentMap) {
+          this.releaseExclusiveRuntimeBusHandlersSubtree(orphan, buses);
+        }
+      } else {
+        for (const child of currentChildren) {
+          unkeyedCurrent.push(child);
+        }
+        for (const nextChild of nextChildVnodes) {
+          if (unkeyedIdx < unkeyedCurrent.length) {
+            const currentChild = unkeyedCurrent[unkeyedIdx];
+            unkeyedIdx += 1;
+            if (currentChild !== undefined) {
+              this.releaseExclusiveForMatchedDeferredChild(
+                currentChild,
+                nextChild as VirtualServiceNode<unknown>,
+                buses,
+                childScope,
+              );
+            }
+          }
+        }
+      }
+
+      for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
+        const orphan = unkeyedCurrent[i];
+        if (orphan !== undefined) {
+          this.releaseExclusiveRuntimeBusHandlersSubtree(orphan, buses);
+        }
+      }
+    } finally {
+      this.applyInstanceProps(instance, prevProps as never);
+      if (scopeChanged) {
+        try {
+          injectContextFields(instance, fiber.scope);
+        } catch {
+          // Best-effort restore; real UPDATE will re-inject or fail-stop.
+        }
+      }
+    }
+  }
+
+  /**
+   * For a matched child under a deferred UPDATE preview: recurse on UPDATE, otherwise
+   * release the whole exclusive subtree (REPLACE / type mismatch).
+   *
+   * @param {RuntimeFiber<unknown>} currentChild - matched current child
+   * @param {VirtualServiceNode<unknown>} nextChild - next child vnode
+   * @param {NonNullable<GraphRuntime['effectableRuntimeBuses']>} buses - runtime buses
+   * @param {ContextScope} parentScope - scope the matched child UPDATE will receive
+   * @returns {void}
+   */
+  private releaseExclusiveForMatchedDeferredChild (
+    currentChild: RuntimeFiber<unknown>,
+    nextChild: VirtualServiceNode<unknown>,
+    buses: NonNullable<GraphRuntime['effectableRuntimeBuses']>,
+    parentScope: ContextScope,
+  ): void {
+    const sameType = currentChild.vnode.type === nextChild.type;
+    const sameKey = (currentChild.vnode.key ?? null) === (nextChild.key ?? null);
+
+    if (sameType && sameKey) {
+      this.releaseExclusiveUnderDeferredUpdate(
+        currentChild,
+        nextChild,
+        buses,
+        parentScope,
+      );
+      return;
+    }
+
+    this.releaseExclusiveRuntimeBusHandlersSubtree(currentChild, buses);
+  }
+
+  /**
+   * Fibers that will be unpaired after the next-child match (full-diff orphans).
+   * Pure: mirrors keyed/unkeyed matching without materializing or destroying.
+   *
+   * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
+   * @param {VirtualServiceNode[]} nextVnodes - next child vnodes
+   * @param {boolean} hasKeyedCurrent - whether any current child has a key
+   * @returns {RuntimeFiber<unknown>[]} fibers that will be destroyed as orphans
+   */
+  private collectFullDiffOrphans (
+    currentChildren: RuntimeFiber<unknown>[],
+    nextVnodes: VirtualServiceNode[],
+    hasKeyedCurrent: boolean,
+  ): RuntimeFiber<unknown>[] {
+    const orphans: RuntimeFiber<unknown>[] = [];
+    const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
+    let unkeyedIdx = 0;
+
+    if (hasKeyedCurrent) {
+      const keyedCurrentMap = new Map<string | number, RuntimeFiber<unknown>>();
+      for (const child of currentChildren) {
+        const key = child.vnode.key;
+        if (key !== undefined) {
+          keyedCurrentMap.set(key, child);
+        } else {
+          unkeyedCurrent.push(child);
+        }
+      }
+
+      for (const nextVnode of nextVnodes) {
+        const nextKey = nextVnode.key;
+        if (nextKey !== undefined && keyedCurrentMap.has(nextKey)) {
+          keyedCurrentMap.delete(nextKey);
+        } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
+          unkeyedIdx += 1;
+        }
+      }
+
+      for (const [, orphan] of keyedCurrentMap) {
+        orphans.push(orphan);
+      }
+    } else {
+      for (const child of currentChildren) {
+        unkeyedCurrent.push(child);
+      }
+      unkeyedIdx = Math.min(nextVnodes.length, unkeyedCurrent.length);
+    }
+
+    for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
+      const orphan = unkeyedCurrent[i];
+      if (orphan !== undefined) {
+        orphans.push(orphan);
+      }
+    }
+
+    return orphans;
+  }
+
+  /**
+   * Fibers matched by key/position that will REPLACE (type or key mismatch) — not UPDATE.
+   * Pure: mirrors {@link reconcileChildrenFullDiff} matching.
+   *
+   * REPLACE victims are *not* orphans: they stay paired until pass-1 REPLACE runs.
+   * An earlier PLACE sibling in the same batch can still try to register exclusive
+   * Command/Query types the victim still holds.
+   *
+   * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
+   * @param {VirtualServiceNode[]} nextVnodes - next child vnodes
+   * @param {boolean} hasKeyedCurrent - whether any current child has a key
+   * @returns {RuntimeFiber<unknown>[]} fibers that will be REPLACE victims
+   */
+  private collectFullDiffReplaceVictims (
+    currentChildren: RuntimeFiber<unknown>[],
+    nextVnodes: VirtualServiceNode[],
+    hasKeyedCurrent: boolean,
+  ): RuntimeFiber<unknown>[] {
+    const victims: RuntimeFiber<unknown>[] = [];
+    const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
+    let unkeyedIdx = 0;
+
+    if (hasKeyedCurrent) {
+      const keyedCurrentMap = new Map<string | number, RuntimeFiber<unknown>>();
+      for (const child of currentChildren) {
+        const key = child.vnode.key;
+        if (key !== undefined) {
+          keyedCurrentMap.set(key, child);
+        } else {
+          unkeyedCurrent.push(child);
+        }
+      }
+
+      for (const nextVnode of nextVnodes) {
+        const nextKey = nextVnode.key;
+        if (nextKey !== undefined && keyedCurrentMap.has(nextKey)) {
+          const currentFiber = keyedCurrentMap.get(nextKey);
+          keyedCurrentMap.delete(nextKey);
+          if (
+            currentFiber !== undefined &&
+            currentFiber.vnode.type !== nextVnode.type
+          ) {
+            victims.push(currentFiber);
+          }
+        } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
+          const currentFiber = unkeyedCurrent[unkeyedIdx];
+          unkeyedIdx += 1;
+          if (
+            currentFiber !== undefined &&
+            (
+              currentFiber.vnode.type !== nextVnode.type ||
+              (currentFiber.vnode.key ?? null) !== (nextVnode.key ?? null)
+            )
+          ) {
+            victims.push(currentFiber);
+          }
+        }
+      }
+    } else {
+      for (const child of currentChildren) {
+        unkeyedCurrent.push(child);
+      }
+
+      const paired = Math.min(nextVnodes.length, unkeyedCurrent.length);
+      for (let i = 0; i < paired; i += 1) {
+        const currentFiber = unkeyedCurrent[i];
+        const nextVnode = nextVnodes[i];
+        if (
+          currentFiber !== undefined &&
+          nextVnode !== undefined &&
+          (
+            currentFiber.vnode.type !== nextVnode.type ||
+            (currentFiber.vnode.key ?? null) !== (nextVnode.key ?? null)
+          )
+        ) {
+          victims.push(currentFiber);
+        }
+      }
+    }
+
+    return victims;
+  }
+
+  /**
    * Builds the value assigned to `ref.current` for a mounted instance.
    *
    * When the constructor declares `@UseImperativeHandle` methods, only those methods
@@ -412,7 +878,7 @@ export class GraphRuntime {
     );
 
     if (methods.length === 0) {
-      this.imperativeRefByOwner.delete(instance);
+      // Full-instance path: caller updates tracking only after a successful assign.
       return instance;
     }
 
@@ -431,22 +897,33 @@ export class GraphRuntime {
       handle[methodKey] = (fn as (...args: unknown[]) => unknown).bind(instance);
     }
 
-    this.imperativeRefByOwner.set(instance, handle);
+    // Do not write imperativeRefByOwner here — a setter may throw before assigning
+    // `ref.current`. Tracking is committed only after a successful assign in commitRef.
     return handle;
   }
 
   /**
    * Identity-safe ref clearing: clears ref.current only if it still points to the expected owner
-   * (full instance) or the limited imperative handle previously bound for that owner.
+   * (full instance), the limited imperative handle previously bound for that owner, or
+   * `attemptedValue` (the value just assigned when a setter threw after write).
    * Prevents an old rollback from clearing a ref that a newer materialization already reused.
    *
    * @param {RefObject<unknown>} ref - ref object
    * @param {Component<unknown, unknown>} expectedOwner - expected current owner
+   * @param {unknown} [attemptedValue] - value commitRef tried to assign (assign-then-throw)
    * @returns {void}
    */
-  private clearRefSafe (ref: RefObject<unknown>, expectedOwner: Component<unknown, unknown>): void {
+  private clearRefSafe (
+    ref: RefObject<unknown>,
+    expectedOwner: Component<unknown, unknown>,
+    attemptedValue?: unknown,
+  ): void {
     const boundHandle = this.imperativeRefByOwner.get(expectedOwner);
-    if (ref.current === expectedOwner || (boundHandle !== undefined && ref.current === boundHandle)) {
+    if (
+      ref.current === expectedOwner
+      || (boundHandle !== undefined && ref.current === boundHandle)
+      || (attemptedValue !== undefined && attemptedValue !== null && ref.current === attemptedValue)
+    ) {
       ref.current = null;
     }
     this.imperativeRefByOwner.delete(expectedOwner);
@@ -482,15 +959,29 @@ export class GraphRuntime {
     // Custom setters may assign `current` then throw. Without a catch, UPDATE ref-swap
     // leaves the new ref holding the instance/handle while `fiber.vnode.ref` still points at
     // the previous ref object — fail-stop finalize clears only the old ref (zombie nextRef).
-    // Materialize assign-then-throw is covered by journal.refBound (#96/#98); this path covers
+    // Materialize assign-then-throw is covered by journal.refBound; this path covers
     // the UPDATE swap hole and is a safe no-op when the setter never assigned.
     if (nextRef !== undefined) {
+      let attemptedValue: unknown;
       try {
-        nextRef.current = instance === null ? null : this.resolveRefCurrentValue(instance);
+        if (instance === null) {
+          nextRef.current = null;
+          return;
+        }
+        attemptedValue = this.resolveRefCurrentValue(instance);
+        nextRef.current = attemptedValue;
+        // Commit ownership tracking only after assign succeeds.
+        if (attemptedValue === instance) {
+          this.imperativeRefByOwner.delete(instance);
+        } else {
+          this.imperativeRefByOwner.set(instance, attemptedValue as object);
+        }
       } catch (error: unknown) {
         if (instance !== null) {
           try {
-            this.clearRefSafe(nextRef, instance);
+            // Pass attemptedValue so assign-then-throw still clears the new handle
+            // even though WeakMap still holds the previous handle (or nothing).
+            this.clearRefSafe(nextRef, instance, attemptedValue);
           } catch {
             // Best-effort: do not mask the original setter error.
           }
@@ -886,6 +1377,30 @@ export class GraphRuntime {
    * @returns {Promise<void>}
    */
   private async enqueueOperation (operation: () => Promise<void>): Promise<void> {
+    // True reentrancy: caller is on the async chain of the running queued operation
+    // (e.g. onMount → await reconcile/unmount). Concurrent external callers have no
+    // store and must enqueue. Reentrant awaits deadlock the single-threaded queue.
+    // For unmount, {@link unmount} still schedules teardown via {@link enqueueOperationUnchecked}.
+    if (this.operationAsyncContext.getStore() === true) {
+      return Promise.reject(
+        new Error(
+          '[Effectable] GraphRuntime: reconcile/unmount cannot be awaited from inside an in-flight ' +
+            'graph operation (e.g. onMount/onUpdate). That would deadlock the operation queue.',
+        ),
+      );
+    }
+
+    return this.enqueueOperationUnchecked(operation);
+  }
+
+  /**
+   * Enqueues an operation without the reentrancy guard.
+   * Used by {@link unmount} to schedule deferred teardown when called from inside a queued op.
+   *
+   * @param {() => Promise<void>} operation - operation to enqueue
+   * @returns {Promise<void>}
+   */
+  private async enqueueOperationUnchecked (operation: () => Promise<void>): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       this.operationQueue.push(async () => {
         try {
@@ -925,7 +1440,10 @@ export class GraphRuntime {
         }
 
         try {
-          await operation();
+          // Bind async context so lifecycle hooks (onMount/onUpdate) that call
+          // reconcile/unmount are detected as reentrant; external concurrent
+          // callers remain outside this store and only enqueue.
+          await this.operationAsyncContext.run(true, operation);
         } catch {
           // Error is already propagated to the caller via the promise wrapper
           // Continue processing the queue (don't poison it forever)
@@ -1100,6 +1618,28 @@ export class GraphRuntime {
    * @param {RuntimeFiber<unknown>} fiber - fiber whose subtree needs rebuild
    * @returns {void | Promise<void>}
    */
+
+  /**
+   * Assigns `fiber.children` and keeps {@link FiberConstructionJournal.mountedChildren}
+   * in sync when a journal exists.
+   *
+   * Mount aliases `fiber.children` to `journal.mountedChildren`. Later UPDATE / dirty
+   * reconcile reassigns `fiber.children` to a fresh array without updating the journal,
+   * so destroyed sibling fibers stayed reachable until the parent unmounted (leak under
+   * keyed list churn).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber whose children are being replaced
+   * @param {Fiber[]} children - next child fibers
+   * @returns {void}
+   */
+  private setFiberChildren (fiber: RuntimeFiber<unknown>, children: Fiber[]): void {
+    fiber.children = children;
+    const journal = fiber.constructionJournal;
+    if (journal !== undefined) {
+      journal.mountedChildren = children as RuntimeFiber<unknown>[];
+    }
+  }
+
   private reconcileDirtyFiber (fiber: RuntimeFiber<unknown>): void | Promise<void> {
     if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
       return;
@@ -1124,7 +1664,7 @@ export class GraphRuntime {
       if (isThenable(childrenRes)) {
         return childrenRes.then(
           (nextChildren) => {
-            fiber.children = nextChildren as Fiber[];
+            this.setFiberChildren(fiber, nextChildren as Fiber[]);
           },
           (error: unknown) => {
             const cleanupResult = this.runFiberFailedCleanup(fiber, error);
@@ -1138,7 +1678,7 @@ export class GraphRuntime {
         );
       }
 
-      fiber.children = childrenRes as Fiber[];
+      this.setFiberChildren(fiber, childrenRes as Fiber[]);
     } catch (error: unknown) {
       const cleanupResult = this.runFiberFailedCleanup(fiber, error);
       if (isThenable(cleanupResult)) {
@@ -1300,6 +1840,29 @@ export class GraphRuntime {
   public async unmount (options?: { rejectOnCleanupError?: boolean }): Promise<void> {
     const rejectOnCleanupError = options?.rejectOnCleanupError === true;
 
+    // Reentrant unmount MUST be handled before joining cachedUnmountPromise.
+    // Otherwise a second await from onMount/onUpdate (sibling PLACE after the first
+    // child already scheduled deferred teardown, or a retry after catch) joins that
+    // promise while the current op is still running — classic queue deadlock:
+    // current op waits on lifecycle, lifecycle waits on the deferred unmount.
+    if (this.operationAsyncContext.getStore() === true) {
+      if (this.state === RUNTIME_STATE.UNMOUNTED) {
+        return;
+      }
+      if (this.state !== RUNTIME_STATE.FAILED && this.state !== RUNTIME_STATE.UNMOUNTING) {
+        this.state = RUNTIME_STATE.UNMOUNTING;
+      }
+      if (this.cachedUnmountPromise === null) {
+        this.cachedUnmountPromise = this.enqueueOperationUnchecked(async () => {
+          await this.runUnmountOperation(rejectOnCleanupError);
+        });
+      }
+      throw new Error(
+        '[Effectable] GraphRuntime: unmount cannot be awaited from inside an in-flight ' +
+          'graph operation (e.g. onMount/onUpdate); teardown was scheduled on the operation queue.',
+      );
+    }
+
     // If unmount is in progress, return the cached promise (HOLE 1)
     // Must check BEFORE the UNMOUNTED early-return so concurrent callers join the in-flight unmount
     if (this.cachedUnmountPromise !== null) {
@@ -1319,64 +1882,74 @@ export class GraphRuntime {
 
     // Create and cache the unmount promise
     this.cachedUnmountPromise = this.enqueueOperation(async () => {
-      // Double-check unmounted state
-      if (this.state === RUNTIME_STATE.UNMOUNTED) {
-        return;
-      }
-
-      // Cancel any pending dirty flush
-      this.dirtyFibers.clear();
-      this.flushScheduled = false;
-
-      // Wait for in-flight dirty flush to complete
-      if (this.activeFlush !== null) {
-        try {
-          await this.activeFlush;
-        } catch {
-          // Ignore flush errors during unmount
-        }
-      }
-
-      // HOLE 1: stay UNMOUNTING during destroy (not UNMOUNTED)
-      // If already FAILED, keep FAILED state through destroy
-      // State transition to UNMOUNTED happens AFTER destroy completes
-
-      // If pendingTeardown is active (fail-stop in progress), await it first
-      if (this.pendingTeardown !== null) {
-        try {
-          await this.pendingTeardown;
-        } catch {
-          // Ignore errors — they are already attached to the fail-stop primary error
-        }
-      }
-
-      if (this.currentRoot !== null) {
-        // Collect cleanup errors during unmount
-        const cleanupErrors: Error[] = [];
-        const d = this.destroyFiber(this.currentRoot, cleanupErrors);
-        if (isThenable(d)) {
-          await d;
-        }
-        this.currentRoot = null;
-
-        // HOLE 1: set UNMOUNTED only after destroy finishes
-        // Transition even if FAILED — unmount is the terminal operation
-        this.state = RUNTIME_STATE.UNMOUNTED;
-
-        // Reject with cleanup errors when requested
-        if (rejectOnCleanupError && cleanupErrors.length > 0) {
-          if (cleanupErrors.length === 1) {
-            throw cleanupErrors[0];
-          }
-          throw new AggregateError(cleanupErrors, 'Cleanup errors during unmount');
-        }
-      } else {
-        // No root to destroy — transition to UNMOUNTED
-        this.state = RUNTIME_STATE.UNMOUNTED;
-      }
+      await this.runUnmountOperation(rejectOnCleanupError);
     });
 
     return this.cachedUnmountPromise;
+  }
+
+  /**
+   * Body of a queued unmount operation (shared by normal and deferred reentrant paths).
+   *
+   * @param {boolean} rejectOnCleanupError - whether cleanup errors should reject
+   * @returns {Promise<void>}
+   */
+  private async runUnmountOperation (rejectOnCleanupError: boolean): Promise<void> {
+    // Double-check unmounted state
+    if (this.state === RUNTIME_STATE.UNMOUNTED) {
+      return;
+    }
+
+    // Cancel any pending dirty flush
+    this.dirtyFibers.clear();
+    this.flushScheduled = false;
+
+    // Wait for in-flight dirty flush to complete
+    if (this.activeFlush !== null) {
+      try {
+        await this.activeFlush;
+      } catch {
+        // Ignore flush errors during unmount
+      }
+    }
+
+    // HOLE 1: stay UNMOUNTING during destroy (not UNMOUNTED)
+    // If already FAILED, keep FAILED state through destroy
+    // State transition to UNMOUNTED happens AFTER destroy completes
+
+    // If pendingTeardown is active (fail-stop in progress), await it first
+    if (this.pendingTeardown !== null) {
+      try {
+        await this.pendingTeardown;
+      } catch {
+        // Ignore errors — they are already attached to the fail-stop primary error
+      }
+    }
+
+    if (this.currentRoot !== null) {
+      // Collect cleanup errors during unmount
+      const cleanupErrors: Error[] = [];
+      const d = this.destroyFiber(this.currentRoot, cleanupErrors);
+      if (isThenable(d)) {
+        await d;
+      }
+      this.currentRoot = null;
+
+      // HOLE 1: set UNMOUNTED only after destroy finishes
+      // Transition even if FAILED — unmount is the terminal operation
+      this.state = RUNTIME_STATE.UNMOUNTED;
+
+      // Reject with cleanup errors when requested
+      if (rejectOnCleanupError && cleanupErrors.length > 0) {
+        if (cleanupErrors.length === 1) {
+          throw cleanupErrors[0];
+        }
+        throw new AggregateError(cleanupErrors, 'Cleanup errors during unmount');
+      }
+    } else {
+      // No root to destroy — transition to UNMOUNTED
+      this.state = RUNTIME_STATE.UNMOUNTED;
+    }
   }
 
   /**
@@ -1479,6 +2052,338 @@ export class GraphRuntime {
   // ---------------------------------------------------------------------------
   // Materialize
   // ---------------------------------------------------------------------------
+
+  /**
+   * Runs deferred `onUpdate` for a fiber subtree in children→parent order
+   * (siblings in compose order). Call after sibling PLACE/REPLACE peers have
+   * finished `@On*` bus wiring and before {@link flushDeferredLifecycleTree}.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - subtree root
+   * @returns {void | Promise<void>}
+   */
+  private flushPendingOnUpdateTree (
+    fiber: RuntimeFiber<unknown>,
+  ): void | Promise<void> {
+    const children = fiber.children as RuntimeFiber<unknown>[];
+    for (let i = 0; i < children.length; i++) {
+      const childFlush = this.flushPendingOnUpdateTree(children[i] as RuntimeFiber<unknown>);
+      if (isThenable(childFlush)) {
+        return this.continueFlushPendingOnUpdateAsync(fiber, children, i, childFlush);
+      }
+    }
+
+    return this.runPendingOnUpdateIfNeeded(fiber);
+  }
+
+  /**
+   * Async continuation of {@link flushPendingOnUpdateTree}.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - subtree root
+   * @param {RuntimeFiber<unknown>[]} children - child fibers
+   * @param {number} pendingIdx - index of the pending child
+   * @param {PromiseLike<void>} pending - pending child flush
+   * @returns {Promise<void>}
+   */
+  private async continueFlushPendingOnUpdateAsync (
+    fiber: RuntimeFiber<unknown>,
+    children: RuntimeFiber<unknown>[],
+    pendingIdx: number,
+    pending: PromiseLike<void>,
+  ): Promise<void> {
+    await pending;
+    for (let i = pendingIdx + 1; i < children.length; i++) {
+      const childFlush = this.flushPendingOnUpdateTree(children[i] as RuntimeFiber<unknown>);
+      if (isThenable(childFlush)) {
+        await childFlush;
+      }
+    }
+    const selfRes = this.runPendingOnUpdateIfNeeded(fiber);
+    if (isThenable(selfRes)) {
+      await selfRes;
+    }
+  }
+
+  /**
+   * Invokes a stashed `onUpdate` when {@link RuntimeFiber.hasPendingOnUpdate} is set.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber with optional pending onUpdate
+   * @returns {void | Promise<void>}
+   */
+  private runPendingOnUpdateIfNeeded (
+    fiber: RuntimeFiber<unknown>,
+  ): void | Promise<void> {
+    if (fiber.hasPendingOnUpdate !== true) {
+      return;
+    }
+
+    const instance = fiber.instance;
+    const prevProps = fiber.pendingOnUpdatePrevProps;
+    fiber.hasPendingOnUpdate = false;
+    fiber.pendingOnUpdatePrevProps = undefined;
+
+    if (instance === null || !fiber.engine.canUpdate()) {
+      return;
+    }
+
+    try {
+      instance.onUpdate(prevProps, instance.props);
+    } catch (error: unknown) {
+      const cleanupResult = this.runFiberFailedCleanup(fiber, error);
+      if (isThenable(cleanupResult)) {
+        return cleanupResult.then(() => {
+          throw error;
+        });
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Flushes REPLACE victims (including nested under UPDATE), then deferred nested
+   * orphans, then pending onUpdates, then deferred startups for a sibling batch.
+   * When `deferPendingBatchFlush` is true, holds all of the above for the ancestor.
+   * Victims/orphans may already be cleared before a later pass; this path is idempotent.
+   *
+   * Nested orphans held for Late PLACE wiring must die before onUpdate: otherwise
+   * Early onUpdate EventBus publishes dual-deliver to the removed child and any
+   * Late PLACE listener. Sibling-level orphans (pendingOrphanSet in full-diff)
+   * still destroy *after* onUpdate for intentional UPDATE↔DELETE handoff.
+   *
+   * @param {RuntimeFiber<unknown>[]} nextChildren - reconciled sibling fibers
+   * @param {boolean} [deferPendingBatchFlush=false] - hold teardown + lifecycle for ancestor
+   * @returns {void | Promise<void>}
+   */
+  private flushSiblingBatchHooks (
+    nextChildren: RuntimeFiber<unknown>[],
+    deferPendingBatchFlush: boolean = false,
+  ): void | Promise<void> {
+    // When this UPDATE is already deferred for a sibling batch, hold REPLACE-victim
+    // destroy too — nested victim onUnmount must wait until later sibling PLACE wires.
+    // Ancestor flush drains victims → deferred orphans → onUpdate → lifecycle.
+    if (deferPendingBatchFlush) {
+      return;
+    }
+    const victimsRes = this.flushPendingReplaceVictims(nextChildren);
+    if (isThenable(victimsRes)) {
+      return victimsRes.then(
+        () => this.flushSiblingBatchHooksAfterVictims(nextChildren, false),
+      );
+    }
+    return this.flushSiblingBatchHooksAfterVictims(nextChildren, false);
+  }
+
+  /**
+   * Destroys REPLACE victims stashed during sibling-batch reconcile (compose order).
+   * Must run before deferred onUpdate/onMount so onUnmount publishes observe wired peers.
+   * Also invoked before orphan DELETE in full-diff reconcile so orphan onUnmount cannot
+   * dual-deliver to a still-wired victim and its replacement.
+   *
+   * @param {RuntimeFiber<unknown>[]} children - reconciled siblings
+   * @returns {void | Promise<void>}
+   */
+  private flushPendingReplaceVictims (
+    children: RuntimeFiber<unknown>[],
+  ): void | Promise<void> {
+    const victims: RuntimeFiber<unknown>[] = [];
+    this.collectPendingReplaceVictims(children, victims);
+    for (let i = 0; i < victims.length; i++) {
+      const destroyRes = this.destroyFiber(victims[i] as RuntimeFiber<unknown>, []);
+      if (isThenable(destroyRes)) {
+        return this.continueDestroyFiberListAsync(victims, i, destroyRes);
+      }
+    }
+  }
+
+  /**
+   * Depth-first collect of {@link FiberConstructionJournal.pendingReplaceVictim}
+   * under `children` (clears journals as it goes). Nested REPLACE under a deferred
+   * UPDATE leaves victims on descendant replacements that sibling-root flush would miss.
+   *
+   * @param {RuntimeFiber<unknown>[]} children - fibers to scan
+   * @param {RuntimeFiber<unknown>[]} out - collected victims in destroy order
+   * @returns {void}
+   */
+  private collectPendingReplaceVictims (
+    children: RuntimeFiber<unknown>[],
+    out: RuntimeFiber<unknown>[],
+  ): void {
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i] as RuntimeFiber<unknown>;
+      const journal = child.constructionJournal;
+      const victim = journal?.pendingReplaceVictim;
+      if (victim !== undefined) {
+        journal!.pendingReplaceVictim = undefined;
+        out.push(victim);
+      }
+      const nested = child.children as RuntimeFiber<unknown>[];
+      if (nested.length > 0) {
+        this.collectPendingReplaceVictims(nested, out);
+      }
+    }
+  }
+
+  /**
+   * Async continuation for sequential {@link destroyFiber} over a precollected list.
+   *
+   * @param {RuntimeFiber<unknown>[]} fibers - fibers to destroy
+   * @param {number} idx - index whose destroy is in flight
+   * @param {PromiseLike<void>} pending - in-flight destroy
+   * @returns {Promise<void>}
+   */
+  private async continueDestroyFiberListAsync (
+    fibers: RuntimeFiber<unknown>[],
+    idx: number,
+    pending: PromiseLike<void>,
+  ): Promise<void> {
+    await pending;
+    for (let i = idx + 1; i < fibers.length; i++) {
+      const destroyRes = this.destroyFiber(fibers[i] as RuntimeFiber<unknown>, []);
+      if (isThenable(destroyRes)) {
+        await destroyRes;
+      }
+    }
+  }
+
+  private flushSiblingBatchHooksAfterVictims (
+    nextChildren: RuntimeFiber<unknown>[],
+    deferPendingBatchFlush: boolean = false,
+  ): void | Promise<void> {
+    // When the parent UPDATE is already in a deferred sibling batch, nested
+    // reconcile must not flush descendant onUpdate *or* deferred onMount yet — a later
+    // sibling may still PLACE @On* handlers. Ancestor flush drains both after peers wire.
+    if (!deferPendingBatchFlush) {
+      // Nested full-diff under a deferred UPDATE stashes orphans on the UPDATE fiber.
+      // Destroy them before onUpdate (eager nested teardown order before deferral)
+      // so Early onUpdate cannot dual-deliver EventBus to the removed child + Late PLACE.
+      const orphansFlush = this.flushPendingDeferredOrphansTree(nextChildren);
+      if (isThenable(orphansFlush)) {
+        return this.continueFlushSiblingBatchHooksAsync(
+          nextChildren, -1, orphansFlush, 'orphans', deferPendingBatchFlush,
+        );
+      }
+
+      for (let i = 0; i < nextChildren.length; i++) {
+        const onUpdateFlush = this.flushPendingOnUpdateTree(nextChildren[i] as RuntimeFiber<unknown>);
+        if (isThenable(onUpdateFlush)) {
+          return this.continueFlushSiblingBatchHooksAsync(
+            nextChildren, i, onUpdateFlush, 'onUpdate', deferPendingBatchFlush,
+          );
+        }
+      }
+
+      // Always walk each sibling subtree: nested PLACE under an UPDATE sibling keeps
+      // lifecycleDeferred on the descendant, not on the UPDATE root. Skipping the
+      // root-only check is required once nested batch flushes are deferred upward.
+      for (let i = 0; i < nextChildren.length; i++) {
+        const child = nextChildren[i] as RuntimeFiber<unknown>;
+        const lifecycleFlush = this.flushDeferredLifecycleTree(child);
+        if (isThenable(lifecycleFlush)) {
+          return this.continueFlushSiblingBatchHooksAsync(
+            nextChildren, i, lifecycleFlush, 'lifecycle', deferPendingBatchFlush,
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Async continuation of {@link flushSiblingBatchHooksAfterVictims}.
+   *
+   * @param {RuntimeFiber<unknown>[]} nextChildren - sibling fibers
+   * @param {number} pendingIdx - index being awaited
+   * @param {PromiseLike<void>} pending - pending flush
+   * @param {'orphans' | 'onUpdate' | 'lifecycle'} phase - which loop to resume
+   * @returns {Promise<void>}
+   */
+  private async continueFlushSiblingBatchHooksAsync (
+    nextChildren: RuntimeFiber<unknown>[],
+    pendingIdx: number,
+    pending: PromiseLike<void>,
+    phase: 'orphans' | 'onUpdate' | 'lifecycle',
+    deferPendingBatchFlush: boolean = false,
+  ): Promise<void> {
+    await pending;
+
+    if (deferPendingBatchFlush) {
+      return;
+    }
+
+    if (phase === 'orphans') {
+      for (let i = 0; i < nextChildren.length; i++) {
+        const onUpdateFlush = this.flushPendingOnUpdateTree(nextChildren[i] as RuntimeFiber<unknown>);
+        if (isThenable(onUpdateFlush)) {
+          await onUpdateFlush;
+        }
+      }
+      phase = 'lifecycle';
+      pendingIdx = -1;
+    } else if (phase === 'onUpdate') {
+      for (let i = pendingIdx + 1; i < nextChildren.length; i++) {
+        const onUpdateFlush = this.flushPendingOnUpdateTree(nextChildren[i] as RuntimeFiber<unknown>);
+        if (isThenable(onUpdateFlush)) {
+          await onUpdateFlush;
+        }
+      }
+      phase = 'lifecycle';
+      pendingIdx = -1;
+    }
+
+    const lifecycleStart = phase === 'lifecycle' ? pendingIdx + 1 : 0;
+    for (let i = lifecycleStart; i < nextChildren.length; i++) {
+      const child = nextChildren[i] as RuntimeFiber<unknown>;
+      const lifecycleFlush = this.flushDeferredLifecycleTree(child);
+      if (isThenable(lifecycleFlush)) {
+        await lifecycleFlush;
+      }
+    }
+  }
+
+  /**
+   * Destroys orphans stashed on UPDATE fibers when nested full-diff ran under
+   * {@link deferPendingBatchFlush}. Walks `children` depth-first (compose order).
+   *
+   * @param {RuntimeFiber<unknown>[]} children - sibling roots to scan
+   * @returns {void | Promise<void>}
+   */
+  private flushPendingDeferredOrphansTree (
+    children: RuntimeFiber<unknown>[],
+  ): void | Promise<void> {
+    const orphans: RuntimeFiber<unknown>[] = [];
+    this.collectPendingDeferredOrphans(children, orphans);
+    for (let i = 0; i < orphans.length; i++) {
+      const destroyRes = this.destroyFiber(orphans[i] as RuntimeFiber<unknown>, []);
+      if (isThenable(destroyRes)) {
+        return this.continueDestroyFiberListAsync(orphans, i, destroyRes);
+      }
+    }
+  }
+
+  /**
+   * Collects and clears {@link RuntimeFiber.pendingDeferredOrphans} under `children`.
+   *
+   * @param {RuntimeFiber<unknown>[]} children - fibers to scan
+   * @param {RuntimeFiber<unknown>[]} out - collected orphans in destroy order
+   * @returns {void}
+   */
+  private collectPendingDeferredOrphans (
+    children: RuntimeFiber<unknown>[],
+    out: RuntimeFiber<unknown>[],
+  ): void {
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i] as RuntimeFiber<unknown>;
+      const pending = child.pendingDeferredOrphans;
+      if (pending !== undefined && pending.length > 0) {
+        child.pendingDeferredOrphans = undefined;
+        for (let j = 0; j < pending.length; j++) {
+          out.push(pending[j] as RuntimeFiber<unknown>);
+        }
+      }
+      const nested = child.children as RuntimeFiber<unknown>[];
+      if (nested.length > 0) {
+        this.collectPendingDeferredOrphans(nested, out);
+      }
+    }
+  }
 
   /**
    * Runs deferred {@link LifecycleEngine.runStartup} for a fiber subtree in
@@ -1840,7 +2745,7 @@ export class GraphRuntime {
 
     // Wire parent buses BEFORE children materialize/onMount. Children run onMount while
     // descending; if the parent is not subscribed yet, child publishes to @OnEvent /
-    // @OnCommand on the parent are silently dropped (mirror of #80 teardown order).
+    // @OnCommand on the parent are silently dropped (mirror of teardown order).
     try {
       this.attachEffectableRuntimeBusWiring(instance, fiber);
       if (fiber.effectableRuntimeBusDisposer !== undefined) {
@@ -2065,9 +2970,11 @@ export class GraphRuntime {
    * @param {VirtualServiceNode<P>} nextVnode - new virtual node
    * @param {RuntimeFiber | null} parentFiber - parent fiber
    * @param {ContextScope} parentScope - parent scope
-   * @param {boolean} [deferLifecycle=false] - when true, REPLACE materialize wires buses but
-   *   defers onMount until the sibling batch flush in {@link reconcileChildren} (same contract
-   *   as PLACE). Root reconcile must leave this false — nothing else flushes the root.
+   * @param {boolean} [deferLifecycle=false] - when true, REPLACE materialize wires buses,
+   *   defers onMount until the sibling batch flush in {@link reconcileChildren}, and defers
+   *   victim destroy/onUnmount until after later PLACE/REPLACE siblings wire (same batch).
+   *   Root reconcile leaves this false; root REPLACE still wires the replacement
+   *   before destroying the victim, then flushes deferred lifecycle itself.
    * @returns {Promise<RuntimeFiber<P>>}
    */
   private reconcileFiber<P>(
@@ -2081,22 +2988,156 @@ export class GraphRuntime {
     const sameKey = (current.vnode.key ?? null) === (nextVnode.key ?? null);
 
     if (sameType && sameKey) {
-      return this.updateFiber(current, nextVnode, parentFiber, parentScope);
+      // Reuse deferLifecycle as deferOnUpdate: sibling batches must not run
+      // onUpdate (and its publishes) before later PLACE peers wire @On* buses.
+      return this.updateFiber(current, nextVnode, parentFiber, parentScope, deferLifecycle);
     }
 
-    // Type or key changed — destroy the old node, create a new one.
-    // Sync fast-path if both destroy and materialize completed synchronously.
+    // Type or key changed — REPLACE.
     // Collect cleanup errors (ref clear / disposer) so a throwing finalize cannot
     // abort REPLACE and fail-stop the surviving tree — same best-effort contract as unmount.
     //
-    // When deferLifecycle is set (child reconcile batch), REPLACE must not run onMount
-    // before later sibling buses are wired — otherwise a replaced publisher's mount-time
-    // publish is silently dropped by a not-yet-wired PLACE/REPLACE listener beside it.
-    const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
-    if (isThenable(destroyRes)) {
-      return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle));
+    // When deferLifecycle is set (child reconcile batch):
+    // 1) REPLACE must not run onMount before later sibling buses are wired — otherwise a
+    //    replaced publisher's mount-time publish is silently dropped by a not-yet-wired
+    // PLACE/REPLACE listener beside it.
+    // 2) REPLACE must also defer destroy/onUnmount of the victim until after later sibling
+    //    PLACE/REPLACE buses wire — otherwise a victim onUnmount publish is silently dropped
+    //    by a not-yet-wired PLACE listener in the same batch. Stash the victim on the
+    //    replacement journal; flushPendingReplaceVictims destroys it after structure.
+    // 3) Exclusive Command/Query slots must still be released before the replacement
+    //    materializes (same contract as orphan pre-PLACE release). Keep @OnEvent until
+    //    destroy so deferred victim onUnmount publishes still fan out.
+    if (deferLifecycle) {
+      if (this.effectableRuntimeBuses !== null) {
+        try {
+          this.releaseExclusiveRuntimeBusHandlersSubtree(
+            current as RuntimeFiber<unknown>,
+            this.effectableRuntimeBuses,
+          );
+        } catch {
+          // Best-effort: a throwing unregister must not block REPLACE materialize.
+          // destroyFiber still runs the full bus disposer later.
+        }
+      }
+      const attachVictim = (fiber: RuntimeFiber<P>): RuntimeFiber<P> => {
+        fiber.constructionJournal!.pendingReplaceVictim = current as RuntimeFiber<unknown>;
+        return fiber;
+      };
+      const destroyVictimOnMaterializeFailure = (error: unknown): Promise<never> => {
+        // Match eager-destroy semantics: a failed REPLACE leaves no live victim leak.
+        const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
+        if (isThenable(destroyRes)) {
+          return destroyRes.then(() => {
+            throw error;
+          });
+        }
+        return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+      };
+      try {
+        const materializeRes = this.materialize(nextVnode, parentFiber, parentScope, true);
+        if (isThenable(materializeRes)) {
+          return materializeRes.then(attachVictim, destroyVictimOnMaterializeFailure);
+        }
+        return attachVictim(materializeRes);
+      } catch (error: unknown) {
+        const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
+        if (isThenable(destroyRes)) {
+          return destroyRes.then(() => {
+            throw error;
+          });
+        }
+        throw error;
+      }
     }
-    return this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle);
+
+    // Root REPLACE (deferLifecycle=false): nothing else flushes the root, but we still
+    // must wire the replacement's @On* handlers before destroying the victim — otherwise
+    // victim onUnmount publishes on the shared runtime buses are silently dropped.
+    return this.replaceRootWireBeforeDestroy(current, nextVnode, parentFiber, parentScope);
+  }
+
+  /**
+   * Root REPLACE handoff: materialize the replacement with buses wired and onMount
+   * deferred, destroy the victim (so onUnmount can reach new @On* handlers), then flush
+   * the replacement's deferred lifecycle. Sibling REPLACE defers victim destroy via
+   * {@link reconcileFiber} `deferLifecycle=true` + {@link flushPendingReplaceVictims}.
+   *
+   * On flush failure the replacement is destroyed here: it is not yet `currentRoot`, so
+   * failStop would only re-tear the victim and leak exclusive bus registrations.
+   *
+   * @param {RuntimeFiber<P>} current - victim root fiber
+   * @param {VirtualServiceNode<P>} nextVnode - replacement vnode
+   * @param {RuntimeFiber | null} parentFiber - parent fiber (null at root)
+   * @param {ContextScope} parentScope - parent scope
+   * @returns {RuntimeFiber<P> | Promise<RuntimeFiber<P>>}
+   */
+  private replaceRootWireBeforeDestroy<P>(
+    current: RuntimeFiber<P>,
+    nextVnode: VirtualServiceNode<P>,
+    parentFiber: RuntimeFiber<unknown> | null,
+    parentScope: ContextScope,
+  ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    // Free exclusive Command/Query slots on the victim subtree before the replacement
+    // wires the same types. Sibling REPLACE already does this when deferLifecycle
+    // is set; root REPLACE must match. Keep @OnEvent until destroy — victim onUnmount
+    // publishes after the replacement is wired (publisher need not stay subscribed).
+    if (this.effectableRuntimeBuses !== null) {
+      try {
+        this.releaseExclusiveRuntimeBusHandlersSubtree(
+          current as RuntimeFiber<unknown>,
+          this.effectableRuntimeBuses,
+        );
+      } catch {
+        // Best-effort: a throwing unregister must not block root REPLACE handoff.
+        // destroyFiber still runs the full bus disposer later.
+      }
+    }
+
+    const afterMaterialize = (
+      nextFiber: RuntimeFiber<P>,
+    ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
+      const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
+      const afterDestroy = (): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
+        // Replacement is not yet published as currentRoot. If deferred lifecycle flush
+        // fails (e.g. descendant onMount throw), failStop only destroys currentRoot
+        // (the already-torn-down victim) and would leak the replacement's exclusive
+        // @OnCommand/@OnQuery registrations on shared buses. Sibling PLACE flush
+        // failures are reclaimed by HOLE 3; root REPLACE must destroy nextFiber here.
+        const destroyReplacementAndRethrow = (err: unknown): never | Promise<never> => {
+          const cleanupRes = this.destroyFiber(nextFiber as RuntimeFiber<unknown>, []);
+          if (isThenable(cleanupRes)) {
+            return Promise.resolve(cleanupRes).then(() => {
+              throw err;
+            });
+          }
+          throw err;
+        };
+
+        try {
+          const flushRes = this.flushDeferredLifecycleTree(nextFiber as RuntimeFiber<unknown>);
+          if (isThenable(flushRes)) {
+            return Promise.resolve(flushRes).then(
+              () => nextFiber,
+              (err: unknown) => destroyReplacementAndRethrow(err),
+            );
+          }
+          return nextFiber;
+        } catch (err: unknown) {
+          return destroyReplacementAndRethrow(err);
+        }
+      };
+      if (isThenable(destroyRes)) {
+        return destroyRes.then(afterDestroy);
+      }
+      return afterDestroy();
+    };
+
+    const materializeRes = this.materialize(nextVnode, parentFiber, parentScope, true);
+    if (isThenable(materializeRes)) {
+      return materializeRes.then(afterMaterialize);
+    }
+    return afterMaterialize(materializeRes);
   }
 
   /**
@@ -2114,6 +3155,7 @@ export class GraphRuntime {
     nextVnode: VirtualServiceNode<P>,
     parentFiber: RuntimeFiber<unknown> | null,
     parentScope: ContextScope,
+    deferOnUpdate: boolean = false,
   ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
     const instance = current.instance;
 
@@ -2154,26 +3196,19 @@ export class GraphRuntime {
     // Build scope for child nodes (ContextProvider may have updated values)
     const childScope = this.buildChildScope(instance, parentScope);
 
-    // Call onUpdate if props or context changed (React 16.5 class-component style: one hook)
     const propsChanged = prevProps !== instance.props;
-    if ((propsChanged || contextChanged) && current.engine.canUpdate()) {
-      try {
-        instance.onUpdate(prevProps, instance.props);
-      } catch (error: unknown) {
-        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
-        if (isThenable(cleanupResult)) {
-          return cleanupResult.then(() => {
-            throw error;
-          });
-        }
-        throw error;
-      }
+    const shouldOnUpdate = (propsChanged || contextChanged) && current.engine.canUpdate();
+
+    // Sibling-batch UPDATE: stash onUpdate until after later PLACE peers wire buses
+    // (flushed in reconcileChildren before deferred onMount). Root / non-batch UPDATE
+    // runs onUpdate *after* reconcileChildren so same-pass PLACE children are wired.
+    if (shouldOnUpdate && deferOnUpdate) {
+      current.pendingOnUpdatePrevProps = prevProps;
+      current.hasPendingOnUpdate = true;
     }
 
-    // Reconcile child nodes (sync fast-path if all children are sync).
-    // Ref commit is deferred to applyFiberUpdate so a compose()/child-reconcile
-    // failure cannot leave nextRef.current pointing at an instance that failStop
-    // will destroy while fiber.vnode.ref still holds the previous ref.
+    // Compose first; only then touch refs. A compose() throw must not leave nextRef
+    // bound while fiber.vnode.ref still names the previous ref (fail-stop would miss it).
     let nextChildVnodes: VirtualServiceNode[];
     try {
       nextChildVnodes = this.getChildVnodes(instance, nextVnode.children);
@@ -2187,53 +3222,141 @@ export class GraphRuntime {
       throw error;
     }
 
-    const childrenRes = this.reconcileChildren(
-      current.children as RuntimeFiber<unknown>[],
-      nextChildVnodes,
-      current as RuntimeFiber<unknown>,
-      childScope,
-    );
-
-    if (isThenable(childrenRes)) {
-      return childrenRes.then((nextChildren) => {
-        try {
-          this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
-        } catch (error: unknown) {
-          // Children already PLACE/UPDATE/DELETE'd. A throwing commitRef leaves
-          // PLACE/REPLACE fibers unreachable from current.children — failStop cannot
-          // reclaim them. Tear them down before rethrowing (HOLE 3 sibling).
-          const orphanRes = this.destroyOrphanedPlacedChildren(
-            current.children as RuntimeFiber<unknown>[],
-            nextChildren,
-            error,
-          );
-          if (isThenable(orphanRes)) {
-            return orphanRes.then(() => {
-              throw error;
-            });
-          }
-          throw error;
-        }
-        return current;
-      });
-    }
-
+    // Commit the UPDATE ref *before* child reconcile so same-pass PLACE children
+    // see parent nextRef in onMount (mount path already commits before deferred
+    // onMount flush). Child-reconcile failure must roll the commit back: fiber.vnode
+    // still holds previousRef until applyFiberUpdate, so fail-stop would otherwise
+    // clear only the old ref and leave a zombie nextRef.
+    const previousRef = current.vnode.ref;
+    const nextRef = nextVnode.ref;
+    let refCommittedBeforeChildren = false;
     try {
-      this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, childrenRes);
+      this.commitRef(previousRef, instance, nextRef, instance);
+      refCommittedBeforeChildren = true;
     } catch (error: unknown) {
-      const orphanRes = this.destroyOrphanedPlacedChildren(
-        current.children as RuntimeFiber<unknown>[],
-        childrenRes,
-        error,
-      );
-      if (isThenable(orphanRes)) {
-        return orphanRes.then(() => {
+      // commitRef clears nextRef on assign-then-throw; no PLACE orphans yet.
+      const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
+      if (isThenable(cleanupResult)) {
+        return cleanupResult.then(() => {
           throw error;
         });
       }
       throw error;
     }
-    return current;
+
+    const rollbackEarlyRefCommit = (): void => {
+      if (!refCommittedBeforeChildren) {
+        return;
+      }
+      if (nextRef !== undefined && nextRef !== previousRef) {
+        try {
+          this.clearRefSafe(nextRef, instance);
+        } catch {
+          // Best-effort: do not mask the child-reconcile error.
+        }
+      }
+      if (previousRef !== undefined && previousRef !== nextRef) {
+        try {
+          // Must go through commitRef so @UseImperativeHandle WeakMap tracking
+          // matches previousRef.current. A bare resolveRefCurrentValue restore
+          // left an untracked allowlist handle that fail-stop clearRefSafe could
+          // not identity-match — zombie API after ACTIVE→failed.
+          this.commitRef(undefined, null, previousRef, instance);
+        } catch {
+          // Best-effort restore before fail-stop clears previousRef.
+        }
+      }
+    };
+
+    let childrenRes: RuntimeFiber<unknown>[] | Promise<RuntimeFiber<unknown>[]>;
+    try {
+      // When this UPDATE's onUpdate is deferred for a sibling batch, also hold nested
+      // onUpdate + deferred onMount flushes until the ancestor batch drain — otherwise
+      // a nested PLACE under Early mounts/publishes before Late's nested @On* wire.
+      childrenRes = this.reconcileChildren(
+        current.children as RuntimeFiber<unknown>[],
+        nextChildVnodes,
+        current as RuntimeFiber<unknown>,
+        childScope,
+        deferOnUpdate,
+      );
+    } catch (error: unknown) {
+      rollbackEarlyRefCommit();
+      throw error;
+    }
+
+    const afterChildren = (nextChildren: RuntimeFiber<unknown>[]): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
+      if (shouldOnUpdate && !deferOnUpdate) {
+        try {
+          instance.onUpdate(prevProps, instance.props);
+        } catch (error: unknown) {
+          // Early commitRef already bound nextRef, but fiber.vnode.ref still names
+          // previousRef until applyFiberUpdate. Without rollback, fail-stop clears
+          // only previousRef and leaves a zombie nextRef (use-after-teardown).
+          rollbackEarlyRefCommit();
+          const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
+          if (isThenable(cleanupResult)) {
+            return cleanupResult.then(() => {
+              throw error;
+            });
+          }
+          throw error;
+        }
+      }
+
+      try {
+        this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
+      } catch (error: unknown) {
+        // Children already PLACE/UPDATE/DELETE'd. A throwing applyFiberUpdate leaves
+        // PLACE/REPLACE fibers unreachable from current.children — failStop cannot
+        // reclaim them. Tear them down before rethrowing (HOLE 3 sibling).
+        // If vnode was not swapped yet, roll the early ref commit back the same way
+        // as an onUpdate failure; after swap, fail-stop clears nextRef via vnode.ref.
+        if (current.vnode !== nextVnode) {
+          rollbackEarlyRefCommit();
+        }
+        const orphanRes = this.destroyOrphanedPlacedChildren(
+          current.children as RuntimeFiber<unknown>[],
+          nextChildren,
+          error,
+        );
+        if (isThenable(orphanRes)) {
+          return Promise.resolve(orphanRes).then(() => {
+            throw error;
+          });
+        }
+        throw error;
+      }
+      return current;
+    };
+
+    if (isThenable(childrenRes)) {
+      return childrenRes.then(
+        (nextChildren) => {
+          try {
+            return afterChildren(nextChildren);
+          } catch (error: unknown) {
+            const orphanRes = this.destroyOrphanedPlacedChildren(
+              current.children as RuntimeFiber<unknown>[],
+              nextChildren,
+              error,
+            );
+            if (isThenable(orphanRes)) {
+              return orphanRes.then(() => {
+                throw error;
+              });
+            }
+            throw error;
+          }
+        },
+        (error: unknown) => {
+          rollbackEarlyRefCommit();
+          throw error;
+        },
+      );
+    }
+
+    return afterChildren(childrenRes);
   }
 
   /**
@@ -2273,7 +3396,7 @@ export class GraphRuntime {
     };
 
     const finishParent = (): void | Promise<void> => {
-      fiber.children = [];
+      this.setFiberChildren(fiber, []);
       const cleanupResult = fiber.engine.runFailedCleanup(instance, true);
       if (isThenable(cleanupResult)) {
         return cleanupResult.then(
@@ -2374,7 +3497,7 @@ export class GraphRuntime {
         continue;
       }
       try {
-        const destroyRes = this.destroyFiber(child, rollbackErrors);
+        const destroyRes = this.destroyPlacedFiberWithReplaceVictim(child, rollbackErrors);
         if (isThenable(destroyRes)) {
           return destroyRes.then(
             async () => {
@@ -2384,7 +3507,7 @@ export class GraphRuntime {
                   continue;
                 }
                 try {
-                  const r = this.destroyFiber(rest, rollbackErrors);
+                  const r = this.destroyPlacedFiberWithReplaceVictim(rest, rollbackErrors);
                   if (isThenable(r)) {
                     await r;
                   }
@@ -2402,7 +3525,7 @@ export class GraphRuntime {
                   continue;
                 }
                 try {
-                  const r = this.destroyFiber(rest, rollbackErrors);
+                  const r = this.destroyPlacedFiberWithReplaceVictim(rest, rollbackErrors);
                   if (isThenable(r)) {
                     await r;
                   }
@@ -2423,6 +3546,42 @@ export class GraphRuntime {
   }
 
   /**
+   * Destroys a PLACE/REPLACE fiber and any stashed REPLACE victim deferred for sibling
+   * bus wiring. HOLE-3 orphan teardown must not leak victims when the replacement is
+   * rolled back before {@link flushPendingReplaceVictims}.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - new PLACE/REPLACE fiber
+   * @param {Error[]} collectErrors - cleanup error sink
+   * @returns {void | Promise<void>}
+   */
+  private destroyPlacedFiberWithReplaceVictim (
+    fiber: RuntimeFiber<unknown>,
+    collectErrors: Error[],
+  ): void | Promise<void> {
+    const victim = fiber.constructionJournal?.pendingReplaceVictim;
+    if (victim !== undefined) {
+      fiber.constructionJournal!.pendingReplaceVictim = undefined;
+      const victimRes = this.destroyFiber(victim, collectErrors);
+      if (isThenable(victimRes)) {
+        return victimRes.then(() => this.destroyFiber(fiber, collectErrors));
+      }
+    }
+    return this.destroyFiber(fiber, collectErrors);
+  }
+
+  /**
+   * Applies the reconcile result to the current fiber in-place.
+   * In-place mutation instead of spread: 0 heap allocations on UPDATE
+   * (3.09x speedup). Safe: RuntimeFiber is private.
+   *
+   * @param {RuntimeFiber<P>} current - current fiber
+   * @param {VirtualServiceNode<P>} nextVnode - new vnode
+   * @param {RuntimeFiber<unknown> | null} parentFiber - parent fiber
+   * @param {ContextScope} parentScope - parent scope
+   * @param {RuntimeFiber<unknown>[]} nextChildren - new child fibers
+   * @returns {void}
+   */
+  /**
    * Applies the reconcile result to the current fiber in-place.
    * In-place mutation instead of spread: 0 heap allocations on UPDATE
    * (3.09x speedup). Safe: RuntimeFiber is private.
@@ -2441,15 +3600,12 @@ export class GraphRuntime {
     parentScope: ContextScope,
     nextChildren: RuntimeFiber<unknown>[],
   ): void {
-    const instance = current.instance;
-    if (instance !== null) {
-      // Commit ref only after compose + child reconcile succeeded.
-      this.commitRef(current.vnode.ref, instance, nextVnode.ref, instance);
-    }
-
+    // Ref already committed in updateFiber after compose and before child
+    // reconcile (so PLACE onMount observes parent nextRef). Only publish the
+    // fiber bookkeeping here.
     current.vnode = nextVnode;
     current.parentFiber = parentFiber as RuntimeFiber<unknown> | null;
-    current.children = nextChildren as Fiber[];
+    this.setFiberChildren(current as RuntimeFiber<unknown>, nextChildren as Fiber[]);
     current.effectTag = FIBER_EFFECT_TAG.UPDATE;
     current.scope = parentScope;
     current.lifecycleStatus = current.engine.getStatus();
@@ -2469,6 +3625,9 @@ export class GraphRuntime {
    * @param {VirtualServiceNode[]} nextVnodes - new child virtual nodes
    * @param {RuntimeFiber} parentFiber - parent fiber
    * @param {ContextScope} childScope - scope for child nodes
+   * @param {boolean} [deferPendingBatchFlush=false] - when true (parent UPDATE is in a
+   *   deferred sibling batch), skip nested onUpdate/onMount flush so a later sibling
+   *   can finish PLACE bus wiring first; ancestor {@link flushSiblingBatchHooks} drains
    * @returns {Promise<RuntimeFiber[]>}
    */
   private reconcileChildren (
@@ -2476,12 +3635,33 @@ export class GraphRuntime {
     nextVnodes: VirtualServiceNode[],
     parentFiber: RuntimeFiber<unknown>,
     childScope: ContextScope,
+    deferPendingBatchFlush: boolean = false,
   ): RuntimeFiber<unknown>[] | Promise<RuntimeFiber<unknown>[]> {
     // === FAST PATH: stable children (N≤32, same type+key per position) ===
     // 9.31x speedup vs full diff for stable trees (typical HFT scenario)
     if (this.isStableChildren(currentChildren, nextVnodes)) {
       const n = nextVnodes.length;
       const stableResult: RuntimeFiber<unknown>[] = [];
+
+      // Stable path walks siblings left-to-right with full nested reconcile (including
+      // PLACE) before the next sibling UPDATE. Preview each UPDATE's child diff and
+      // free exclusive Command/Query slots that a later sibling still holds — same
+      // contract as full-diff deferred-UPDATE preview, which never runs on this fast-path.
+      if (this.effectableRuntimeBuses !== null) {
+        const buses = this.effectableRuntimeBuses;
+        for (let i = 0; i < n; i += 1) {
+          try {
+            this.releaseExclusiveUnderDeferredUpdate(
+              currentChildren[i] as RuntimeFiber<unknown>,
+              nextVnodes[i] as VirtualServiceNode<unknown>,
+              buses,
+              childScope,
+            );
+          } catch {
+            // Best-effort — real UPDATE still runs in the sibling walk.
+          }
+        }
+      }
 
       for (let i = 0; i < n; i++) {
         const reconciled = this.reconcileFiber(
@@ -2495,17 +3675,25 @@ export class GraphRuntime {
         if (isThenable(reconciled)) {
           return this.continueStableReconcileAsync(
             stableResult, reconciled, i, nextVnodes, currentChildren, parentFiber, childScope,
+            deferPendingBatchFlush,
           );
         }
 
         stableResult.push(reconciled);
       }
 
+      const batchFlush = this.flushSiblingBatchHooks(stableResult, deferPendingBatchFlush);
+      if (isThenable(batchFlush)) {
+        return Promise.resolve(batchFlush).then(() => stableResult);
+      }
+
       return stableResult;
     }
 
     // === FULL DIFF PATH — always async (complex logic; sync path not optimized here) ===
-    return this.reconcileChildrenFullDiff(currentChildren, nextVnodes, parentFiber, childScope);
+    return this.reconcileChildrenFullDiff(
+      currentChildren, nextVnodes, parentFiber, childScope, deferPendingBatchFlush,
+    );
   }
 
   /**
@@ -2518,6 +3706,7 @@ export class GraphRuntime {
    * @param {RuntimeFiber<unknown>[]} currentChildren - all current fibers
    * @param {RuntimeFiber<unknown>} parentFiber - parent fiber
    * @param {ContextScope} childScope - children scope
+   * @param {boolean} [deferPendingBatchFlush=false] - hold nested onUpdate/onMount for ancestor
    * @returns {Promise<RuntimeFiber<unknown>[]>}
    */
   private async continueStableReconcileAsync (
@@ -2528,6 +3717,7 @@ export class GraphRuntime {
     currentChildren: RuntimeFiber<unknown>[],
     parentFiber: RuntimeFiber<unknown>,
     childScope: ContextScope,
+    deferPendingBatchFlush: boolean = false,
   ): Promise<RuntimeFiber<unknown>[]> {
     this.stableAsyncContinueCount += 1;
     resultSoFar.push(await pending);
@@ -2541,6 +3731,11 @@ export class GraphRuntime {
         true,
       );
       resultSoFar.push(isThenable(reconciled) ? await reconciled : (reconciled as RuntimeFiber<unknown>));
+    }
+
+    const batchFlush = this.flushSiblingBatchHooks(resultSoFar, deferPendingBatchFlush);
+    if (isThenable(batchFlush)) {
+      await batchFlush;
     }
 
     return resultSoFar;
@@ -2601,6 +3796,7 @@ export class GraphRuntime {
    * @param {VirtualServiceNode[]} nextVnodes - new vnodes
    * @param {RuntimeFiber<unknown>} parentFiber - parent fiber
    * @param {ContextScope} childScope - children scope
+   * @param {boolean} [deferPendingBatchFlush=false] - hold nested onUpdate/onMount for ancestor
    * @returns {Promise<RuntimeFiber<unknown>[]>}
    * @throws {Error} when duplicate keys are detected in current or next children
    */
@@ -2609,6 +3805,7 @@ export class GraphRuntime {
     nextVnodes: VirtualServiceNode[],
     parentFiber: RuntimeFiber<unknown>,
     childScope: ContextScope,
+    deferPendingBatchFlush: boolean = false,
   ): Promise<RuntimeFiber<unknown>[]> {
     // Validate unique keys BEFORE any side effects (Option A: React v16.5 contract)
     this.validateUniqueKeys(currentChildren, parentFiber, 'current');
@@ -2634,16 +3831,234 @@ export class GraphRuntime {
 
     const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
     const nextChildren: RuntimeFiber<unknown>[] = [];
+
+    // Leaving fibers that can still hold exclusive slots during pass-1:
+    // - orphans (unpaired) — type-scoped release so UPDATE→orphan execute/query survives
+    // when no PLACE claims the type;
+    // - REPLACE victims (matched key/position, type/key change) — PLACE siblings earlier
+    // in compose order can run while the victim is still alive.
+    // Walk subtrees (nested exclusive under wrappers). `@OnEvent` stays until destroy
+    // either way (multi-subscriber). Generation-safe exclusive release must not wipe
+    // a PLACE that already claimed the same type when REPLACE later re-releases the victim.
+    const fullDiffOrphans = this.collectFullDiffOrphans(
+      currentChildren,
+      nextVnodes,
+      hasKeyedCurrent,
+    );
+    const fullDiffReplaceVictims = this.collectFullDiffReplaceVictims(
+      currentChildren,
+      nextVnodes,
+      hasKeyedCurrent,
+    );
+
+    // Publish leaving fibers for attachEffectableRuntimeBusWiring so nested PLACE
+    // under a wrapper / deferred UPDATE can free exclusive slots the sibling-root
+    // claimed-type union never sees. Nest with any outer full-diff handoff (parent
+    // orphan must stay visible while an UPDATE child materializes).
+    const previousExclusiveHandoff = this.pendingExclusiveHandoffFibers;
+    this.pendingExclusiveHandoffFibers = previousExclusiveHandoff === null
+      ? [...fullDiffOrphans, ...fullDiffReplaceVictims]
+      : [...previousExclusiveHandoff, ...fullDiffOrphans, ...fullDiffReplaceVictims];
+
+    try {
+      return await this.reconcileChildrenFullDiffWithHandoff(
+        currentChildren,
+        nextVnodes,
+        parentFiber,
+        childScope,
+        hasKeyedCurrent,
+        currentChildrenSet,
+        unkeyedCurrent,
+        nextChildren,
+        fullDiffOrphans,
+        fullDiffReplaceVictims,
+        deferPendingBatchFlush,
+      );
+    } finally {
+      this.pendingExclusiveHandoffFibers = previousExclusiveHandoff;
+    }
+  }
+
+  /**
+   * Full-diff body after {@link pendingExclusiveHandoffFibers} is installed.
+   * Split so the handoff list is always restored via `finally` (including nested
+   * full-diff under an UPDATE).
+   *
+   * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
+   * @param {VirtualServiceNode[]} nextVnodes - next child vnodes
+   * @param {RuntimeFiber<unknown>} parentFiber - parent fiber
+   * @param {ContextScope} childScope - children scope
+   * @param {boolean} hasKeyedCurrent - whether any current child is keyed
+   * @param {Set<RuntimeFiber<unknown>>} currentChildrenSet - identity set for rollback
+   * @param {RuntimeFiber<unknown>[]} unkeyedCurrent - unkeyed current buffer (mutated)
+   * @param {RuntimeFiber<unknown>[]} nextChildren - output buffer (mutated)
+   * @param {RuntimeFiber<unknown>[]} fullDiffOrphans - unpaired current fibers
+   * @param {RuntimeFiber<unknown>[]} fullDiffReplaceVictims - REPLACE victims
+   * @param {boolean} [deferPendingBatchFlush=false] - hold nested onUpdate/onMount for ancestor
+   * @returns {Promise<RuntimeFiber<unknown>[]>}
+   */
+  private async reconcileChildrenFullDiffWithHandoff (
+    currentChildren: RuntimeFiber<unknown>[],
+    nextVnodes: VirtualServiceNode[],
+    parentFiber: RuntimeFiber<unknown>,
+    childScope: ContextScope,
+    hasKeyedCurrent: boolean,
+    currentChildrenSet: Set<RuntimeFiber<unknown>>,
+    unkeyedCurrent: RuntimeFiber<unknown>[],
+    nextChildren: RuntimeFiber<unknown>[],
+    fullDiffOrphans: RuntimeFiber<unknown>[],
+    fullDiffReplaceVictims: RuntimeFiber<unknown>[],
+    deferPendingBatchFlush: boolean = false,
+  ): Promise<RuntimeFiber<unknown>[]> {
     let unkeyedIdx = 0;
+
+    // Complexity invariant: O(N + L) over next siblings N and leaving fibers L
+    // (orphans + REPLACE victims) — not O(P×L) per PLACE/REPLACE. Union exclusive
+    // types claimed by incoming PLACE/REPLACE once, then one type-scoped subtree
+    // release over leaving fibers before pass-1 materialize.
+    if (this.effectableRuntimeBuses !== null) {
+      const claimedCommandTypes = new Set<string>();
+      const claimedQueryTypes = new Set<string>();
+      const unkeyedForClaim: RuntimeFiber<unknown>[] = [];
+      let unkeyedClaimIdx = 0;
+      const keyedForClaim = hasKeyedCurrent
+        ? new Map<string | number, RuntimeFiber<unknown>>()
+        : null;
+
+      if (keyedForClaim !== null) {
+        for (const child of currentChildren) {
+          const key = child.vnode.key;
+          if (key !== undefined) {
+            keyedForClaim.set(key, child);
+          } else {
+            unkeyedForClaim.push(child);
+          }
+        }
+      } else {
+        for (const child of currentChildren) {
+          unkeyedForClaim.push(child);
+        }
+      }
+
+      const addClaimedTypes = (vnode: VirtualServiceNode<unknown>): void => {
+        const types = collectExclusiveHandlerTypesFromType(vnode.type);
+        for (const commandType of types.commandTypes) {
+          claimedCommandTypes.add(commandType);
+        }
+        for (const queryType of types.queryTypes) {
+          claimedQueryTypes.add(queryType);
+        }
+      };
+
+      for (const nextVnode of nextVnodes) {
+        const nextKey = nextVnode.key;
+        let currentFiber: RuntimeFiber<unknown> | undefined;
+        if (keyedForClaim !== null && nextKey !== undefined && keyedForClaim.has(nextKey)) {
+          currentFiber = keyedForClaim.get(nextKey);
+          keyedForClaim.delete(nextKey);
+        } else if (nextKey === undefined && unkeyedClaimIdx < unkeyedForClaim.length) {
+          currentFiber = unkeyedForClaim[unkeyedClaimIdx];
+          unkeyedClaimIdx += 1;
+        }
+
+        const isUpdateMatch = (
+          currentFiber !== undefined &&
+          currentFiber.vnode.type === nextVnode.type &&
+          (currentFiber.vnode.key ?? null) === (nextVnode.key ?? null)
+        );
+        if (!isUpdateMatch) {
+          addClaimedTypes(nextVnode as VirtualServiceNode<unknown>);
+        }
+      }
+
+      if (claimedCommandTypes.size > 0 || claimedQueryTypes.size > 0) {
+        const buses = this.effectableRuntimeBuses;
+        const onlyTypes = {
+          commandTypes: claimedCommandTypes,
+          queryTypes: claimedQueryTypes,
+        };
+        for (const leaving of [...fullDiffOrphans, ...fullDiffReplaceVictims]) {
+          try {
+            this.releaseExclusiveRuntimeBusHandlersSubtree(leaving, buses, onlyTypes);
+          } catch {
+            // Best-effort: a throwing unregister must not skip remaining fibers or block PLACE.
+            // destroyFiber still runs the full bus disposer later.
+          }
+        }
+      }
+    }
+
+
+    // Preview deferred UPDATEs and free exclusive slots their child diffs will drop
+    // before any PLACE in this batch. Orphan/victim type-scoped release above
+    // does not cover nested handlers under a *surviving* UPDATE wrapper.
+    if (this.effectableRuntimeBuses !== null) {
+      const buses = this.effectableRuntimeBuses;
+      const unkeyedForPreview: RuntimeFiber<unknown>[] = [];
+      let unkeyedPreviewIdx = 0;
+      const keyedForPreview = hasKeyedCurrent
+        ? new Map<string | number, RuntimeFiber<unknown>>()
+        : null;
+
+      if (keyedForPreview !== null) {
+        for (const child of currentChildren) {
+          const key = child.vnode.key;
+          if (key !== undefined) {
+            keyedForPreview.set(key, child);
+          } else {
+            unkeyedForPreview.push(child);
+          }
+        }
+      } else {
+        for (const child of currentChildren) {
+          unkeyedForPreview.push(child);
+        }
+      }
+
+      for (const nextVnode of nextVnodes) {
+        const nextKey = nextVnode.key;
+        let currentFiber: RuntimeFiber<unknown> | undefined;
+        if (keyedForPreview !== null && nextKey !== undefined && keyedForPreview.has(nextKey)) {
+          currentFiber = keyedForPreview.get(nextKey);
+        } else if (nextKey === undefined && unkeyedPreviewIdx < unkeyedForPreview.length) {
+          currentFiber = unkeyedForPreview[unkeyedPreviewIdx];
+          unkeyedPreviewIdx += 1;
+        }
+
+        if (
+          currentFiber !== undefined &&
+          currentFiber.vnode.type === nextVnode.type &&
+          (currentFiber.vnode.key ?? null) === (nextVnode.key ?? null)
+        ) {
+          try {
+            this.releaseExclusiveUnderDeferredUpdate(
+              currentFiber,
+              nextVnode as VirtualServiceNode<unknown>,
+              buses,
+              childScope,
+            );
+          } catch {
+            // Best-effort — real UPDATE still runs in pass 2.
+          }
+        }
+      }
+    }
 
     // Pass-1 defers same-type UPDATE until after PLACE/REPLACE siblings are wired.
     // Otherwise UPDATE `onUpdate` can publish before a later PLACE sibling's `@On*`
-    // handlers exist — silent event loss (same class as #108 onMount/PLACE ordering).
+    // handlers exist — silent event loss (same class as onMount/PLACE ordering).
     const pendingUpdates: Array<{
       slot: number;
       current: RuntimeFiber<unknown>;
       nextVnode: VirtualServiceNode<unknown>;
     }> = [];
+
+    // Orphan DELETE must run *after* deferred UPDATEs (pass 2). moved orphan
+    // destroy before pass 2 so PLACE could wire first, but that also ran sibling
+    // onUnmount before UPDATE onUpdate — silent handoff loss / stale props on the
+    // surviving listener. Collect orphans here; release the keyed Map before pass 2.
+    /** Unmatched current children to destroy; iteration uses compose order below. */
+    const pendingOrphanSet = new Set<RuntimeFiber<unknown>>();
 
     /**
      * Same type+key → schedule UPDATE for pass 2; otherwise REPLACE with deferred startup.
@@ -2670,6 +4085,8 @@ export class GraphRuntime {
         return;
       }
 
+      // REPLACE materializes a new instance that may need exclusive slots still held
+      // by a same-batch orphan (pre-pass above already freed claimed exclusive types).
       const reconciledRes = this.reconcileFiber(
         currentFiber,
         nextVnode,
@@ -2722,20 +4139,15 @@ export class GraphRuntime {
                 nextVnode as VirtualServiceNode<unknown>,
               );
             } else {
-              // New node — PLACE: defer startup so later sibling buses wire first.
+              // New node — PLACE: materialize with deferred startup so later sibling buses wire first.
               const newRes = this.materialize(nextVnode, parentFiber, childScope, true);
               nextChildren.push(isThenable(newRes) ? await newRes : newRes);
             }
           }
 
-          // Destroy remaining unpaired current children (keyed).
-          // Best-effort: collect finalize errors so one throwing ref clear cannot
-          // skip remaining orphans and fail-stop the whole runtime.
+          // Queue unpaired keyed orphans — destroy after pass-2 UPDATEs (see pendingOrphanSet).
           for (const [, orphan] of keyedCurrentMap) {
-            const d = this.destroyFiber(orphan, []);
-            if (isThenable(d)) {
-              await d;
-            }
+            pendingOrphanSet.add(orphan);
           }
         } finally {
           this.reconcileDepth--;
@@ -2757,45 +4169,124 @@ export class GraphRuntime {
               nextVnode as VirtualServiceNode<unknown>,
             );
           } else {
-            // New node — PLACE: defer startup so later sibling buses wire first.
+            // New node — PLACE: materialize with deferred startup so later sibling buses wire first.
             const newRes = this.materialize(nextVnode, parentFiber, childScope, true);
             nextChildren.push(isThenable(newRes) ? await newRes : newRes);
           }
         }
       }
 
-      // Destroy remaining unpaired unkeyed children (best-effort finalize errors).
+      // Queue unpaired unkeyed orphans (destroyed after pass-2 UPDATEs).
       for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
         const orphan = unkeyedCurrent[i];
 
         if (orphan !== undefined) {
-          const d = this.destroyFiber(orphan, []);
-          if (isThenable(d)) {
-            await d;
-          }
+          pendingOrphanSet.add(orphan);
         }
       }
 
-      // Pass 2: run deferred UPDATEs. PLACE/REPLACE siblings are already wired, so
-      // onUpdate publishes reach new @On* handlers before deferred onMount flush.
+      // Pass 2: run deferred UPDATEs with onUpdate stashed. Sibling PLACE/REPLACE are
+      // already wired in pass 1, but a later UPDATE sibling may still PLACE *nested*
+      // children during this pass — immediate onUpdate here would publish before those
+      // nested @On* handlers exist (silent drop; only covered sibling PLACE).
+      // Orphans stay alive until after the onUpdate flush so UPDATE↔DELETE handoff
+      // keeps order (onUpdate before sibling onUnmount).
       for (const pending of pendingUpdates) {
         const updatedRes = this.updateFiber(
           pending.current,
           pending.nextVnode,
           parentFiber,
           childScope,
+          true,
         );
         nextChildren[pending.slot] = isThenable(updatedRes) ? await updatedRes : updatedRes;
       }
 
-      // Flush PLACE/REPLACE startups in compose order after every new sibling is wired.
-      for (const child of nextChildren) {
-        if (child.constructionJournal?.lifecycleDeferred === true) {
-          const flush = this.flushDeferredLifecycleTree(child);
-          if (isThenable(flush)) {
-            await flush;
+      // When this full-diff runs under a parent UPDATE that deferred its batch flush,
+      // hold REPLACE-victim destroy, onUpdate, and orphan DELETE until the ancestor
+      // drains — a later sibling may still PLACE @On* that must observe onUnmount /
+      // onUpdate publishes. Free exclusive Command/Query on stashed orphans now so
+      // later PLACE can claim them; keep EventBus until destroy (same contract as
+      // deferred REPLACE victims).
+      if (deferPendingBatchFlush) {
+        const stashed: RuntimeFiber<unknown>[] = [];
+        for (const child of currentChildren) {
+          if (!pendingOrphanSet.has(child)) {
+            continue;
+          }
+          stashed.push(child);
+        }
+        if (stashed.length > 0) {
+          const buses = this.effectableRuntimeBuses;
+          if (buses !== null) {
+            for (let i = 0; i < stashed.length; i++) {
+              try {
+                this.releaseExclusiveRuntimeBusHandlersSubtree(stashed[i] as RuntimeFiber<unknown>, buses);
+              } catch {
+                // Best-effort: destroyFiber still runs the full bus disposer later.
+              }
+            }
+          }
+          const existing = parentFiber.pendingDeferredOrphans;
+          if (existing === undefined) {
+            parentFiber.pendingDeferredOrphans = stashed;
+          } else {
+            for (let i = 0; i < stashed.length; i++) {
+              existing.push(stashed[i] as RuntimeFiber<unknown>);
+            }
           }
         }
+      } else {
+        // Order matches flushSiblingBatchHooks for nested teardown:
+        // REPLACE victims → deferred nested orphans → onUpdate → sibling orphans.
+        // Victims/nested-orphans must die before onUpdate: after nested teardown
+        // deferral they survive until this ancestor drain — onUpdate-first dual-
+        // delivers EventBus to the removed instance and any Late PLACE listener /
+        // replacement. Sibling-level pendingOrphanSet stays until after onUpdate so
+        // UPDATE↔DELETE handoff still reaches orphan @On*. Pass-1 PLACE/REPLACE and
+        // nested PLACE under later UPDATEs are already wired before this block.
+        const victimsRes = this.flushPendingReplaceVictims(nextChildren);
+        if (isThenable(victimsRes)) {
+          await victimsRes;
+        }
+
+        const deferredOrphansRes = this.flushPendingDeferredOrphansTree(nextChildren);
+        if (isThenable(deferredOrphansRes)) {
+          await deferredOrphansRes;
+        }
+
+        for (let i = 0; i < nextChildren.length; i++) {
+          const onUpdateFlush = this.flushPendingOnUpdateTree(
+            nextChildren[i] as RuntimeFiber<unknown>,
+          );
+          if (isThenable(onUpdateFlush)) {
+            await onUpdateFlush;
+          }
+        }
+
+        // Destroy sibling orphans after onUpdate flush in original compose order (not
+        // keyed-then-unkeyed). Keyed-first teardown inverted compose order when an
+        // unkeyed sibling preceded a keyed one, so an earlier unkeyed onUnmount publish
+        // could miss a later keyed @On* listener. PLACE peers are already wired, so
+        // onUnmount publishes still reach same-batch PLACE @On*.
+        for (const child of currentChildren) {
+          if (!pendingOrphanSet.has(child)) {
+            continue;
+          }
+          const d = this.destroyFiber(child, []);
+          if (isThenable(d)) {
+            await d;
+          }
+        }
+      }
+
+      // onUpdates already flushed above (unless held for ancestor); this pass runs
+      // deferred PLACE/REPLACE onMount in compose order after every new sibling (and
+      // nested PLACE) is wired — or skips when the parent UPDATE deferred the batch.
+      // REPLACE victims may already be cleared above (before orphan DELETE); idempotent.
+      const batchFlush = this.flushSiblingBatchHooks(nextChildren, deferPendingBatchFlush);
+      if (isThenable(batchFlush)) {
+        await batchFlush;
       }
 
       return nextChildren;
@@ -2811,9 +4302,9 @@ export class GraphRuntime {
           continue;
         }
 
-        // New fiber (PLACE or REPLACE result) — destroy it
+        // New fiber (PLACE or REPLACE result) — destroy it (+ deferred REPLACE victim)
         try {
-          const d = this.destroyFiber(child, rollbackErrors);
+          const d = this.destroyPlacedFiberWithReplaceVictim(child, rollbackErrors);
           if (isThenable(d)) {
             await d;
           }
@@ -2911,6 +4402,60 @@ export class GraphRuntime {
    * @returns {void | Promise<void>}
    */
   private destroyFiber (fiber: RuntimeFiber<unknown>, collectErrors: Error[] | null = null): void | Promise<void> {
+    // REPLACE victims stashed under deferred sibling-batch REPLACE are not in
+    // `fiber.children`. fail-stop / parent destroy must reclaim them — otherwise a
+    // later sibling throw before flushSiblingBatchHooks leaves the victim's
+    // EventBus (and lifecycle) alive after the runtime is FAILED.
+    const stashedVictim = fiber.constructionJournal?.pendingReplaceVictim;
+    if (stashedVictim !== undefined) {
+      fiber.constructionJournal!.pendingReplaceVictim = undefined;
+      try {
+        const victimRes = this.destroyFiber(stashedVictim, collectErrors);
+        if (isThenable(victimRes)) {
+          return victimRes.then(() => this.destroyFiber(fiber, collectErrors));
+        }
+      } catch (err: unknown) {
+        if (collectErrors !== null) {
+          collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    // Orphans stashed for a deferred nested full-diff are not in `fiber.children`.
+    // Clear the stash up front, but if one orphan's destroy is async the remaining
+    // entries in the local list must still be drained — otherwise fail-stop after
+    // Early stashes multiple orphans and the first has async onUnmount leaves later
+    // orphans' EventBus subscribed after the runtime is FAILED.
+    const deferredOrphans = fiber.pendingDeferredOrphans;
+    if (deferredOrphans !== undefined && deferredOrphans.length > 0) {
+      fiber.pendingDeferredOrphans = undefined;
+      for (let i = 0; i < deferredOrphans.length; i++) {
+        try {
+          const orphanRes = this.destroyFiber(
+            deferredOrphans[i] as RuntimeFiber<unknown>,
+            collectErrors,
+          );
+          if (isThenable(orphanRes)) {
+            return this.continueDestroyDeferredOrphansAsync(
+              fiber,
+              deferredOrphans,
+              i,
+              orphanRes,
+              collectErrors,
+            );
+          }
+        } catch (err: unknown) {
+          if (collectErrors !== null) {
+            collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+          } else {
+            throw err;
+          }
+        }
+      }
+    }
+
     const children = fiber.children;
     const n = children.length;
 
@@ -2954,6 +4499,57 @@ export class GraphRuntime {
     // Always finalize the fiber even if shutdown failed (best-effort cleanup)
     // finalizeFiberDestroy uses commitRef for identity-safe ref clearing
     this.finalizeFiberDestroy(fiber, collectErrors);
+  }
+
+  /**
+   * Async continuation after a stashed {@link RuntimeFiber.pendingDeferredOrphans}
+   * entry returns a Promise. Drains the remaining local orphan list (the journal
+   * slot was already cleared), then resumes {@link destroyFiber} for `fiber`
+   * itself (live children + shutdown).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber that owned the stash
+   * @param {RuntimeFiber<unknown>[]} orphans - cleared stash snapshot
+   * @param {number} pendingIdx - index whose destroy is in flight
+   * @param {PromiseLike<void>} pending - in-flight orphan destroy
+   * @param {Error[] | null} collectErrors - array to collect cleanup errors
+   * @returns {Promise<void>}
+   */
+  private async continueDestroyDeferredOrphansAsync (
+    fiber: RuntimeFiber<unknown>,
+    orphans: RuntimeFiber<unknown>[],
+    pendingIdx: number,
+    pending: PromiseLike<void>,
+    collectErrors: Error[] | null = null,
+  ): Promise<void> {
+    try {
+      await pending;
+    } catch (err: unknown) {
+      if (collectErrors !== null) {
+        collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+      } else {
+        throw err;
+      }
+    }
+
+    for (let i = pendingIdx + 1; i < orphans.length; i++) {
+      try {
+        const r = this.destroyFiber(orphans[i] as RuntimeFiber<unknown>, collectErrors);
+        if (isThenable(r)) {
+          await r;
+        }
+      } catch (err: unknown) {
+        if (collectErrors !== null) {
+          collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    const rest = this.destroyFiber(fiber, collectErrors);
+    if (isThenable(rest)) {
+      await rest;
+    }
   }
 
   /**

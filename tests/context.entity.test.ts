@@ -205,6 +205,25 @@ describe('UseContext / getContextFields / injectContextFields', () => {
     expect(Object.hasOwn(instance, 'injected') || 'injected' in instance).toBe(true);
     expect(instance.injected).toBeUndefined();
   });
+
+  it('CTX-NaN: stable NaN does not report as changed (Object.is)', () => {
+    const TOKEN_NAN = createContext<number>('TOKEN_NAN');
+    class NanConsumer extends Component<Record<string, unknown>, Record<string, unknown>> {
+      @UseContext(TOKEN_NAN)
+      public injected = 0;
+
+      constructor () {
+        super({});
+      }
+    }
+
+    const scope = extendScope(EMPTY_CONTEXT_SCOPE, TOKEN_NAN, Number.NaN);
+    const instance = new NanConsumer();
+
+    expect(injectContextFields(instance, scope)).toBe(true);
+    expect(Number.isNaN(instance.injected)).toBe(true);
+    expect(injectContextFields(instance, scope)).toBe(false);
+  });
 });
 
 describe('ContextProvider entity contract', () => {

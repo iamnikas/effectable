@@ -69,14 +69,12 @@ describe('connect nested mapState throw during first-pass onMount', () => {
     process.on('uncaughtException', onUncaught);
     process.on('unhandledRejection', onUnhandled);
 
-    let resolveMount!: () => void;
-
+    // Use a real async onMount (settles after the sync dispatch). Returning a
+    // never-settling Promise deadlocks connect: it waits for the user Promise
+    // before rethrowing syncSubscribeError from the nested mapState throw.
     class C extends Component<{ v?: number }, Record<string, never>> {
-      public override onMount (): Promise<void> {
+      public override async onMount (): Promise<void> {
         store.dispatch({ type: 'BLOW' });
-        return new Promise<void>((resolve) => {
-          resolveMount = resolve;
-        });
       }
     }
 
@@ -108,9 +106,6 @@ describe('connect nested mapState throw during first-pass onMount', () => {
       syncThrow = err;
     }
 
-    if (typeof resolveMount === 'function') {
-      resolveMount();
-    }
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();

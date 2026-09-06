@@ -1,7 +1,9 @@
 /**
- * Regression probe: if applyFiberUpdate/commitRef throws AFTER reconcileChildren
- * succeeded (including PLACE), fail-stop only walks the old parent.children and
- * orphans newly placed fibers (onMount without onUnmount / resource leak).
+ * UPDATE ref commit runs after compose and before child reconcile.
+ *
+ * When commitRef throws, no PLACE children exist yet — so there is nothing to
+ * orphan. (Previously commitRef ran in applyFiberUpdate *after* reconcile, and
+ * a throwing setter could leave PLACE fibers unreachable from parent.children.)
  */
 import { Component, GraphRuntime, h } from 'Effectable';
 import type { RefObject, VirtualServiceNode } from 'Effectable';
@@ -42,8 +44,8 @@ class Parent extends Component<Record<string, never>, { n: number }> {
   }
 }
 
-describe('GraphRuntime applyFiberUpdate ref-commit orphan', () => {
-  it('PLACE child is unmounted when commitRef throws after child reconcile', async () => {
+describe('GraphRuntime UPDATE commitRef before child reconcile', () => {
+  it('commitRef throw before PLACE does not mount the new sibling', async () => {
     Leaf.mountCount = 0;
     Leaf.unmountCount = 0;
 
@@ -70,9 +72,10 @@ describe('GraphRuntime applyFiberUpdate ref-commit orphan', () => {
     await expect(runtime.reconcile(h(Parent, { n: 1 }, ref))).rejects.toThrow('ref commit boom');
 
     expect(runtime.isActive()).toBe(false);
-    // Leaf B was PLACE'd (mountCount 2) and must not be orphaned.
-    expect(Leaf.mountCount).toBe(2);
-    expect(Leaf.unmountCount).toBe(2);
+    // Leaf B must never have been PLACE'd — commit failed before child reconcile.
+    expect(Leaf.mountCount).toBe(1);
+    expect(Leaf.unmountCount).toBe(1);
+    expect(stored).toBeNull();
 
     await runtime.unmount();
   });

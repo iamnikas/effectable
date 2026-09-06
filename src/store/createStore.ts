@@ -7,7 +7,7 @@
  * @module Effectable/store/createStore
  */
 
-import { BehaviorSubject, Observable } from 'rxjs';
+import { Observable, Subject } from 'rxjs';
 import { map, distinctUntilChanged } from 'rxjs/operators';
 import { Store, Reducer, Action, StoreEnhancer, Selector } from './types';
 
@@ -15,8 +15,8 @@ import { Store, Reducer, Action, StoreEnhancer, Selector } from './types';
  * Creates a Redux Store with RxJS support
  *
  * Primary function for creating application state storage.
- * Compatible with Redux v4 API, but uses BehaviorSubject for
- * reactive state management.
+ * Compatible with Redux v4 API, with an Observable state stream
+ * for reactive subscriptions.
  *
  * @template S - Store state type
  * @template A - Action type (must extend the base Action)
@@ -46,14 +46,16 @@ export function createStore<S, A extends Action> (
     return enhancer(createStore)(reducer, initialState);
   }
 
-  // Internal BehaviorSubject for reactive state
-  // BehaviorSubject ensures new subscribers receive the current value
-  const state$ = new BehaviorSubject<S>(initialState);
-
-  // Canonical current state for getState(). Kept in sync before notification so a
-  // nested dispatch from a subscriber always reduces from the latest committed state,
-  // even while an outer state$.next is still delivering its value to later observers.
+  // Canonical current state for getState() and for replay to new state$/select
+  // subscribers. Kept in sync before notification so a nested dispatch from a
+  // subscriber always reduces from the latest committed state, even while an outer
+  // notification is still delivering its value to later observers.
   let currentState: S = initialState;
+
+  // Notification channel only (no BehaviorSubject replay buffer). New subscribers
+  // replay `currentState` via `stateObservable$` so they never see a stale
+  // BehaviorSubject `_value` after nested dispatch coalescing.
+  const notifications$ = new Subject<S>();
 
   // Flag to prevent dispatch while a reducer is running
   let isDispatching = false;
@@ -62,15 +64,39 @@ export function createStore<S, A extends Action> (
   let isDestroyed = false;
 
   // Nested dispatch from a state$/select subscriber must not leave later observers
-  // with a stale outer emission AFTER the nested (newer) state. BehaviorSubject.next
-  // is re-entrant: outer next(S1) → subscriber dispatches → next(S2) → remaining
+  // with a stale outer emission AFTER the nested (newer) state. Subject.next is
+  // re-entrant: outer next(S1) → subscriber dispatches → next(S2) → remaining
   // outer observers still receive S1 after S2. Publish through this gate so the
   // outermost notify loop always finishes on the latest committed state.
   let isPublishing = false;
   let publishAgain = false;
+  // destroy() during state$.next otherwise calls complete() mid-delivery and
+  // drops not-yet-notified observers for that emission (including connect select
+  // subscribers whose onUpdate triggered destroy). Defer complete until publish ends.
+  let pendingDestroyComplete = false;
 
   /**
-   * Commits `nextState` and notifies `state$` observers without letting a nested
+   * Public state stream: attach to the notification channel first, then replay
+   * committed `currentState`. Order matters — BehaviorSubject registered the
+   * observer before emitting `_value`, so a dispatch during that first emission
+   * still reached the same subscriber. Replaying before `notifications$.subscribe`
+   * dropped that update. After destroy, new subscribers complete
+   * with no next (connect destroyed-store contract).
+   */
+  const stateObservable$ = new Observable<S>((subscriber) => {
+    if (isDestroyed) {
+      subscriber.complete();
+      return undefined;
+    }
+    const inner = notifications$.subscribe(subscriber);
+    if (!isDestroyed && !subscriber.closed) {
+      subscriber.next(currentState);
+    }
+    return inner;
+  });
+
+  /**
+   * Commits `nextState` and notifies observers without letting a nested
    * dispatch leave a stale outer emission as the final observed value.
    *
    * @param {S} nextState - state to commit and publish
@@ -88,10 +114,14 @@ export function createStore<S, A extends Action> (
     try {
       do {
         publishAgain = false;
-        state$.next(currentState);
+        notifications$.next(currentState);
       } while (publishAgain);
     } finally {
       isPublishing = false;
+      if (pendingDestroyComplete) {
+        pendingDestroyComplete = false;
+        notifications$.complete();
+      }
     }
   }
 
@@ -202,16 +232,18 @@ export function createStore<S, A extends Action> (
    * currentPath$.subscribe(path => console.log('Path:', path));
    */
   const select = <T>(selectorFn: Selector<S, T>): Observable<T> => {
-    return state$.pipe(
+    return stateObservable$.pipe(
       map(selectorFn),
-      distinctUntilChanged()
+      // Object.is so stable NaN (and -0/+0) compare equal — default === re-emits
+      // NaN on every dispatch and can infinite-loop a subscriber that dispatches.
+      distinctUntilChanged(Object.is)
     );
   };
 
   /**
    * Shuts down the Store and releases resources
    *
-   * Calls complete() on the BehaviorSubject, which ends all subscriptions.
+   * Completes the notification subject, which ends all subscriptions.
    * After destroy() the Store is no longer usable.
    *
    * @example
@@ -219,14 +251,22 @@ export function createStore<S, A extends Action> (
    * store.destroy();
    */
   const destroy = (): void => {
+    if (isDestroyed) {
+      return;
+    }
     isDestroyed = true;
-    state$.complete();
+    // If a subscriber destroys mid-notify, finish delivering this emission first.
+    if (isPublishing) {
+      pendingDestroyComplete = true;
+      return;
+    }
+    notifications$.complete();
   };
 
   return {
     dispatch,
     getState,
-    state$: state$.asObservable(), // Return as Observable, not BehaviorSubject
+    state$: stateObservable$,
     select,
     destroy,
   };
