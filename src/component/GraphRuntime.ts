@@ -2067,7 +2067,8 @@ export class GraphRuntime {
    * @param {ContextScope} parentScope - parent scope
    * @param {boolean} [deferLifecycle=false] - when true, REPLACE materialize wires buses but
    *   defers onMount until the sibling batch flush in {@link reconcileChildren} (same contract
-   *   as PLACE). Root reconcile must leave this false — nothing else flushes the root.
+   *   as PLACE). Root reconcile must leave this false — this method flushes the replacement
+   *   itself after wiring (see root REPLACE ordering below).
    * @returns {Promise<RuntimeFiber<P>>}
    */
   private reconcileFiber<P>(
@@ -2084,19 +2085,65 @@ export class GraphRuntime {
       return this.updateFiber(current, nextVnode, parentFiber, parentScope);
     }
 
-    // Type or key changed — destroy the old node, create a new one.
-    // Sync fast-path if both destroy and materialize completed synchronously.
+    // Type or key changed — REPLACE.
     // Collect cleanup errors (ref clear / disposer) so a throwing finalize cannot
     // abort REPLACE and fail-stop the surviving tree — same best-effort contract as unmount.
     //
     // When deferLifecycle is set (child reconcile batch), REPLACE must not run onMount
     // before later sibling buses are wired — otherwise a replaced publisher's mount-time
     // publish is silently dropped by a not-yet-wired PLACE/REPLACE listener beside it.
+    //
+    // Root path (deferLifecycle=false): materialize the replacement with deferred onMount
+    // first so @On* handlers exist, destroy the victim (onUnmount can publish into the new
+    // tree), then flush deferred startups. Eager destroy-before-materialize dropped those
+    // teardown events because the new tree was not wired yet.
+    if (!deferLifecycle) {
+      const finishRootReplace = (
+        next: RuntimeFiber<P>,
+      ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
+        const flushAfterDestroy = (): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
+          const flushRes = this.flushDeferredLifecycleTree(next as RuntimeFiber<unknown>);
+          if (isThenable(flushRes)) {
+            return Promise.resolve(flushRes).then(
+              () => next,
+              async (flushErr: unknown) => {
+                // Victim already destroyed; tear down the replacement so failStop does
+                // not leave an orphan wired tree while currentRoot still names the victim.
+                const rollback = this.destroyFiber(next as RuntimeFiber<unknown>, []);
+                if (isThenable(rollback)) {
+                  await rollback;
+                }
+                throw flushErr;
+              },
+            );
+          }
+          return next;
+        };
+
+        const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
+        if (isThenable(destroyRes)) {
+          return destroyRes.then(flushAfterDestroy);
+        }
+        return flushAfterDestroy();
+      };
+
+      try {
+        const materializeRes = this.materialize(nextVnode, parentFiber, parentScope, true);
+        if (isThenable(materializeRes)) {
+          return materializeRes.then(finishRootReplace);
+        }
+        return finishRootReplace(materializeRes);
+      } catch (error: unknown) {
+        // Materialize failed — victim still live; rethrow for failStop on currentRoot.
+        throw error;
+      }
+    }
+
     const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
     if (isThenable(destroyRes)) {
-      return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle));
+      return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope, true));
     }
-    return this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle);
+    return this.materialize(nextVnode, parentFiber, parentScope, true);
   }
 
   /**
