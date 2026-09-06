@@ -13,6 +13,7 @@ import {
   createStore,
   h,
 } from 'Effectable';
+import type { DispatchMethod } from 'Effectable';
 
 describe('connect applyToScope mapDispatch side-effect', () => {
   type S = { n: number; tick: number };
@@ -42,7 +43,7 @@ describe('connect applyToScope mapDispatch side-effect', () => {
     const Connected = connect(
       store,
       (s: S) => ({ n: s.n }),
-      (dispatch) => {
+      (dispatch: DispatchMethod<A>) => {
         mapDispatchCalls += 1;
         dispatch({ type: 'TICK' });
         return {
