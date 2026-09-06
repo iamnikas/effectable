@@ -374,7 +374,7 @@ export function injectContextFields (
       // defineProperty — `target[key] =` invokes the Object.prototype `__proto__`
       // setter when a @UseContext field is named `__proto__`, replacing the
       // instance [[Prototype]] with the injected value and dropping Component methods
-      // (same class as store/connect #109 and mutableState/BusDecorators #135).
+      // (same class as store/connect and mutableState/BusDecorators).
       Object.defineProperty(target, meta.propertyKey, {
         value: nextValue,
         enumerable: true,

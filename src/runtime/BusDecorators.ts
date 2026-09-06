@@ -35,7 +35,7 @@ const ON_EVENT_ENTRIES = 'effectable:runtime:OnEvent:entries';
  * `command:<type>` / `query:<type>`. Generation-safe: calling the disposer only
  * clears the bus slot if this registration still owns it (see CommandBus/QueryBus
  * register return values). Blind `unregister(type)` would wipe a later PLACE that
- * already claimed the same exclusive type (#177).
+ * already claimed the same exclusive type.
  */
 const exclusiveHandlerDisposers = new WeakMap<object, Map<string, () => void>>();
 
@@ -272,7 +272,7 @@ export function collectExclusiveHandlerTypesFromType (componentType: unknown): {
  * (UPDATE `execute`/`query` handoff before orphan destroy).
  *
  * Uses generation-safe registration disposers from {@link wireRuntimeBuses} so a
- * later PLACE that already claimed the same exclusive type is not wiped (#177).
+ * later PLACE that already claimed the same exclusive type is not wiped.
  * The instance's full wire disposer remains valid (idempotent once cleared).
  *
  * @template TCommand
@@ -325,7 +325,7 @@ export function releaseExclusiveRuntimeBusHandlers<
   }
 
   // Prefer generation-safe registration disposers over blind bus.unregister(type),
-  // which would wipe a later PLACE that already claimed the same exclusive slot (#177).
+  // which would wipe a later PLACE that already claimed the same exclusive slot.
   for (const type of commandTypes) {
     const key = `command:${type}`;
     const disposer = exclusiveMap.get(key);

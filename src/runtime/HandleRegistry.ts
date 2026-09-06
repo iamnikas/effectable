@@ -178,7 +178,7 @@ export class HandleRegistry {
       // Use defineProperty — `ref[methodName] =` on a normal object invokes the
       // Object.prototype `__proto__` setter when methodName === '__proto__',
       // replacing the handle's [[Prototype]] with the bound function (lost key +
-      // polluted prototype). Sibling of store/connect (#109) and Component/Bus (#135).
+      // polluted prototype). Sibling of store/connect and Component/Bus.
       Object.defineProperty(ref, methodName, {
         value: fn.bind(instance),
         enumerable: true,

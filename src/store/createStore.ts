@@ -54,7 +54,7 @@ export function createStore<S, A extends Action> (
 
   // Notification channel only (no BehaviorSubject replay buffer). New subscribers
   // replay `currentState` via `stateObservable$` so they never see a stale
-  // BehaviorSubject `_value` after nested dispatch coalescing (#86 residual).
+  // BehaviorSubject `_value` after nested dispatch coalescing.
   const notifications$ = new Subject<S>();
 
   // Flag to prevent dispatch while a reducer is running
@@ -80,7 +80,7 @@ export function createStore<S, A extends Action> (
    * committed `currentState`. Order matters — BehaviorSubject registered the
    * observer before emitting `_value`, so a dispatch during that first emission
    * still reached the same subscriber. Replaying before `notifications$.subscribe`
-   * dropped that update (#124 residual). After destroy, new subscribers complete
+   * dropped that update. After destroy, new subscribers complete
    * with no next (connect destroyed-store contract).
    */
   const stateObservable$ = new Observable<S>((subscriber) => {
