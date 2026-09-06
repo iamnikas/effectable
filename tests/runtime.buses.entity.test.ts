@@ -143,6 +143,32 @@ describe('CommandBus', () => {
       'Command handler is not registered: CMD_A'
     );
   });
+
+  it('stale disposer after re-register of the SAME handler function does not drop the live registration', async () => {
+    const bus = new CommandBus<TestCommand>();
+    const handler = async (): Promise<string> => 'live';
+    const cmd: TestCommand = { type: 'CMD_A', payload: { v: 0 } };
+
+    const disposeFirst = bus.register('CMD_A', handler);
+    disposeFirst();
+    bus.register('CMD_A', handler);
+    disposeFirst();
+
+    expect(await bus.execute<string>(cmd)).toBe('live');
+  });
+
+  it('stale disposer after clear() + re-register of the SAME handler function does not drop the live registration', async () => {
+    const bus = new CommandBus<TestCommand>();
+    const handler = async (): Promise<string> => 'live';
+    const cmd: TestCommand = { type: 'CMD_A', payload: { v: 0 } };
+
+    const disposeFirst = bus.register('CMD_A', handler);
+    bus.clear();
+    bus.register('CMD_A', handler);
+    disposeFirst();
+
+    expect(await bus.execute<string>(cmd)).toBe('live');
+  });
 });
 
 describe('QueryBus', () => {
@@ -244,9 +270,69 @@ describe('QueryBus', () => {
 
     expect(await bus.execute<number>(q)).toBe(2);
   });
+
+  it('stale disposer after re-register of the SAME handler function does not drop the live registration', async () => {
+    const bus = new QueryBus<TestQuery>();
+    const handler = (): number => 7;
+    const q: TestQuery = { type: 'QRY_B', payload: { s: 'x' } };
+
+    const disposeFirst = bus.register('QRY_B', handler);
+    disposeFirst();
+    bus.register('QRY_B', handler);
+    disposeFirst();
+
+    expect(await bus.execute<number>(q)).toBe(7);
+  });
+
+  it('stale disposer after clear() + re-register of the SAME handler function does not drop the live registration', async () => {
+    const bus = new QueryBus<TestQuery>();
+    const handler = (): number => 7;
+    const q: TestQuery = { type: 'QRY_B', payload: { s: 'x' } };
+
+    const disposeFirst = bus.register('QRY_B', handler);
+    bus.clear();
+    bus.register('QRY_B', handler);
+    disposeFirst();
+
+    expect(await bus.execute<number>(q)).toBe(7);
+  });
 });
 
 describe('EventBus', () => {
+  it('stale typed unsubscribe after re-subscribe of the SAME handler does not drop the live subscription', () => {
+    const bus = new EventBus<TestEvent>();
+    const seen: TestEvent[] = [];
+    const handler = (event: TestEvent): void => {
+      seen.push(event);
+    };
+    const ev: TestEvent = { type: 'EVT_C', payload: { flag: true } };
+
+    const offFirst = bus.subscribe('EVT_C', handler);
+    offFirst();
+    bus.subscribe('EVT_C', handler);
+    offFirst();
+
+    bus.publish(ev);
+    expect(seen).toEqual([ev]);
+  });
+
+  it('stale subscribeAll disposer after re-subscribe of the SAME handler does not drop the live subscription', () => {
+    const bus = new EventBus<TestEvent>();
+    const seen: TestEvent[] = [];
+    const handler = (event: TestEvent): void => {
+      seen.push(event);
+    };
+    const ev: TestEvent = { type: 'EVT_C', payload: { flag: false } };
+
+    const offFirst = bus.subscribeAll(handler);
+    offFirst();
+    bus.subscribeAll(handler);
+    offFirst();
+
+    bus.publish(ev);
+    expect(seen).toEqual([ev]);
+  });
+
   it('M03/M05: typed subscribe, subscribeAll, unsubscribe and clear', () => {
     const bus = new EventBus<TestEvent>();
     const typed: TestEvent[] = [];
