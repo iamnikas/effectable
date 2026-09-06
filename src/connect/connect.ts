@@ -1257,11 +1257,23 @@ function buildConnectHoc<S, P, R, A extends Action> (
         }
 
         // Nested store emit during sync super.onMount may have errored the subscription.
+        // When onMount already returned a Promise, do NOT throw sync after suppressing it:
+        // GraphRuntime would fail-stop / tear down while the user onMount body is still
+        // awaiting — continuation after await then races teardown (use-after-unmount).
+        // Prefer returning the Promise and rejecting with syncSubscribeError after it settles.
         if (syncSubscribeError !== null) {
           this.disposeConnectSubscription();
           if (isPromiseLike(mountResult)) {
-            // Suppress orphan rejection — caller receives the syncSubscribeError throw instead.
-            void Promise.resolve(mountResult as Promise<void>).then(() => undefined, () => undefined);
+            return Promise.resolve(mountResult as Promise<void>).then(
+              () => {
+                throw syncSubscribeError;
+              },
+              () => {
+                // Prefer the subscribe/mapState failure that aborted mount; the user
+                // onMount rejection is secondary once the subscription is dead.
+                throw syncSubscribeError;
+              },
+            );
           }
           throw syncSubscribeError;
         }
