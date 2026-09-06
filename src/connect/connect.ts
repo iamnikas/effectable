@@ -240,6 +240,16 @@ function getMappedPropsRecord (mapped: unknown): Record<string, unknown> | null 
     return null;
   }
 
+  // Thenables are typeof 'object' but are not props records. Treating a Promise as a
+  // Record yields empty mapped props (no enumerable own keys) and silent data loss —
+  // e.g. `async (s) => ({ n: s.n })` leaves props.n undefined while the runtime stays active.
+  // Fail loudly: callers must not return Promises from mapState (sync mappers only).
+  if (isPromiseLike(mapped)) {
+    throw new TypeError(
+      '[Effectable.connect] mapStateToProps must return a plain props object synchronously; got a thenable/Promise',
+    );
+  }
+
   return mapped as Record<string, unknown>;
 }
 
