@@ -63,6 +63,11 @@ const MarketService = connect(
 
 // legacy merge: props are forwarded automatically (only where intentionally needed)
 const Legacy = connect(undefined, mapDispatch, { ownPropsModeMerge: true })(Cmp);
+
+// Options may also sit in the last object slot without a `null` mapDispatch placeholder
+// (runtime detects ConnectOptions via the `ownPropsModeMerge` field):
+const LegacyRoot = connect(store, mapState, { ownPropsModeMerge: true })(Cmp);
+const LegacyChild = connect(mapState, { ownPropsModeMerge: true })(Cmp);
 ```
 
 ## API: connect
