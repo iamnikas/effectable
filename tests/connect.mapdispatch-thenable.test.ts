@@ -16,6 +16,8 @@ import {
 } from 'Effectable';
 import type { DispatchMethod } from 'Effectable';
 
+type HostProps = { inc?: () => void };
+
 interface State {
   n: number;
 }
@@ -30,7 +32,7 @@ describe('connect mapDispatchToProps thenable rejection', () => {
       { n: 0 },
     );
 
-    class Host extends Component<{ inc?: () => void }, Record<string, never>> {
+    class Host extends Component<HostProps, Record<string, never>> {
       public constructor (props: Record<string, never>) {
         super(props);
       }
@@ -39,12 +41,9 @@ describe('connect mapDispatchToProps thenable rejection', () => {
     const Connected = connect(
       store,
       null,
-      // Cast: production typings forbid async factories; runtime must still reject.
-      ((async (dispatch: DispatchMethod<TestAction>) => ({
+      async (dispatch: DispatchMethod<TestAction>) => ({
         inc: () => dispatch({ type: 'INC' }),
-      })) as unknown as (
-        dispatch: DispatchMethod<TestAction>,
-      ) => { inc: () => void }),
+      }),
     )(Host);
 
     await expect(GraphRuntime.mount(h(Connected, {}))).rejects.toThrow(
@@ -61,7 +60,7 @@ describe('connect mapDispatchToProps thenable rejection', () => {
       { n: 0 },
     );
 
-    class Host extends Component<{ inc?: () => void }, Record<string, never>> {
+    class Host extends Component<HostProps, Record<string, never>> {
       public constructor (props: Record<string, never>) {
         super(props);
       }
@@ -76,9 +75,16 @@ describe('connect mapDispatchToProps thenable rejection', () => {
     )(Host);
 
     const rt = await GraphRuntime.mount(h(Connected, {}));
-    const inst = rt.getRootInstance() as Host;
-    expect(typeof inst.props.inc).toBe('function');
-    inst.props.inc?.();
+    const inst = rt.getRootInstance();
+    if (inst === null) {
+      throw new Error('expected root instance');
+    }
+    const inc = (inst.props as HostProps).inc;
+    expect(typeof inc).toBe('function');
+    if (inc === undefined) {
+      throw new Error('expected bound inc');
+    }
+    inc();
     expect(store.getState().n).toBe(1);
     await rt.unmount();
     store.destroy();
