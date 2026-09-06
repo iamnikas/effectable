@@ -114,7 +114,7 @@ describe('GraphRuntime full-diff onUpdate vs nested PLACE', () => {
       { n: number; show: boolean; extra: boolean }
     > {
       public override compose () {
-        const kids = [
+        const kids: Array<ReturnType<typeof h>> = [
           h(Early, { n: this.props.n }, 'early'),
           h(Late, { show: this.props.show }, 'late'),
         ];
