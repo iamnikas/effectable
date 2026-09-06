@@ -248,18 +248,27 @@ function buildConnectHoc<S, P, R, A extends Action> (
 
         // Class-field lifecycle hooks are own properties and shadow Connected.prototype.
         // Capture them, then reinstall Connected wiring so GraphRuntime still runs connect.
+        //
+        // Only install own Connected hooks when a user own-property hook was actually
+        // captured. Unconditionally assigning Connected.prototype.onMount/onUnmount as own
+        // properties shadows subclass `override onMount` / `onUnmount` on the prototype
+        // chain (`class Ext extends Connected { override onMount() { …; super.onMount(); } }`),
+        // so Ext lifecycle never runs while Base's still does via Constructor.prototype.
         const self = this as {
           onMount?: unknown;
           onUnmount?: unknown;
         };
+        const wiredMount = Connected.prototype.onMount;
+        const wiredUnmount = Connected.prototype.onUnmount;
+
         if (Object.prototype.hasOwnProperty.call(this, 'onMount') && typeof self.onMount === 'function') {
           this.__connectOwnOnMount = self.onMount as () => void | Promise<void>;
+          self.onMount = wiredMount;
         }
         if (Object.prototype.hasOwnProperty.call(this, 'onUnmount') && typeof self.onUnmount === 'function') {
           this.__connectOwnOnUnmount = self.onUnmount as () => void | Promise<void>;
+          self.onUnmount = wiredUnmount;
         }
-        self.onMount = Connected.prototype.onMount;
-        self.onUnmount = Connected.prototype.onUnmount;
       }
 
       /**
