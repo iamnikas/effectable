@@ -117,6 +117,14 @@ interface FiberConstructionJournal {
   busWiringAttached?: boolean;
   /** Ref binding step completed. */
   refBound?: boolean;
+  /**
+   * Structure + bus wiring finished, but {@link LifecycleEngine.runStartup} was deferred.
+   * Cleared when {@link GraphRuntime.flushDeferredLifecycleTree} runs startup.
+   *
+   * Used so sibling (and parent) `@On*` handlers are subscribed before any peer
+   * `onMount` publishes — depth-first materialize otherwise drops those events.
+   */
+  lifecycleDeferred?: boolean;
   /** Successfully mounted child fibers (in acquisition order). */
   mountedChildren: RuntimeFiber<unknown>[];
   /** Original ref owner (for identity-safe clearing during rollback). */
@@ -1405,6 +1413,274 @@ export class GraphRuntime {
   // ---------------------------------------------------------------------------
 
   /**
+   * Runs deferred {@link LifecycleEngine.runStartup} for a fiber subtree in
+   * children→parent order (siblings in compose order).
+   *
+   * Call only after the subtree (and any later siblings that must observe
+   * publishes) have completed bus wiring. Idempotent for fibers that already
+   * started.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - subtree root
+   * @returns {void | Promise<void>}
+   */
+  private flushDeferredLifecycleTree (
+    fiber: RuntimeFiber<unknown>,
+  ): void | Promise<void> {
+    const children = fiber.children as RuntimeFiber<unknown>[];
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i] as RuntimeFiber<unknown>;
+      const childFlush = this.flushDeferredLifecycleTree(child);
+      if (isThenable(childFlush)) {
+        return this.continueFlushDeferredLifecycleAsync(fiber, children, i, childFlush);
+      }
+    }
+
+    return this.runDeferredLifecycleIfNeeded(fiber);
+  }
+
+  /**
+   * Async continuation of {@link flushDeferredLifecycleTree} after a child flush returns a Promise.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - subtree root
+   * @param {RuntimeFiber<unknown>[]} children - child fibers
+   * @param {number} pendingIdx - index of the pending child
+   * @param {PromiseLike<void>} pending - pending child flush
+   * @returns {Promise<void>}
+   */
+  private async continueFlushDeferredLifecycleAsync (
+    fiber: RuntimeFiber<unknown>,
+    children: RuntimeFiber<unknown>[],
+    pendingIdx: number,
+    pending: PromiseLike<void>,
+  ): Promise<void> {
+    await pending;
+    for (let i = pendingIdx + 1; i < children.length; i++) {
+      const childFlush = this.flushDeferredLifecycleTree(children[i] as RuntimeFiber<unknown>);
+      if (isThenable(childFlush)) {
+        await childFlush;
+      }
+    }
+    const selfRes = this.runDeferredLifecycleIfNeeded(fiber);
+    if (isThenable(selfRes)) {
+      await selfRes;
+    }
+  }
+
+  /**
+   * Runs startup + update-hook injection when {@link FiberConstructionJournal.lifecycleDeferred}
+   * is set; no-op otherwise.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber to start
+   * @returns {void | Promise<void>}
+   */
+  private runDeferredLifecycleIfNeeded (
+    fiber: RuntimeFiber<unknown>,
+  ): void | Promise<void> {
+    const journal = fiber.constructionJournal;
+    if (journal === undefined || journal.lifecycleDeferred !== true) {
+      return;
+    }
+
+    const instance = fiber.instance;
+    if (instance === null) {
+      journal.lifecycleDeferred = false;
+      return;
+    }
+
+    const startupRes = fiber.engine.runStartup(instance, { deferFailedCleanup: true });
+    if (isThenable(startupRes)) {
+      return this.finalizeDeferredLifecycleAsync(fiber, startupRes);
+    }
+
+    if (!startupRes.ok) {
+      const error = startupRes.error instanceof Error
+        ? startupRes.error
+        : new Error(String(startupRes.error));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        return rollbackRes.then(() => {
+          throw error;
+        });
+      }
+      throw error;
+    }
+
+    journal.lifecycleDeferred = false;
+    fiber.lifecycleStatus = fiber.engine.getStatus();
+    fiber.effectTag = null;
+    journal.schedulerHookAttached = true;
+    this.injectUpdateHook(instance, fiber);
+  }
+
+  /**
+   * Async path for {@link runDeferredLifecycleIfNeeded} when startup returns a Promise.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber being started
+   * @param {PromiseLike<import('./lifecycle').LifecycleTransitionResult>} pendingStartup - pending startup
+   * @returns {Promise<void>}
+   */
+  private async finalizeDeferredLifecycleAsync (
+    fiber: RuntimeFiber<unknown>,
+    pendingStartup: PromiseLike<import('./lifecycle').LifecycleTransitionResult>,
+  ): Promise<void> {
+    const result = await pendingStartup;
+    const journal = fiber.constructionJournal!;
+    const instance = fiber.instance;
+
+    if (!result.ok) {
+      const error = result.error instanceof Error ? result.error : new Error(String(result.error));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        await rollbackRes;
+      }
+      throw error;
+    }
+
+    journal.lifecycleDeferred = false;
+    fiber.lifecycleStatus = fiber.engine.getStatus();
+    fiber.effectTag = null;
+    if (instance !== null) {
+      journal.schedulerHookAttached = true;
+      this.injectUpdateHook(instance, fiber);
+    }
+  }
+
+  /**
+   * After bus wiring: either defer lifecycle (sibling/parent batching) or flush
+   * deferred children and run this fiber's startup.
+   *
+   * @template P node props type
+   * @param {RuntimeFiber<P>} fiber - fiber that just finished wiring
+   * @param {Component<unknown, P>} instance - component instance
+   * @param {LifecycleEngine} engine - lifecycle engine
+   * @param {boolean} deferLifecycle - when true, skip startup until a parent flush
+   * @returns {RuntimeFiber<P> | Promise<RuntimeFiber<P>>}
+   */
+  private completeMaterializeAfterWiring<P> (
+    fiber: RuntimeFiber<P>,
+    instance: Component<unknown, P>,
+    engine: LifecycleEngine,
+    deferLifecycle: boolean,
+  ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    const journal = fiber.constructionJournal!;
+
+    if (deferLifecycle) {
+      journal.lifecycleDeferred = true;
+      return fiber;
+    }
+
+    // Children were materialized with deferLifecycle=true — start them (and their
+    // subtrees) before this node's onMount so sibling/parent @On* handlers exist.
+    // If a deferred sibling fails during flush after an earlier sibling started,
+    // roll back this parent (destroys all mounted children) — same contract as
+    // the pre-defer depth-first materialize catch around each child.
+    try {
+      const children = fiber.children as RuntimeFiber<unknown>[];
+      for (let i = 0; i < children.length; i++) {
+        const childFlush = this.flushDeferredLifecycleTree(children[i] as RuntimeFiber<unknown>);
+        if (isThenable(childFlush)) {
+          return this.continueCompleteMaterializeAfterWiringAsync(
+            fiber,
+            instance,
+            engine,
+            children,
+            i,
+            childFlush,
+          );
+        }
+      }
+
+      return this.runMaterializeStartup(fiber, instance, engine);
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber as RuntimeFiber<unknown>, error);
+      if (isThenable(rollbackRes)) {
+        return rollbackRes.then(() => {
+          throw error;
+        }) as Promise<RuntimeFiber<P>>;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Async continuation after a deferred child flush during materialize completion.
+   *
+   * @template P node props type
+   * @param {RuntimeFiber<P>} fiber - parent fiber
+   * @param {Component<unknown, P>} instance - parent instance
+   * @param {LifecycleEngine} engine - parent engine
+   * @param {RuntimeFiber<unknown>[]} children - child fibers
+   * @param {number} pendingIdx - pending child index
+   * @param {PromiseLike<void>} pending - pending flush
+   * @returns {Promise<RuntimeFiber<P>>}
+   */
+  private async continueCompleteMaterializeAfterWiringAsync<P> (
+    fiber: RuntimeFiber<P>,
+    instance: Component<unknown, P>,
+    engine: LifecycleEngine,
+    children: RuntimeFiber<unknown>[],
+    pendingIdx: number,
+    pending: PromiseLike<void>,
+  ): Promise<RuntimeFiber<P>> {
+    try {
+      await pending;
+      for (let i = pendingIdx + 1; i < children.length; i++) {
+        const childFlush = this.flushDeferredLifecycleTree(children[i] as RuntimeFiber<unknown>);
+        if (isThenable(childFlush)) {
+          await childFlush;
+        }
+      }
+      return this.runMaterializeStartup(fiber, instance, engine);
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber as RuntimeFiber<unknown>, error);
+      if (isThenable(rollbackRes)) {
+        await rollbackRes;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Runs startup for a fiber that is completing materialize (not deferred).
+   *
+   * @template P node props type
+   * @param {RuntimeFiber<P>} fiber - fiber
+   * @param {Component<unknown, P>} instance - instance
+   * @param {LifecycleEngine} engine - engine
+   * @returns {RuntimeFiber<P> | Promise<RuntimeFiber<P>>}
+   */
+  private runMaterializeStartup<P> (
+    fiber: RuntimeFiber<P>,
+    instance: Component<unknown, P>,
+    engine: LifecycleEngine,
+  ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    const startupRes = engine.runStartup(instance, { deferFailedCleanup: true });
+
+    if (isThenable(startupRes)) {
+      return this.finalizeMaterializeAsync(fiber, engine, startupRes);
+    }
+
+    if (!startupRes.ok) {
+      const error = startupRes.error instanceof Error ? startupRes.error : new Error(String(startupRes.error));
+      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
+      if (isThenable(rollbackRes)) {
+        return rollbackRes.then(() => {
+          throw error;
+        }) as Promise<RuntimeFiber<P>>;
+      }
+      throw error;
+    }
+
+    fiber.lifecycleStatus = engine.getStatus();
+    fiber.effectTag = null;
+    fiber.constructionJournal!.schedulerHookAttached = true;
+    this.injectUpdateHook(instance, fiber);
+    return fiber;
+  }
+
+  /**
    * Creates a RuntimeFiber for a virtual node: instantiates the component,
    * injects contexts, builds the child scope (for ContextProvider),
    * recursively materializes children, binds ref, runs lifecycle.
@@ -1416,12 +1692,15 @@ export class GraphRuntime {
    * @param {VirtualServiceNode<P>} vnode - virtual node
    * @param {RuntimeFiber | null} parentFiber - parent fiber
    * @param {ContextScope} parentScope - parent scope
+   * @param {boolean} [deferLifecycle=false] - when true, wire buses but defer onMount
+   *   until {@link flushDeferredLifecycleTree} (used for sibling batching)
    * @returns {RuntimeFiber<P> | Promise<RuntimeFiber<P>>}
    */
   private materialize<P>(
     vnode: VirtualServiceNode<P>,
     parentFiber: RuntimeFiber<unknown> | null,
     parentScope: ContextScope,
+    deferLifecycle: boolean = false,
   ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
     const engine = new LifecycleEngine();
     // Constructor is stored as ComponentConstructor<unknown> for covariance,
@@ -1515,9 +1794,17 @@ export class GraphRuntime {
     for (let i = 0; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
       let childRes: RuntimeFiber<unknown> | Promise<RuntimeFiber<unknown>>;
-      
+
       try {
-        childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
+        // Defer child lifecycle so all siblings (and this parent) finish bus wiring
+        // before any onMount runs — otherwise earlier-sibling publishes miss later
+        // siblings' @On* handlers (and parent handlers miss child onMount publishes).
+        childRes = this.materialize(
+          childVnode,
+          fiber as RuntimeFiber<unknown>,
+          childScope,
+          true,
+        );
       } catch (err: unknown) {
         const error = err instanceof Error ? err : new Error(String(err));
         const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
@@ -1540,6 +1827,7 @@ export class GraphRuntime {
           childScope,
           childRes,
           i,
+          deferLifecycle,
         );
       }
 
@@ -1568,36 +1856,12 @@ export class GraphRuntime {
 
     // Parent buses already wired before children (see above). Do not wire again here.
 
-    // Run lifecycle after all children are materialized.
-    // Pre-mount hook was injected before children (covers ancestor setState
-    // from descendant onMount and setState during this node's onMount).
-    const startupRes = engine.runStartup(instance, { deferFailedCleanup: true });
-
-    if (isThenable(startupRes)) {
-      return this.finalizeMaterializeAsync(fiber, engine, startupRes);
-    }
-
-    if (!startupRes.ok) {
-      const error = startupRes.error instanceof Error ? startupRes.error : new Error(String(startupRes.error));
-      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
-      if (isThenable(rollbackRes)) {
-        return rollbackRes.then(() => {
-          throw error;
-        }) as Promise<RuntimeFiber<P>>;
-      }
-      throw error;
-    }
-
-    fiber.lifecycleStatus = engine.getStatus();
-    fiber.effectTag = null;
-    fiber.constructionJournal!.schedulerHookAttached = true;
-    this.injectUpdateHook(instance, fiber);
-    return fiber;
+    return this.completeMaterializeAfterWiring(fiber, instance, engine, deferLifecycle);
   }
 
   /**
    * Async continuation of {@link materialize} after a child returned a Promise.
-   * Finishes remaining child fibers with `await`, then runs parent startup.
+   * Finishes remaining child fibers with `await`, then completes wiring / lifecycle.
    *
    * @param {RuntimeFiber<P>} fiber - current fiber
    * @param {Component<unknown, P>} instance - component instance
@@ -1607,6 +1871,7 @@ export class GraphRuntime {
    * @param {ContextScope} childScope - scope for child nodes
    * @param {Promise<RuntimeFiber<unknown>>} pending - Promise for the current child
    * @param {number} pendingIdx - index of the current child
+   * @param {boolean} deferLifecycle - parent defer flag from {@link materialize}
    * @returns {Promise<RuntimeFiber<P>>}
    */
   private async continueMaterializeAsync<P>(
@@ -1618,6 +1883,7 @@ export class GraphRuntime {
     childScope: ContextScope,
     pending: PromiseLike<RuntimeFiber<unknown>>,
     pendingIdx: number,
+    deferLifecycle: boolean,
   ): Promise<RuntimeFiber<P>> {
     const journal = fiber.constructionJournal!;
 
@@ -1634,9 +1900,14 @@ export class GraphRuntime {
 
     for (let i = pendingIdx + 1; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
-      
+
       try {
-        const childRes = this.materialize(childVnode, fiber as RuntimeFiber<unknown>, childScope);
+        const childRes = this.materialize(
+          childVnode,
+          fiber as RuntimeFiber<unknown>,
+          childScope,
+          true,
+        );
         const resolvedChild = isThenable(childRes) ? await childRes : (childRes as RuntimeFiber<unknown>);
         journal.mountedChildren.push(resolvedChild);
       } catch (err: unknown) {
@@ -1669,24 +1940,7 @@ export class GraphRuntime {
     // Parent buses were wired before the child loop in materialize(); async continuation
     // must not register handlers a second time.
 
-    // Pre-mount hook already injected at the start of materialize (before children).
-    const startupRes = engine.runStartup(instance, { deferFailedCleanup: true });
-    const resolved = isThenable(startupRes) ? await startupRes : startupRes;
-
-    if (!resolved.ok) {
-      const error = resolved.error instanceof Error ? resolved.error : new Error(String(resolved.error));
-      const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
-      if (isThenable(rollbackRes)) {
-        await rollbackRes;
-      }
-      throw error;
-    }
-
-    fiber.lifecycleStatus = engine.getStatus();
-    fiber.effectTag = null;
-    journal.schedulerHookAttached = true;
-    this.injectUpdateHook(instance, fiber);
-    return fiber;
+    return this.completeMaterializeAfterWiring(fiber, instance, engine, deferLifecycle);
   }
 
   /**
@@ -1738,6 +1992,9 @@ export class GraphRuntime {
    * @param {VirtualServiceNode<P>} nextVnode - new virtual node
    * @param {RuntimeFiber | null} parentFiber - parent fiber
    * @param {ContextScope} parentScope - parent scope
+   * @param {boolean} [deferLifecycle=false] - when true, REPLACE materialize wires buses but
+   *   defers onMount until the sibling batch flush in {@link reconcileChildren} (same contract
+   *   as PLACE). Root reconcile must leave this false — nothing else flushes the root.
    * @returns {Promise<RuntimeFiber<P>>}
    */
   private reconcileFiber<P>(
@@ -1745,6 +2002,7 @@ export class GraphRuntime {
     nextVnode: VirtualServiceNode<P>,
     parentFiber: RuntimeFiber<unknown> | null,
     parentScope: ContextScope,
+    deferLifecycle: boolean = false,
   ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
     const sameType = current.vnode.type === nextVnode.type;
     const sameKey = (current.vnode.key ?? null) === (nextVnode.key ?? null);
@@ -1757,11 +2015,15 @@ export class GraphRuntime {
     // Sync fast-path if both destroy and materialize completed synchronously.
     // Collect cleanup errors (ref clear / disposer) so a throwing finalize cannot
     // abort REPLACE and fail-stop the surviving tree — same best-effort contract as unmount.
+    //
+    // When deferLifecycle is set (child reconcile batch), REPLACE must not run onMount
+    // before later sibling buses are wired — otherwise a replaced publisher's mount-time
+    // publish is silently dropped by a not-yet-wired PLACE/REPLACE listener beside it.
     const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
     if (isThenable(destroyRes)) {
-      return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope));
+      return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle));
     }
-    return this.materialize(nextVnode, parentFiber, parentScope);
+    return this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle);
   }
 
   /**
@@ -2153,6 +2415,7 @@ export class GraphRuntime {
           nextVnodes[i] as VirtualServiceNode<unknown>,
           parentFiber,
           childScope,
+          true,
         );
 
         if (isThenable(reconciled)) {
@@ -2201,6 +2464,7 @@ export class GraphRuntime {
         nextVnodes[i] as VirtualServiceNode<unknown>,
         parentFiber,
         childScope,
+        true,
       );
       resultSoFar.push(isThenable(reconciled) ? await reconciled : (reconciled as RuntimeFiber<unknown>));
     }
@@ -2333,6 +2597,7 @@ export class GraphRuntime {
                 nextVnode as VirtualServiceNode<unknown>,
                 parentFiber,
                 childScope,
+                true,
               );
               nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
             } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
@@ -2344,11 +2609,12 @@ export class GraphRuntime {
                 nextVnode as VirtualServiceNode<unknown>,
                 parentFiber,
                 childScope,
+                true,
               );
               nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
             } else {
-              // New node — PLACE
-              const newRes = this.materialize(nextVnode, parentFiber, childScope);
+              // New node — PLACE: defer startup so later sibling buses wire first.
+              const newRes = this.materialize(nextVnode, parentFiber, childScope, true);
               nextChildren.push(isThenable(newRes) ? await newRes : newRes);
             }
           }
@@ -2382,11 +2648,12 @@ export class GraphRuntime {
               nextVnode as VirtualServiceNode<unknown>,
               parentFiber,
               childScope,
+              true,
             );
             nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
           } else {
-            // New node — PLACE
-            const newRes = this.materialize(nextVnode, parentFiber, childScope);
+            // New node — PLACE: defer startup so later sibling buses wire first.
+            const newRes = this.materialize(nextVnode, parentFiber, childScope, true);
             nextChildren.push(isThenable(newRes) ? await newRes : newRes);
           }
         }
@@ -2400,6 +2667,16 @@ export class GraphRuntime {
           const d = this.destroyFiber(orphan, []);
           if (isThenable(d)) {
             await d;
+          }
+        }
+      }
+
+      // Flush PLACE/REPLACE startups in compose order after every new sibling is wired.
+      for (const child of nextChildren) {
+        if (child.constructionJournal?.lifecycleDeferred === true) {
+          const flush = this.flushDeferredLifecycleTree(child);
+          if (isThenable(flush)) {
+            await flush;
           }
         }
       }
