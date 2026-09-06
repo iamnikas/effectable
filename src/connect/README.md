@@ -93,8 +93,9 @@ const ConnectedFeedsWithCreators = connect(undefined, {
    child for one generation). After mount, `applyToScope` only republishes the store — re-running
    mappers on every dirty reconcile would re-enter `mapDispatch` factories that dispatch as a side
    effect and fail-stop the runtime. When the wrapped class defines `applyToScope` (e.g.
-   `ContextProvider` or a custom context publisher), connect **delegates to it first**, then
-   overlays `CONNECT_STORE_CONTEXT` — otherwise user tokens are silently dropped from the child scope.
+   `ContextProvider` or a custom context publisher), connect **syncs mapped props first**, then
+   **delegates to it**, then overlays `CONNECT_STORE_CONTEXT` — otherwise user tokens are
+   silently dropped, or mapped-only provider values are published as `undefined` on first compose.
 3. HOC `onMount()`: merge dispatch → subscribe to state if needed → `super.onMount`.
 4. **Post-mount kick-off:** if `mapStateToProps` **or** `mapDispatchToProps` is set, after mount completes
    the HOC schedules **one** deferred `setState({})` via `queueMicrotask`. This yields exactly one
