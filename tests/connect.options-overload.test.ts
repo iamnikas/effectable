@@ -191,4 +191,38 @@ describe('connect options overload (ownPropsModeMerge without null mapDispatch)'
     inst.props.inc!();
     expect(store.getState().n).toBe(1);
   });
+
+  // Sibling of #176: options in the child mapDispatch slot must not swallow a following
+  // mapDispatch. `connect(mapState, { ownPropsModeMerge }, mapDispatch)` is type-legal
+  // after ConnectOptions joined the 2nd-arg union; the #129 parser required arg3 ===
+  // undefined to treat arg2 as options, so with mapDispatch present it swapped the bag
+  // into mapDispatch ({}) and the function into options (merge never applied).
+  test('child form: connect(mapState, options, mapDispatch) keeps dispatch and merges', () => {
+    const store = makeStore();
+    class Host extends Component<
+      Record<string, never>,
+      { n?: number; label?: string; inc?: () => void }
+    > {}
+
+    const ConnectedChild = connect(
+      (s: S) => ({ n: s.n }),
+      { ownPropsModeMerge: true },
+      (dispatch: DispatchMethod<A>) => ({
+        inc: (): void => {
+          dispatch({ type: 'INC' });
+        },
+      }),
+    )(Host);
+
+    const inst = new ConnectedChild({ label: 'child' }) as InstanceType<typeof ConnectedChild> & {
+      __connectStoreFromContext?: unknown;
+    };
+    inst.__connectStoreFromContext = store;
+    void inst.onMount!();
+    expect(inst.props.n).toBe(0);
+    expect(inst.props.label).toBe('child');
+    expect(typeof inst.props.inc).toBe('function');
+    inst.props.inc!();
+    expect(store.getState().n).toBe(1);
+  });
 });
