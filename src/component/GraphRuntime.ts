@@ -484,7 +484,15 @@ export class GraphRuntime {
     // the previous ref object — fail-stop finalize clears only the old ref (zombie nextRef).
     // Materialize assign-then-throw is covered by journal.refBound (#96/#98); this path covers
     // the UPDATE swap hole and is a safe no-op when the setter never assigned.
+    //
+    // @UseImperativeHandle throw-*before*-assign: resolveRefCurrentValue replaces the map
+    // entry with a fresh handle object before the setter runs. clearRefSafe then matches
+    // only that new handle, deletes the map entry, and leaves ref.current on the *previous*
+    // handle — fail-stop finalize can no longer identity-match → zombie. Restore the
+    // previous mapping when the setter never took the new value.
     if (nextRef !== undefined) {
+      const previousBoundHandle =
+        instance !== null ? this.imperativeRefByOwner.get(instance) : undefined;
       try {
         nextRef.current = instance === null ? null : this.resolveRefCurrentValue(instance);
       } catch (error: unknown) {
@@ -493,6 +501,12 @@ export class GraphRuntime {
             this.clearRefSafe(nextRef, instance);
           } catch {
             // Best-effort: do not mask the original setter error.
+          }
+          if (
+            previousBoundHandle !== undefined &&
+            nextRef.current === previousBoundHandle
+          ) {
+            this.imperativeRefByOwner.set(instance, previousBoundHandle);
           }
         }
         throw error;
