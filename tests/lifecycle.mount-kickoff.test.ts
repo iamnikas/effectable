@@ -386,8 +386,9 @@ describe('connect + GraphRuntime: kick-off after mount with pre-populated store 
       }
 
       public override onMount (): void {
-        // Illicit direct this.state = after construction: warns and does not apply.
-        // Consumer still does not call setState — library must deliver post-mount kick-off.
+        // Direct this.state = without setState (legacy consumer pattern). Gate may still be
+        // open if onMount runs in the same turn as `new`; post-gate assigns warn and no-op.
+        // Consumer does not call setState — library must deliver post-mount kick-off.
         this.state = { ...this.state, projectId: 'project-1' };
       }
 
@@ -417,7 +418,7 @@ describe('connect + GraphRuntime: kick-off after mount with pre-populated store 
 
     // Post-mount kick-off from connect: exactly one deferred onUpdate after mount
     // without setState/setTimeout in the consumer (hack model #1 / handleInitProjectId).
-    expect(engineRef.current.updateLog).toEqual(['update:null:synced']);
+    expect(engineRef.current.updateLog).toEqual(['update:project-1:synced']);
 
     await runtime.unmount();
   });
