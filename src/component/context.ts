@@ -371,7 +371,16 @@ export function injectContextFields (
     // unbounded-cascade if onUpdate setStates an ancestor).
     if (!Object.is(prevValue, nextValue)) {
       anyChanged = true;
-      target[meta.propertyKey] = nextValue;
+      // defineProperty — `target[key] =` invokes the Object.prototype `__proto__`
+      // setter when a @UseContext field is named `__proto__`, replacing the
+      // instance [[Prototype]] with the injected value and dropping Component methods
+      // (same class as store/connect #109 and mutableState/BusDecorators #135).
+      Object.defineProperty(target, meta.propertyKey, {
+        value: nextValue,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
   }
 
