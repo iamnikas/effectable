@@ -40,7 +40,7 @@ describe('context injectContextFields __proto__ key assignment safety', () => {
     expect(changed).toBe(true);
     expect(Object.getPrototypeOf(host)).toBe(Host.prototype);
     expect(Object.prototype.hasOwnProperty.call(host, '__proto__')).toBe(true);
-    expect((host as Record<string, unknown>)['__proto__']).toBe(injected);
+    expect((host as unknown as Record<string, unknown>)['__proto__']).toBe(injected);
     expect(host.marker()).toBe('host-method');
     expect(Object.prototype.hasOwnProperty.call(host, 'tag')).toBe(false);
     expect((host as { tag?: string }).tag).toBeUndefined();
