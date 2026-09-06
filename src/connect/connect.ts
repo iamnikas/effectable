@@ -1443,14 +1443,14 @@ function buildConnectHoc<S, P, R, A extends Action> (
  * @template P props type of the connected component
  * @template R result type of `mapStateToProps`
  * @template A action type
- * @param {Store<S, A> | MapStateToProps<S, P, R> | null | undefined} [storeOrMapStateToProps] - explicit store or `mapStateToProps`
- * @param {MapStateToProps<S, P, R> | MapDispatchToProps<S, P, A> | null | undefined} [mapStateToPropsOrMapDispatchToProps] - `mapStateToProps` or `mapDispatchToProps`
+ * @param {Store<S, A> | MapStateToProps<S, P, R> | ConnectOptions | null | undefined} [storeOrMapStateToProps] - explicit store, `mapStateToProps`, or {@link ConnectOptions}
+ * @param {MapStateToProps<S, P, R> | MapDispatchToProps<S, P, A> | ConnectOptions | null | undefined} [mapStateToPropsOrMapDispatchToProps] - `mapStateToProps`, `mapDispatchToProps`, or {@link ConnectOptions}
  * @param {MapDispatchToProps<S, P, A> | ConnectOptions | null | undefined} [mapDispatchToPropsOrOptions] - `mapDispatchToProps` or {@link ConnectOptions}
  * @param {ConnectOptions} [maybeOptions] - {@link ConnectOptions} (e.g. `ownPropsModeMerge`) for the form with an explicit store
  * @returns {<C extends ConnectableHocTarget>(Constructor: C) => C} HOC: `(Ctor) => subclass of C` with the same constructor name
  */
 export function connect<S, P = unknown, R = unknown, A extends Action = Action> (
-  storeOrMapStateToProps?: Store<S, A> | MapStateToProps<S, P, R> | null,
+  storeOrMapStateToProps?: Store<S, A> | MapStateToProps<S, P, R> | ConnectOptions | null,
   mapStateToPropsOrMapDispatchToProps?: MapStateToProps<S, P, R> | MapDispatchToProps<S, P, A> | ConnectOptions | null,
   mapDispatchToPropsOrOptions?: MapDispatchToProps<S, P, A> | ConnectOptions | null,
   maybeOptions?: ConnectOptions
@@ -1462,9 +1462,19 @@ export function connect<S, P = unknown, R = unknown, A extends Action = Action> 
 
   if (isStoreLike(storeOrMapStateToProps)) {
     store = storeOrMapStateToProps as Store<S, A>;
-    // connect(store, options) — options in the mapState slot
+    // connect(store, options[, mapDispatch[, options]]) — options in the mapState slot.
+    // Must still bind a following mapDispatch; dropping it silently loses callbacks on a
+    // type-legal call after ConnectOptions was added to the 2nd-arg union (#129).
     if (isConnectOptions(mapStateToPropsOrMapDispatchToProps)) {
       options = mapStateToPropsOrMapDispatchToProps;
+      if (isConnectOptions(mapDispatchToPropsOrOptions) && maybeOptions === undefined) {
+        options = mapDispatchToPropsOrOptions;
+      } else if (mapDispatchToPropsOrOptions !== undefined) {
+        mapDispatchToProps = mapDispatchToPropsOrOptions as MapDispatchToProps<S, P, A> | undefined;
+        if (maybeOptions !== undefined) {
+          options = maybeOptions;
+        }
+      }
     } else {
       mapStateToProps = mapStateToPropsOrMapDispatchToProps as MapStateToProps<S, P, R> | undefined;
       // connect(store, mapState, options) — options without null mapDispatch
@@ -1476,8 +1486,16 @@ export function connect<S, P = unknown, R = unknown, A extends Action = Action> 
       }
     }
   } else if (isConnectOptions(storeOrMapStateToProps)) {
-    // connect(options) — rare; options-only child HOC
+    // connect(options[, mapDispatch[, options]]) — options-only / options+dispatch child HOC
     options = storeOrMapStateToProps;
+    if (isConnectOptions(mapStateToPropsOrMapDispatchToProps) && mapDispatchToPropsOrOptions === undefined) {
+      options = mapStateToPropsOrMapDispatchToProps;
+    } else if (mapStateToPropsOrMapDispatchToProps !== undefined) {
+      mapDispatchToProps = mapStateToPropsOrMapDispatchToProps as MapDispatchToProps<S, P, A> | undefined;
+      if (mapDispatchToPropsOrOptions !== undefined) {
+        options = mapDispatchToPropsOrOptions as ConnectOptions;
+      }
+    }
   } else {
     mapStateToProps = storeOrMapStateToProps as MapStateToProps<S, P, R> | undefined;
     // connect(mapState, options) — options without null mapDispatch

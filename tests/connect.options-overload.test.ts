@@ -113,4 +113,82 @@ describe('connect options overload (ownPropsModeMerge without null mapDispatch)'
     expect(inst.props.n).toBe(0);
     expect(typeof (inst.props as { go?: unknown }).go).toBe('function');
   });
+
+  // #129 regression: options in the mapState slot must not swallow a following mapDispatch.
+  // connect(store, { ownPropsModeMerge }, mapDispatch) is type-legal after ConnectOptions was
+  // added to the 2nd-arg union; the first implementation assigned options and ignored arg3.
+  test('store form: connect(store, options, mapDispatch) keeps dispatch and merges', () => {
+    const store = makeStore();
+    class Host extends Component<
+      Record<string, never>,
+      { label?: string; inc?: () => void }
+    > {}
+
+    const Connected = connect(
+      store,
+      { ownPropsModeMerge: true },
+      (dispatch: DispatchMethod<A>) => ({
+        inc: (): void => {
+          dispatch({ type: 'INC' });
+        },
+      }),
+    )(Host);
+
+    const inst = new Connected({ label: 'keep-me' });
+    void inst.onMount!();
+    expect(inst.props.label).toBe('keep-me');
+    expect(typeof inst.props.inc).toBe('function');
+    inst.props.inc!();
+    expect(store.getState().n).toBe(1);
+  });
+
+  test('store form: connect(store, options, actionCreators) binds creators', () => {
+    const store = makeStore();
+    class Host extends Component<
+      Record<string, never>,
+      { label?: string; go?: () => void }
+    > {}
+
+    const Connected = connect(
+      store,
+      { ownPropsModeMerge: true },
+      {
+        go: (): A => ({ type: 'INC' }),
+      },
+    )(Host);
+
+    const inst = new Connected({ label: 'x' });
+    void inst.onMount!();
+    expect(inst.props.label).toBe('x');
+    expect(typeof inst.props.go).toBe('function');
+    inst.props.go!();
+    expect(store.getState().n).toBe(1);
+  });
+
+  test('child form: connect(options, mapDispatch) keeps dispatch and merges', () => {
+    const store = makeStore();
+    class Host extends Component<
+      Record<string, never>,
+      { label?: string; inc?: () => void }
+    > {}
+
+    const ConnectedChild = connect(
+      { ownPropsModeMerge: true },
+      (dispatch: DispatchMethod<A>) => ({
+        inc: (): void => {
+          dispatch({ type: 'INC' });
+        },
+      }),
+    )(Host);
+
+    const inst = new ConnectedChild({ label: 'child' }) as InstanceType<typeof ConnectedChild> & {
+      __connectStoreFromContext?: unknown;
+    };
+    inst.__connectStoreFromContext = store;
+    void inst.onMount!();
+    expect(inst.props.label).toBe('child');
+    expect(typeof inst.props.inc).toBe('function');
+    inst.props.inc!();
+    expect(store.getState().n).toBe(1);
+  });
 });
