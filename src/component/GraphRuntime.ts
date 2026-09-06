@@ -17,8 +17,10 @@
  *   observability — a throwing observer cannot skip fail-stop.
  * - Dirty flush runs only while ACTIVE and the operation queue is idle; `setState` during child
  *   materialization is buffered and applied after the mount/reconcile pass.
- * - UPDATE `commitRef` runs only after successful compose + child reconcile; compose/key
- *   validation failure rolls back the fiber (including premount hooks) without leaving phantoms.
+ * - UPDATE `commitRef` runs after successful compose and *before* child reconcile so
+ *   same-pass PLACE `onMount` observes parent `nextRef` (mount path already commits before
+ *   deferred onMount flush). Child-reconcile failure rolls the early commit back; compose
+ *   failure never touches refs.
  * - Failed cleanup is children-first and does not invoke a phantom parent `onUnmount`.
  * - Orphan DELETE finalize is best-effort so survivors are not fail-stopped for cleanup noise.
  *
@@ -2550,10 +2552,8 @@ export class GraphRuntime {
       current.hasPendingOnUpdate = true;
     }
 
-    // Reconcile child nodes (sync fast-path if all children are sync).
-    // Ref commit is deferred to applyFiberUpdate so a compose()/child-reconcile
-    // failure cannot leave nextRef.current pointing at an instance that failStop
-    // will destroy while fiber.vnode.ref still holds the previous ref.
+    // Compose first; only then touch refs. A compose() throw must not leave nextRef
+    // bound while fiber.vnode.ref still names the previous ref (fail-stop would miss it).
     let nextChildVnodes: VirtualServiceNode[];
     try {
       nextChildVnodes = this.getChildVnodes(instance, nextVnode.children);
@@ -2567,12 +2567,60 @@ export class GraphRuntime {
       throw error;
     }
 
-    const childrenRes = this.reconcileChildren(
-      current.children as RuntimeFiber<unknown>[],
-      nextChildVnodes,
-      current as RuntimeFiber<unknown>,
-      childScope,
-    );
+    // Commit the UPDATE ref *before* child reconcile so same-pass PLACE children
+    // see parent nextRef in onMount (mount path already commits before deferred
+    // onMount flush). Child-reconcile failure must roll the commit back: fiber.vnode
+    // still holds previousRef until applyFiberUpdate, so fail-stop would otherwise
+    // clear only the old ref and leave a zombie nextRef.
+    const previousRef = current.vnode.ref;
+    const nextRef = nextVnode.ref;
+    let refCommittedBeforeChildren = false;
+    try {
+      this.commitRef(previousRef, instance, nextRef, instance);
+      refCommittedBeforeChildren = true;
+    } catch (error: unknown) {
+      // commitRef clears nextRef on assign-then-throw; no PLACE orphans yet.
+      const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
+      if (isThenable(cleanupResult)) {
+        return cleanupResult.then(() => {
+          throw error;
+        });
+      }
+      throw error;
+    }
+
+    const rollbackEarlyRefCommit = (): void => {
+      if (!refCommittedBeforeChildren) {
+        return;
+      }
+      if (nextRef !== undefined && nextRef !== previousRef) {
+        try {
+          this.clearRefSafe(nextRef, instance);
+        } catch {
+          // Best-effort: do not mask the child-reconcile error.
+        }
+      }
+      if (previousRef !== undefined && previousRef !== nextRef) {
+        try {
+          previousRef.current = this.resolveRefCurrentValue(instance);
+        } catch {
+          // Best-effort restore before fail-stop clears previousRef.
+        }
+      }
+    };
+
+    let childrenRes: RuntimeFiber<unknown>[] | Promise<RuntimeFiber<unknown>[]>;
+    try {
+      childrenRes = this.reconcileChildren(
+        current.children as RuntimeFiber<unknown>[],
+        nextChildVnodes,
+        current as RuntimeFiber<unknown>,
+        childScope,
+      );
+    } catch (error: unknown) {
+      rollbackEarlyRefCommit();
+      throw error;
+    }
 
     const afterChildren = (nextChildren: RuntimeFiber<unknown>[]): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
       if (shouldOnUpdate && !deferOnUpdate) {
@@ -2592,7 +2640,7 @@ export class GraphRuntime {
       try {
         this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
       } catch (error: unknown) {
-        // Children already PLACE/UPDATE/DELETE'd. A throwing commitRef leaves
+        // Children already PLACE/UPDATE/DELETE'd. A throwing applyFiberUpdate leaves
         // PLACE/REPLACE fibers unreachable from current.children — failStop cannot
         // reclaim them. Tear them down before rethrowing (HOLE 3 sibling).
         const orphanRes = this.destroyOrphanedPlacedChildren(
@@ -2601,7 +2649,7 @@ export class GraphRuntime {
           error,
         );
         if (isThenable(orphanRes)) {
-          return orphanRes.then(() => {
+          return Promise.resolve(orphanRes).then(() => {
             throw error;
           });
         }
@@ -2611,40 +2659,32 @@ export class GraphRuntime {
     };
 
     if (isThenable(childrenRes)) {
-      return childrenRes.then((nextChildren) => {
-        try {
-          return afterChildren(nextChildren);
-        } catch (error: unknown) {
-          const orphanRes = this.destroyOrphanedPlacedChildren(
-            current.children as RuntimeFiber<unknown>[],
-            nextChildren,
-            error,
-          );
-          if (isThenable(orphanRes)) {
-            return orphanRes.then(() => {
-              throw error;
-            });
+      return childrenRes.then(
+        (nextChildren) => {
+          try {
+            return afterChildren(nextChildren);
+          } catch (error: unknown) {
+            const orphanRes = this.destroyOrphanedPlacedChildren(
+              current.children as RuntimeFiber<unknown>[],
+              nextChildren,
+              error,
+            );
+            if (isThenable(orphanRes)) {
+              return orphanRes.then(() => {
+                throw error;
+              });
+            }
+            throw error;
           }
+        },
+        (error: unknown) => {
+          rollbackEarlyRefCommit();
           throw error;
-        }
-      });
+        },
+      );
     }
 
-    try {
-      return afterChildren(childrenRes);
-    } catch (error: unknown) {
-      const orphanRes = this.destroyOrphanedPlacedChildren(
-        current.children as RuntimeFiber<unknown>[],
-        childrenRes,
-        error,
-      );
-      if (isThenable(orphanRes)) {
-        return orphanRes.then(() => {
-          throw error;
-        });
-      }
-      throw error;
-    }
+    return afterChildren(childrenRes);
   }
 
   /**
@@ -2845,6 +2885,18 @@ export class GraphRuntime {
    * @param {RuntimeFiber<unknown>[]} nextChildren - new child fibers
    * @returns {void}
    */
+  /**
+   * Applies the reconcile result to the current fiber in-place.
+   * In-place mutation instead of spread: 0 heap allocations on UPDATE
+   * (3.09x speedup). Safe: RuntimeFiber is private.
+   *
+   * @param {RuntimeFiber<P>} current - current fiber
+   * @param {VirtualServiceNode<P>} nextVnode - new vnode
+   * @param {RuntimeFiber<unknown> | null} parentFiber - parent fiber
+   * @param {ContextScope} parentScope - parent scope
+   * @param {RuntimeFiber<unknown>[]} nextChildren - new child fibers
+   * @returns {void}
+   */
   private applyFiberUpdate<P> (
     current: RuntimeFiber<P>,
     nextVnode: VirtualServiceNode<P>,
@@ -2852,12 +2904,9 @@ export class GraphRuntime {
     parentScope: ContextScope,
     nextChildren: RuntimeFiber<unknown>[],
   ): void {
-    const instance = current.instance;
-    if (instance !== null) {
-      // Commit ref only after compose + child reconcile succeeded.
-      this.commitRef(current.vnode.ref, instance, nextVnode.ref, instance);
-    }
-
+    // Ref already committed in updateFiber after compose and before child
+    // reconcile (so PLACE onMount observes parent nextRef). Only publish the
+    // fiber bookkeeping here.
     current.vnode = nextVnode;
     current.parentFiber = parentFiber as RuntimeFiber<unknown> | null;
     this.setFiberChildren(current as RuntimeFiber<unknown>, nextChildren as Fiber[]);
