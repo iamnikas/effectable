@@ -537,7 +537,8 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * reconcile → applyToScope → dispatch → … → fail-stop).
        *
        * After mount, props stay current via the store subscription and
-       * {@link RUNTIME_PROPS_RECEIVER}; post-mount `applyToScope` only republishes the store.
+       * {@link RUNTIME_PROPS_RECEIVER}; post-mount `applyToScope` only republishes the store
+       * (still after delegating to the wrapped class's `applyToScope` when present).
        *
        * After `store.destroy()`, skip live `getState()` / mapDispatch refresh — that throw
        * would fail-stop the entire GraphRuntime on the next parent `setState`. Keep last
@@ -547,6 +548,18 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * @returns {ContextScope} scope for child nodes
        */
       public applyToScope (parentScope: ContextScope): ContextScope {
+        // Preserve the wrapped class's applyToScope (ContextProvider or a custom
+        // context publisher). Skipping super silently drops user tokens from the
+        // child scope while CONNECT_STORE_CONTEXT still publishes — children see
+        // token defaults instead of the intended provider values.
+        const baseApply = (
+          Constructor.prototype as { applyToScope?: (scope: ContextScope) => ContextScope }
+        ).applyToScope;
+        const scopeForChildren =
+          typeof baseApply === 'function'
+            ? baseApply.call(this, parentScope)
+            : parentScope;
+
         const store = this.tryResolveConnectStore();
         if (store !== null) {
           // Pre-mount only (#91): first compose runs before onMount, so own-props must
@@ -555,12 +568,12 @@ function buildConnectHoc<S, P, R, A extends Action> (
           if (!this.__connectMountCompleted) {
             this.syncConnectPropsBeforeCompose(store);
           }
-          return extendScope(parentScope, CONNECT_STORE_CONTEXT, store);
+          return extendScope(scopeForChildren, CONNECT_STORE_CONTEXT, store);
         }
 
         // Destroyed store: do not call getState(); keep last mapped props.
         if (this.__connectStoreDestroyed && this.__connectStore !== null) {
-          return extendScope(parentScope, CONNECT_STORE_CONTEXT, this.__connectStore);
+          return extendScope(scopeForChildren, CONNECT_STORE_CONTEXT, this.__connectStore);
         }
 
         // Missing store (never resolved) — same public error as before.
@@ -568,7 +581,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
         if (!this.__connectMountCompleted) {
           this.syncConnectPropsBeforeCompose(resolved);
         }
-        return extendScope(parentScope, CONNECT_STORE_CONTEXT, resolved);
+        return extendScope(scopeForChildren, CONNECT_STORE_CONTEXT, resolved);
       }
 
       /**
