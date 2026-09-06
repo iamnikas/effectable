@@ -62,6 +62,7 @@ import type {
 } from '../runtime/types';
 import type { RuntimeBusesBundle } from '../runtime/BusDecorators';
 import { wireRuntimeBusesIfDecorated } from '../runtime/BusDecorators';
+import type { RuntimeBusWiringDisposer } from '../runtime/BusDecorators';
 import { GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES } from './graphRuntime.constants';
 
 /**
@@ -146,7 +147,7 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
    * Disposer for auto-wiring {@link wireRuntimeBusesIfDecorated} for `@Use*Bus` / `@On*` decorators.
    * Called after `runShutdown` (after `onUnmount`).
    */
-  effectableRuntimeBusDisposer?: () => void;
+  effectableRuntimeBusDisposer?: RuntimeBusWiringDisposer;
   /**
    * `setState` during `runStartup`/`onMount` happened before the live
    * {@link SCHEDULE_UPDATE_HOOK} was injected: after startup, {@link scheduleUpdate} must run.
@@ -394,6 +395,97 @@ export class GraphRuntime {
     }
 
     delete fiber.effectableRuntimeBusDisposer;
+  }
+
+  /**
+   * Releases exclusive Command/Query bus registrations without clearing EventBus
+   * subscriptions or removing the disposer (destroyFiber still unsubscribes events).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - node fiber
+   * @returns {void}
+   */
+  private disposeExclusiveEffectableRuntimeBusWiring (fiber: RuntimeFiber<unknown>): void {
+    const disposer = fiber.effectableRuntimeBusDisposer;
+    if (disposer !== undefined && typeof disposer.disposeExclusive === 'function') {
+      disposer.disposeExclusive();
+    }
+  }
+
+  /**
+   * Depth-first exclusive bus release for an orphan subtree. Nested `@OnCommand` /
+   * `@OnQuery` under a keyed wrapper must free slots before PLACE, not only the orphan root.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - orphan root (or any subtree root)
+   * @returns {void}
+   */
+  private disposeExclusiveEffectableRuntimeBusWiringSubtree (
+    fiber: RuntimeFiber<unknown>,
+  ): void {
+    const children = fiber.children as RuntimeFiber<unknown>[];
+    for (let i = 0; i < children.length; i += 1) {
+      this.disposeExclusiveEffectableRuntimeBusWiringSubtree(
+        children[i] as RuntimeFiber<unknown>,
+      );
+    }
+    this.disposeExclusiveEffectableRuntimeBusWiring(fiber);
+  }
+
+  /**
+   * Fibers that will be unpaired after the next-child match (full-diff orphans).
+   * Pure: mirrors keyed/unkeyed matching without materializing or destroying.
+   *
+   * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
+   * @param {VirtualServiceNode[]} nextVnodes - next child vnodes
+   * @param {boolean} hasKeyedCurrent - whether any current child has a key
+   * @returns {RuntimeFiber<unknown>[]} fibers that will be destroyed as orphans
+   */
+  private collectFullDiffOrphans (
+    currentChildren: RuntimeFiber<unknown>[],
+    nextVnodes: VirtualServiceNode[],
+    hasKeyedCurrent: boolean,
+  ): RuntimeFiber<unknown>[] {
+    const orphans: RuntimeFiber<unknown>[] = [];
+    const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
+    let unkeyedIdx = 0;
+
+    if (hasKeyedCurrent) {
+      const keyedCurrentMap = new Map<string | number, RuntimeFiber<unknown>>();
+      for (const child of currentChildren) {
+        const key = child.vnode.key;
+        if (key !== undefined) {
+          keyedCurrentMap.set(key, child);
+        } else {
+          unkeyedCurrent.push(child);
+        }
+      }
+
+      for (const nextVnode of nextVnodes) {
+        const nextKey = nextVnode.key;
+        if (nextKey !== undefined && keyedCurrentMap.has(nextKey)) {
+          keyedCurrentMap.delete(nextKey);
+        } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
+          unkeyedIdx += 1;
+        }
+      }
+
+      for (const [, orphan] of keyedCurrentMap) {
+        orphans.push(orphan);
+      }
+    } else {
+      for (const child of currentChildren) {
+        unkeyedCurrent.push(child);
+      }
+      unkeyedIdx = Math.min(nextVnodes.length, unkeyedCurrent.length);
+    }
+
+    for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
+      const orphan = unkeyedCurrent[i];
+      if (orphan !== undefined) {
+        orphans.push(orphan);
+      }
+    }
+
+    return orphans;
   }
 
   /**
@@ -2635,6 +2727,24 @@ export class GraphRuntime {
     const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
     const nextChildren: RuntimeFiber<unknown>[] = [];
     let unkeyedIdx = 0;
+
+    // Free exclusive Command/Query slots on orphan subtrees BEFORE any PLACE materialize.
+    // Exclusive buses allow only one handler per type: PLACE `@OnCommand`/`@OnQuery` while
+    // a not-yet-destroyed orphan (or nested child) still owns the type fail-stops.
+    // Only exclusive registrations are released here — EventBus stays subscribed until
+    // destroyFiber so REPLACE victim `onUnmount` publishes still reach live orphans.
+    for (const orphan of this.collectFullDiffOrphans(
+      currentChildren,
+      nextVnodes,
+      hasKeyedCurrent,
+    )) {
+      try {
+        this.disposeExclusiveEffectableRuntimeBusWiringSubtree(orphan);
+      } catch {
+        // Best-effort: a throwing disposer must not skip remaining orphans or block PLACE.
+        // destroyFiber will dispose again (exclusive no-op; events still cleaned up).
+      }
+    }
 
     // Pass-1 defers same-type UPDATE until after PLACE/REPLACE siblings are wired.
     // Otherwise UPDATE `onUpdate` can publish before a later PLACE sibling's `@On*`

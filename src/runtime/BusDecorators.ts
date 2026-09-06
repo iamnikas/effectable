@@ -220,6 +220,18 @@ export function instanceUsesRuntimeBusDecorators (instance: object): boolean {
 }
 
 /**
+ * Disposer returned by {@link wireRuntimeBuses}.
+ *
+ * Invoking the function releases all registrations/subscriptions from that wiring
+ * call (idempotent). {@link RuntimeBusWiringDisposer.disposeExclusive} releases only
+ * CommandBus/QueryBus handlers so GraphRuntime can free exclusive slots before PLACE
+ * while leaving EventBus subscriptions alive until fiber destroy.
+ */
+export type RuntimeBusWiringDisposer = (() => void) & {
+  disposeExclusive: () => void;
+};
+
+/**
  * Calls {@link wireRuntimeBuses} only if the constructor chain has relevant decorators.
  *
  * @template TCommand
@@ -227,7 +239,7 @@ export function instanceUsesRuntimeBusDecorators (instance: object): boolean {
  * @template TEvent
  * @param {object} instance - instance
  * @param {RuntimeBusesBundle<TCommand, TQuery, TEvent>} buses - buses
- * @returns {(() => void) | null} disposer or null if wiring is not needed
+ * @returns {RuntimeBusWiringDisposer | null} disposer or null if wiring is not needed
  */
 export function wireRuntimeBusesIfDecorated<
   TCommand extends RuntimeCommand,
@@ -236,7 +248,7 @@ export function wireRuntimeBusesIfDecorated<
 > (
   instance: object,
   buses: RuntimeBusesBundle<TCommand, TQuery, TEvent>
-): (() => void) | null {
+): RuntimeBusWiringDisposer | null {
   if (!instanceUsesRuntimeBusDecorators(instance)) {
     return null;
   }
@@ -285,12 +297,16 @@ function unwindDisposers (disposers: Array<() => void>): { primaryError?: Error;
  * EventBus fan-out: every distinct `@OnEvent` method for the same type is subscribed (unlike
  * Command/Query last-write-wins). Delivery itself uses {@link EventBus.publish} handler snapshots.
  *
+ * The disposer exposes {@link RuntimeBusWiringDisposer.disposeExclusive} to release only
+ * exclusive Command/Query registrations (GraphRuntime pre-PLACE orphan cleanup) while keeping
+ * EventBus subscriptions until full dispose / fiber destroy.
+ *
  * @template TCommand
  * @template TQuery
  * @template TEvent
  * @param {object} instance - class instance with decorator metadata
  * @param {RuntimeBusesBundle<TCommand, TQuery, TEvent>} buses - bus bundle
- * @returns {() => void} disposer: removes registrations and subscriptions created by this call
+ * @returns {RuntimeBusWiringDisposer} disposer for registrations/subscriptions from this call
  */
 export function wireRuntimeBuses<
   TCommand extends RuntimeCommand,
@@ -299,10 +315,11 @@ export function wireRuntimeBuses<
 > (
   instance: object,
   buses: RuntimeBusesBundle<TCommand, TQuery, TEvent>
-): () => void {
+): RuntimeBusWiringDisposer {
   const leafCtor = instance.constructor as Function;
   const ctorChain = getConstructorChainLeafFirst(leafCtor);
-  const disposers: Array<() => void> = [];
+  const exclusiveDisposers: Array<() => void> = [];
+  const eventDisposers: Array<() => void> = [];
 
   try {
     // Base → leaf: last assign wins when field names collide.
@@ -346,7 +363,7 @@ export function wireRuntimeBuses<
       const handler: CommandHandler<TCommand, unknown> = (command) => {
         return raw.call(instance, command) as ReturnType<CommandHandler<TCommand, unknown>>;
       };
-      disposers.push(buses.commandBus.register(type as TCommand['type'], handler));
+      exclusiveDisposers.push(buses.commandBus.register(type as TCommand['type'], handler));
     }
 
     for (const [type, method] of mergedQuery) {
@@ -357,7 +374,7 @@ export function wireRuntimeBuses<
       const handler: QueryHandler<TQuery, unknown> = (query) => {
         return raw.call(instance, query) as ReturnType<QueryHandler<TQuery, unknown>>;
       };
-      disposers.push(buses.queryBus.register(type as TQuery['type'], handler));
+      exclusiveDisposers.push(buses.queryBus.register(type as TQuery['type'], handler));
     }
 
     for (const [type, methods] of mergedEvent) {
@@ -369,11 +386,11 @@ export function wireRuntimeBuses<
         const handler: EventHandler<TEvent> = (event) => {
           raw.call(instance, event);
         };
-        disposers.push(buses.eventBus.subscribe(type as TEvent['type'], handler));
+        eventDisposers.push(buses.eventBus.subscribe(type as TEvent['type'], handler));
       }
     }
   } catch (wiringError) {
-    const { cleanupErrors } = unwindDisposers(disposers);
+    const { cleanupErrors } = unwindDisposers(exclusiveDisposers.concat(eventDisposers));
     const primary = wiringError instanceof Error ? wiringError : new Error(String(wiringError));
     if (cleanupErrors.length > 0) {
       (primary as Error & { cleanupErrors?: Error[] }).cleanupErrors = cleanupErrors;
@@ -381,22 +398,52 @@ export function wireRuntimeBuses<
     throw primary;
   }
 
-  let disposed = false;
-  return () => {
-    if (disposed) {
+  let exclusiveDisposed = false;
+  let eventsDisposed = false;
+
+  const throwIfCleanupErrors = (cleanupErrors: Error[], label: string): void => {
+    if (cleanupErrors.length === 0) {
       return;
     }
-    disposed = true;
-
-    const { cleanupErrors } = unwindDisposers(disposers);
-    if (cleanupErrors.length > 0) {
-      const aggregateError = new Error(
-        `wireRuntimeBuses: disposer cleanup encountered ${cleanupErrors.length} error(s)`
-      ) as Error & { cleanupErrors: Error[] };
-      aggregateError.cleanupErrors = cleanupErrors;
-      throw aggregateError;
-    }
+    const aggregateError = new Error(
+      `${label} encountered ${cleanupErrors.length} error(s)`
+    ) as Error & { cleanupErrors: Error[] };
+    aggregateError.cleanupErrors = cleanupErrors;
+    throw aggregateError;
   };
+
+  /**
+   * Releases exclusive Command/Query registrations only. Leaves `@OnEvent` subscriptions
+   * live so GraphRuntime can free exclusive slots before PLACE without silent EventBus
+   * handoff loss from orphans that are still mounted until later destroy.
+   *
+   * @returns {void}
+   */
+  const disposeExclusive = (): void => {
+    if (exclusiveDisposed) {
+      return;
+    }
+    exclusiveDisposed = true;
+    throwIfCleanupErrors(
+      unwindDisposers(exclusiveDisposers).cleanupErrors,
+      'wireRuntimeBuses: exclusive disposer cleanup',
+    );
+  };
+
+  const disposeAll = ((): void => {
+    disposeExclusive();
+    if (eventsDisposed) {
+      return;
+    }
+    eventsDisposed = true;
+    throwIfCleanupErrors(
+      unwindDisposers(eventDisposers).cleanupErrors,
+      'wireRuntimeBuses: event disposer cleanup',
+    );
+  }) as RuntimeBusWiringDisposer;
+
+  disposeAll.disposeExclusive = disposeExclusive;
+  return disposeAll;
 }
 
 /**

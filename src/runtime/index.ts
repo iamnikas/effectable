@@ -37,4 +37,4 @@ export {
   instanceUsesRuntimeBusDecorators,
   wireRuntimeBusesAll,
 } from './BusDecorators';
-export type { RuntimeBusesBundle } from './BusDecorators';
+export type { RuntimeBusesBundle, RuntimeBusWiringDisposer } from './BusDecorators';
