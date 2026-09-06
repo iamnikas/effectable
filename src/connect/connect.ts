@@ -135,6 +135,47 @@ function isStoreLike (value: unknown): boolean {
 }
 
 /**
+ * Detects a {@link ConnectOptions} bag so `connect` can accept options in the
+ * last object slot without requiring a `null` mapDispatch placeholder.
+ *
+ * The public signature types the store-form 3rd argument as
+ * `MapDispatchToProps | ConnectOptions`. Without a runtime check,
+ * `connect(store, mapState, { ownPropsModeMerge: true })` treats the options
+ * object as an action-creators map (booleans skipped → `{}`), leaves
+ * `options` undefined, and silently stays in strict mode — own props are
+ * dropped. Same footgun for child `connect(mapState, { ownPropsModeMerge: true })`.
+ *
+ * Heuristic: own `ownPropsModeMerge` key present as boolean/undefined, and no
+ * own enumerable function values (those indicate an action-creators map).
+ *
+ * @param {unknown} value - candidate argument
+ * @returns {boolean} true when `value` should be parsed as ConnectOptions
+ */
+function isConnectOptions (value: unknown): value is ConnectOptions {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(value, 'ownPropsModeMerge')) {
+    return false;
+  }
+
+  const record = value as Record<string, unknown>;
+  const flag = record['ownPropsModeMerge'];
+  if (flag !== undefined && typeof flag !== 'boolean') {
+    return false;
+  }
+
+  for (const key of Object.keys(record)) {
+    if (typeof record[key] === 'function') {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * Resolves the user `onMount` / `onUnmount` connect should invoke after its own wiring.
  *
  * Order:
@@ -1404,7 +1445,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
  */
 export function connect<S, P = unknown, R = unknown, A extends Action = Action> (
   storeOrMapStateToProps?: Store<S, A> | MapStateToProps<S, P, R> | null,
-  mapStateToPropsOrMapDispatchToProps?: MapStateToProps<S, P, R> | MapDispatchToProps<S, P, A> | null,
+  mapStateToPropsOrMapDispatchToProps?: MapStateToProps<S, P, R> | MapDispatchToProps<S, P, A> | ConnectOptions | null,
   mapDispatchToPropsOrOptions?: MapDispatchToProps<S, P, A> | ConnectOptions | null,
   maybeOptions?: ConnectOptions
 ): <C extends ConnectableHocTarget>(Constructor: C) => C {
@@ -1415,13 +1456,31 @@ export function connect<S, P = unknown, R = unknown, A extends Action = Action> 
 
   if (isStoreLike(storeOrMapStateToProps)) {
     store = storeOrMapStateToProps as Store<S, A>;
-    mapStateToProps = mapStateToPropsOrMapDispatchToProps as MapStateToProps<S, P, R> | undefined;
-    mapDispatchToProps = mapDispatchToPropsOrOptions as MapDispatchToProps<S, P, A> | undefined;
-    options = maybeOptions;
+    // connect(store, options) — options in the mapState slot
+    if (isConnectOptions(mapStateToPropsOrMapDispatchToProps)) {
+      options = mapStateToPropsOrMapDispatchToProps;
+    } else {
+      mapStateToProps = mapStateToPropsOrMapDispatchToProps as MapStateToProps<S, P, R> | undefined;
+      // connect(store, mapState, options) — options without null mapDispatch
+      if (isConnectOptions(mapDispatchToPropsOrOptions) && maybeOptions === undefined) {
+        options = mapDispatchToPropsOrOptions;
+      } else {
+        mapDispatchToProps = mapDispatchToPropsOrOptions as MapDispatchToProps<S, P, A> | undefined;
+        options = maybeOptions;
+      }
+    }
+  } else if (isConnectOptions(storeOrMapStateToProps)) {
+    // connect(options) — rare; options-only child HOC
+    options = storeOrMapStateToProps;
   } else {
     mapStateToProps = storeOrMapStateToProps as MapStateToProps<S, P, R> | undefined;
-    mapDispatchToProps = mapStateToPropsOrMapDispatchToProps as MapDispatchToProps<S, P, A> | undefined;
-    options = mapDispatchToPropsOrOptions as ConnectOptions | undefined;
+    // connect(mapState, options) — options without null mapDispatch
+    if (isConnectOptions(mapStateToPropsOrMapDispatchToProps) && mapDispatchToPropsOrOptions === undefined) {
+      options = mapStateToPropsOrMapDispatchToProps;
+    } else {
+      mapDispatchToProps = mapStateToPropsOrMapDispatchToProps as MapDispatchToProps<S, P, A> | undefined;
+      options = mapDispatchToPropsOrOptions as ConnectOptions | undefined;
+    }
   }
 
   const ownPropsMode: OwnPropsMode = options !== undefined && options.ownPropsModeMerge === true
