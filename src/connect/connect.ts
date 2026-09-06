@@ -11,7 +11,8 @@
  *   run again; stale async `onMount` from a previous generation is ignored.
  * - Remount clears stale mapped state props and re-resolves the context store when needed.
  * - Class-field `onMount` / `onUnmount` (own instance properties) still go through connect wiring
- *   and do not shadow store subscribe / unsubscribe.
+ *   and do not shadow store subscribe / unsubscribe. Own-property reinstall is per-hook and only
+ *   when a field was captured, so prototype overrides on subclasses of Connected still run.
  * - `mapStateToProps` subscribe failures fail the mount; mapDispatch-only hosts still get the
  *   post-mount kick-off after a successful mount.
  *
@@ -247,19 +248,22 @@ function buildConnectHoc<S, P, R, A extends Action> (
         this.__connectOwnProps = this.props as unknown as Record<string, unknown>;
 
         // Class-field lifecycle hooks are own properties and shadow Connected.prototype.
-        // Capture them, then reinstall Connected wiring so GraphRuntime still runs connect.
+        // Capture each field and reinstall only that hook so GraphRuntime still runs connect.
+        // Do NOT unconditionally stamp both own properties: that shadows prototype overrides on
+        // subclasses of Connected (`class Ext extends Connected { override onMount() {…} }`),
+        // so Ext's hooks never run and subclass unmount cleanup leaks.
         const self = this as {
           onMount?: unknown;
           onUnmount?: unknown;
         };
         if (Object.prototype.hasOwnProperty.call(this, 'onMount') && typeof self.onMount === 'function') {
           this.__connectOwnOnMount = self.onMount as () => void | Promise<void>;
+          self.onMount = Connected.prototype.onMount;
         }
         if (Object.prototype.hasOwnProperty.call(this, 'onUnmount') && typeof self.onUnmount === 'function') {
           this.__connectOwnOnUnmount = self.onUnmount as () => void | Promise<void>;
+          self.onUnmount = Connected.prototype.onUnmount;
         }
-        self.onMount = Connected.prototype.onMount;
-        self.onUnmount = Connected.prototype.onUnmount;
       }
 
       /**
