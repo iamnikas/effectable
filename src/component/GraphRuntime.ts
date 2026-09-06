@@ -458,6 +458,189 @@ export class GraphRuntime {
   }
 
   /**
+   * Releases exclusive Command/Query registrations for `fiber` and every mounted
+   * descendant. Nested `@OnCommand` / `@OnQuery` under a keyed wrapper that is
+   * leaving (or about to lose children under a deferred UPDATE) must free slots
+   * before a same-batch PLACE registers the same types.
+   * EventBus subscriptions are left intact.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - subtree root
+   * @param {NonNullable<GraphRuntime['effectableRuntimeBuses']>} buses - runtime buses
+   * @returns {void}
+   */
+  private releaseExclusiveRuntimeBusHandlersSubtree (
+    fiber: RuntimeFiber<unknown>,
+    buses: NonNullable<GraphRuntime['effectableRuntimeBuses']>,
+  ): void {
+    const children = fiber.children;
+    for (let i = 0; i < children.length; i += 1) {
+      const child = children[i];
+      if (child !== undefined) {
+        this.releaseExclusiveRuntimeBusHandlersSubtree(
+          child as RuntimeFiber<unknown>,
+          buses,
+        );
+      }
+    }
+    const instance = fiber.instance;
+    if (instance !== null) {
+      releaseExclusiveRuntimeBusHandlers(instance, buses);
+    }
+  }
+
+  /**
+   * Predicts next child vnodes for an UPDATE fiber by temporarily applying
+   * `nextVnode.props` and calling `compose()`, then restoring prior props.
+   * Used only for exclusive-bus pre-PLACE planning (compose is required to be pure).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - matched current fiber
+   * @param {VirtualServiceNode<unknown>} nextVnode - next vnode for the same slot
+   * @returns {VirtualServiceNode[] | null} predicted children, or null if unavailable
+   */
+  private predictUpdateChildVnodes (
+    fiber: RuntimeFiber<unknown>,
+    nextVnode: VirtualServiceNode<unknown>,
+  ): VirtualServiceNode[] | null {
+    const instance = fiber.instance;
+    if (instance === null) {
+      return null;
+    }
+
+    const prevProps = instance.props;
+    const propsReceiver = (
+      instance as Component<unknown, unknown> & RuntimePropsReceiver<unknown>
+    )[RUNTIME_PROPS_RECEIVER];
+
+    try {
+      if (typeof propsReceiver === 'function') {
+        propsReceiver.call(
+          instance as Component<unknown, unknown> & RuntimePropsReceiver<unknown>,
+          nextVnode.props,
+        );
+      } else {
+        instance.props = nextVnode.props;
+      }
+      return this.getChildVnodes(
+        instance as Component<unknown, unknown>,
+        nextVnode.children as VirtualServiceNode[],
+      );
+    } finally {
+      if (typeof propsReceiver === 'function') {
+        propsReceiver.call(
+          instance as Component<unknown, unknown> & RuntimePropsReceiver<unknown>,
+          prevProps,
+        );
+      } else {
+        instance.props = prevProps;
+      }
+    }
+  }
+
+  /**
+   * Fibers whose exclusive Command/Query slots must be freed before any PLACE in
+   * this batch: full-diff orphans at this level, plus nested orphans under
+   * deferred UPDATE matches (pass-1 PLACE runs before pass-2 UPDATE, so nested
+   * REMOVE under a surviving wrapper would otherwise still own the slot).
+   *
+   * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
+   * @param {VirtualServiceNode[]} nextVnodes - next child vnodes
+   * @param {boolean} hasKeyedCurrent - whether any current child has a key
+   * @returns {RuntimeFiber<unknown>[]} fibers to release (subtree roots)
+   */
+  private collectExclusivePrePlaceFibers (
+    currentChildren: RuntimeFiber<unknown>[],
+    nextVnodes: VirtualServiceNode[],
+    hasKeyedCurrent: boolean,
+  ): RuntimeFiber<unknown>[] {
+    const leaving: RuntimeFiber<unknown>[] = this.collectFullDiffOrphans(
+      currentChildren,
+      nextVnodes,
+      hasKeyedCurrent,
+    );
+
+    const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
+    let unkeyedIdx = 0;
+
+    const visitUpdateMatch = (
+      currentFiber: RuntimeFiber<unknown>,
+      nextVnode: VirtualServiceNode<unknown>,
+    ): void => {
+      const sameType = currentFiber.vnode.type === nextVnode.type;
+      const sameKey = (currentFiber.vnode.key ?? null) === (nextVnode.key ?? null);
+      if (!sameType || !sameKey) {
+        return;
+      }
+
+      const predictedChildren = this.predictUpdateChildVnodes(currentFiber, nextVnode);
+      if (predictedChildren === null) {
+        return;
+      }
+
+      let childHasKeyed = false;
+      const childFibers = currentFiber.children as RuntimeFiber<unknown>[];
+      for (const child of childFibers) {
+        if (child.vnode.key !== undefined) {
+          childHasKeyed = true;
+          break;
+        }
+      }
+
+      const nested = this.collectExclusivePrePlaceFibers(
+        childFibers,
+        predictedChildren,
+        childHasKeyed,
+      );
+      for (const fiber of nested) {
+        leaving.push(fiber);
+      }
+    };
+
+    if (hasKeyedCurrent) {
+      const keyedCurrentMap = new Map<string | number, RuntimeFiber<unknown>>();
+      for (const child of currentChildren) {
+        const key = child.vnode.key;
+        if (key !== undefined) {
+          keyedCurrentMap.set(key, child);
+        } else {
+          unkeyedCurrent.push(child);
+        }
+      }
+
+      for (const nextVnode of nextVnodes) {
+        const nextKey = nextVnode.key;
+        if (nextKey !== undefined && keyedCurrentMap.has(nextKey)) {
+          const currentFiber = keyedCurrentMap.get(nextKey);
+          keyedCurrentMap.delete(nextKey);
+          if (currentFiber !== undefined) {
+            visitUpdateMatch(currentFiber, nextVnode);
+          }
+        } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
+          const currentFiber = unkeyedCurrent[unkeyedIdx];
+          unkeyedIdx += 1;
+          if (currentFiber !== undefined) {
+            visitUpdateMatch(currentFiber, nextVnode);
+          }
+        }
+      }
+    } else {
+      for (const child of currentChildren) {
+        unkeyedCurrent.push(child);
+      }
+      for (const nextVnode of nextVnodes) {
+        if (unkeyedIdx < unkeyedCurrent.length) {
+          const currentFiber = unkeyedCurrent[unkeyedIdx];
+          unkeyedIdx += 1;
+          if (currentFiber !== undefined) {
+            visitUpdateMatch(currentFiber, nextVnode);
+          }
+        }
+      }
+    }
+
+    return leaving;
+  }
+
+  /**
    * Builds the value assigned to `ref.current` for a mounted instance.
    *
    * When the constructor declares `@UseImperativeHandle` methods, only those methods
@@ -2769,23 +2952,26 @@ export class GraphRuntime {
     const nextChildren: RuntimeFiber<unknown>[] = [];
     let unkeyedIdx = 0;
 
-    // Release orphan exclusive Command/Query slots BEFORE any PLACE materialize.
-    // Those buses allow only one handler per type: PLACE `@OnCommand`/`@OnQuery` for a
-    // type still owned by a not-yet-destroyed orphan throws and fail-stops.
-    // Keep `@OnEvent` subscriptions until destroy — deferred sibling UPDATE may still
-    // publish into the orphan before onUnmount (#158). EventBus is multi-subscriber, and
-    // orphan `onUnmount` publishes after PLACE wires without needing the orphan subscribed.
+    // Release exclusive Command/Query slots BEFORE any PLACE materialize:
+    // - full-diff orphans at this level (REMOVE+PLACE), including nested handlers
+    //   under wrappers that themselves leave;
+    // - nested orphans under deferred UPDATE matches — pass-1 PLACE runs before
+    //   pass-2 UPDATE, so a surviving wrapper can still hold a nested exclusive
+    //   handler while a sibling PLACE tries to register the same type (fail-stop).
+    // Keep `@OnEvent` until destroy — deferred sibling UPDATE may still publish into
+    // the orphan before onUnmount (#158). EventBus is multi-subscriber, and orphan
+    // `onUnmount` publishes after PLACE wires without needing the orphan subscribed.
     if (this.effectableRuntimeBuses !== null) {
       const buses = this.effectableRuntimeBuses;
-      for (const orphan of this.collectFullDiffOrphans(currentChildren, nextVnodes, hasKeyedCurrent)) {
-        const instance = orphan.instance;
-        if (instance === null) {
-          continue;
-        }
+      for (const fiber of this.collectExclusivePrePlaceFibers(
+        currentChildren,
+        nextVnodes,
+        hasKeyedCurrent,
+      )) {
         try {
-          releaseExclusiveRuntimeBusHandlers(instance, buses);
+          this.releaseExclusiveRuntimeBusHandlersSubtree(fiber, buses);
         } catch {
-          // Best-effort: a throwing unregister must not skip remaining orphans or block PLACE.
+          // Best-effort: a throwing unregister must not skip remaining fibers or block PLACE.
           // destroyFiber still runs the full bus disposer later.
         }
       }
