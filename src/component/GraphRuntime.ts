@@ -2636,6 +2636,50 @@ export class GraphRuntime {
     const nextChildren: RuntimeFiber<unknown>[] = [];
     let unkeyedIdx = 0;
 
+    // Pass-1 defers same-type UPDATE until after PLACE/REPLACE siblings are wired.
+    // Otherwise UPDATE `onUpdate` can publish before a later PLACE sibling's `@On*`
+    // handlers exist — silent event loss (same class as #108 onMount/PLACE ordering).
+    const pendingUpdates: Array<{
+      slot: number;
+      current: RuntimeFiber<unknown>;
+      nextVnode: VirtualServiceNode<unknown>;
+    }> = [];
+
+    /**
+     * Same type+key → schedule UPDATE for pass 2; otherwise REPLACE with deferred startup.
+     *
+     * @param {RuntimeFiber<unknown>} currentFiber - matched current fiber
+     * @param {VirtualServiceNode<unknown>} nextVnode - next vnode
+     * @returns {Promise<void>}
+     */
+    const enqueueMatchedSibling = async (
+      currentFiber: RuntimeFiber<unknown>,
+      nextVnode: VirtualServiceNode<unknown>,
+    ): Promise<void> => {
+      const sameType = currentFiber.vnode.type === nextVnode.type;
+      const sameKey = (currentFiber.vnode.key ?? null) === (nextVnode.key ?? null);
+
+      if (sameType && sameKey) {
+        pendingUpdates.push({
+          slot: nextChildren.length,
+          current: currentFiber,
+          nextVnode,
+        });
+        // Placeholder identity keeps rollback classification correct until pass 2.
+        nextChildren.push(currentFiber);
+        return;
+      }
+
+      const reconciledRes = this.reconcileFiber(
+        currentFiber,
+        nextVnode,
+        parentFiber,
+        childScope,
+        true,
+      );
+      nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
+    };
+
     try {
       if (hasKeyedCurrent) {
         // Acquire Map from the depth-indexed pool (5.1x: Map.clear() vs new Map())
@@ -2665,27 +2709,18 @@ export class GraphRuntime {
               }
 
               keyedCurrentMap.delete(nextKey);
-
-              const reconciledRes = this.reconcileFiber(
+              await enqueueMatchedSibling(
                 currentFiber,
                 nextVnode as VirtualServiceNode<unknown>,
-                parentFiber,
-                childScope,
-                true,
               );
-              nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
             } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
               const currentFiber = unkeyedCurrent[unkeyedIdx];
               unkeyedIdx += 1;
 
-              const reconciledRes = this.reconcileFiber(
+              await enqueueMatchedSibling(
                 currentFiber as RuntimeFiber<unknown>,
                 nextVnode as VirtualServiceNode<unknown>,
-                parentFiber,
-                childScope,
-                true,
               );
-              nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
             } else {
               // New node — PLACE: defer startup so later sibling buses wire first.
               const newRes = this.materialize(nextVnode, parentFiber, childScope, true);
@@ -2717,14 +2752,10 @@ export class GraphRuntime {
             const currentFiber = unkeyedCurrent[unkeyedIdx];
             unkeyedIdx += 1;
 
-            const reconciledRes = this.reconcileFiber(
+            await enqueueMatchedSibling(
               currentFiber as RuntimeFiber<unknown>,
               nextVnode as VirtualServiceNode<unknown>,
-              parentFiber,
-              childScope,
-              true,
             );
-            nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
           } else {
             // New node — PLACE: defer startup so later sibling buses wire first.
             const newRes = this.materialize(nextVnode, parentFiber, childScope, true);
@@ -2743,6 +2774,18 @@ export class GraphRuntime {
             await d;
           }
         }
+      }
+
+      // Pass 2: run deferred UPDATEs. PLACE/REPLACE siblings are already wired, so
+      // onUpdate publishes reach new @On* handlers before deferred onMount flush.
+      for (const pending of pendingUpdates) {
+        const updatedRes = this.updateFiber(
+          pending.current,
+          pending.nextVnode,
+          parentFiber,
+          childScope,
+        );
+        nextChildren[pending.slot] = isThenable(updatedRes) ? await updatedRes : updatedRes;
       }
 
       // Flush PLACE/REPLACE startups in compose order after every new sibling is wired.

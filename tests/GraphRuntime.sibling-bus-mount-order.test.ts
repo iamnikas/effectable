@@ -179,4 +179,51 @@ describe('GraphRuntime sibling bus mount order', () => {
     expect(seen).toEqual(['replaced']);
     await rt.unmount();
   });
+
+  it('UPDATE publisher onUpdate + PLACE listener: publish reaches new sibling @OnEvent', async () => {
+    const seen: string[] = [];
+    const buses = makeBuses();
+
+    class Publisher extends Component<{ n: number }, { n: number }> {
+      @UseEventBus() declare events: EventBus<Ev>;
+      public override onUpdate (prev: { n: number }): void {
+        if (prev.n !== this.props.n) {
+          this.events.publish({ type: 'READY', payload: { id: `n=${this.props.n}` } });
+        }
+      }
+    }
+
+    class Listener extends Component {
+      @OnEvent('READY')
+      public onReady (e: Ev): void {
+        seen.push(e.payload.id);
+      }
+    }
+
+    class Parent extends Component<{ n: number; show: boolean }, { n: number; show: boolean }> {
+      public override compose () {
+        if (!this.props.show) {
+          return [h(Publisher, { n: this.props.n }, 'p')];
+        }
+        // Same-batch UPDATE of publisher (n changes) + PLACE listener.
+        // Without deferring UPDATE until after PLACE wiring, onUpdate publish is dropped.
+        return [
+          h(Publisher, { n: this.props.n }, 'p'),
+          h(Listener, {}, 'l'),
+        ];
+      }
+    }
+
+    const rt = await GraphRuntime.mount(
+      h(Parent, { n: 1, show: false }),
+      undefined,
+      buses as any,
+    );
+    expect(seen).toEqual([]);
+
+    await rt.reconcile(h(Parent, { n: 2, show: true }));
+    expect(rt.isActive()).toBe(true);
+    expect(seen).toEqual(['n=2']);
+    await rt.unmount();
+  });
 });
