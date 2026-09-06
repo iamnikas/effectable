@@ -497,7 +497,7 @@ export class GraphRuntime {
    * Transactional rollback for failed fiber materialization.
    * Releases acquired resources in reverse acquisition order:
    * 1. disable scheduler hook
-   * 2. destroy mounted children in reverse order
+   * 2. destroy mounted children in compose order (same as {@link destroyFiber})
    * 3. run failed-startup cleanup (parent onUnmount when startup ran)
    * 4. dispose runtime bus registrations
    * 5. clear bound ref (identity-safe)
@@ -539,16 +539,18 @@ export class GraphRuntime {
       }
     }
 
-    // 2. Destroy mounted children in reverse order BEFORE parent onUnmount / bus / ref.
-    // Documented teardown contract is children → parent; onUnmount was already after
-    // children, but bus dispose + ref clear still ran ahead of child destroy — child
-    // onUnmount could observe a nulled parent ref / dead parent bus subscriptions.
+    // 2. Destroy mounted children in compose order BEFORE parent onUnmount / bus / ref.
+    // Documented teardown contract is children → parent with siblings in compose
+    // order (matches destroyFiber / README shutdown). Reverse sibling order made
+    // failure-path onUnmount observe a different live-sibling set than clean unmount.
+    // Children must also run before bus dispose + ref clear so child onUnmount still
+    // sees a live parent ref / parent @On* subscriptions.
     // Pass cleanupErrors so nested destroy is best-effort: a throwing
     // ref-clear/disposer on one grandchild must not skip remaining siblings.
     // Those nodes were never attached to currentRoot, so failStop cannot reclaim them.
     const destroyChildrenThenParentCleanup = (): void | Promise<void> => {
       const children = journal.mountedChildren;
-      for (let i = children.length - 1; i >= 0; i -= 1) {
+      for (let i = 0; i < children.length; i += 1) {
         try {
           const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, cleanupErrors);
           if (isThenable(destroyRes)) {
@@ -577,7 +579,7 @@ export class GraphRuntime {
    * Async continuation of rollback child destruction after one child's destroy returned a Promise.
    *
    * @param {RuntimeFiber<unknown>[]} children - mounted children
-   * @param {number} lastIdx - index of the last processed child
+   * @param {number} pendingIdx - index of the child whose destroy is pending
    * @param {Promise<void>} pending - Promise from destroying the previous child
    * @param {Error} primaryError - original materialization error
    * @param {Error[]} cleanupErrors - accumulated cleanup errors
@@ -587,7 +589,7 @@ export class GraphRuntime {
    */
   private async continueRollbackDestroyAsync (
     children: RuntimeFiber<unknown>[],
-    lastIdx: number,
+    pendingIdx: number,
     pending: Promise<void>,
     primaryError: Error,
     cleanupErrors: Error[],
@@ -600,7 +602,8 @@ export class GraphRuntime {
       cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
     }
 
-    for (let i = lastIdx - 1; i >= 0; i -= 1) {
+    // Remaining siblings in compose order (pendingIdx+1 … n-1), matching destroyFiber.
+    for (let i = pendingIdx + 1; i < children.length; i += 1) {
       try {
         const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, cleanupErrors);
         if (isThenable(destroyRes)) {
@@ -2245,13 +2248,14 @@ export class GraphRuntime {
       attachCleanupErrors();
     };
 
-    for (let i = children.length - 1; i >= 0; i -= 1) {
+    // Siblings in compose order — same contract as destroyFiber / clean unmount.
+    for (let i = 0; i < children.length; i += 1) {
       try {
         const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, cleanupErrors);
         if (isThenable(destroyRes)) {
           return destroyRes.then(
             async () => {
-              for (let j = i - 1; j >= 0; j -= 1) {
+              for (let j = i + 1; j < children.length; j += 1) {
                 try {
                   const r = this.destroyFiber(children[j] as RuntimeFiber<unknown>, cleanupErrors);
                   if (isThenable(r)) {
@@ -2265,7 +2269,7 @@ export class GraphRuntime {
             },
             async (err: unknown) => {
               cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
-              for (let j = i - 1; j >= 0; j -= 1) {
+              for (let j = i + 1; j < children.length; j += 1) {
                 try {
                   const r = this.destroyFiber(children[j] as RuntimeFiber<unknown>, cleanupErrors);
                   if (isThenable(r)) {
