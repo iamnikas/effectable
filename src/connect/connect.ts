@@ -138,6 +138,38 @@ function getMappedPropsRecord (mapped: unknown): Record<string, unknown> | null 
  * @param {P} props - current instance props (for the full `mapDispatch` form)
  * @returns {Record<string, unknown> | null} flat object of callbacks/dispatch wrappers, or `null` if nothing to merge
  */
+
+/**
+ * Shallow equality for own-props records (RUNTIME_PROPS_RECEIVER).
+ * Used to avoid re-invoking mapDispatch factories when parent reconcile
+ * passes a new props object with the same fields — a factory that dispatches
+ * as a side effect would otherwise loop with a connected parent.
+ *
+ * @param {Record<string, unknown>} a - previous own props
+ * @param {Record<string, unknown>} b - next own props
+ * @returns {boolean} true when both have the same keys and `===` values
+ */
+function shallowEqualOwnProps (
+  a: Record<string, unknown>,
+  b: Record<string, unknown>
+): boolean {
+  if (a === b) {
+    return true;
+  }
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) {
+    return false;
+  }
+  for (let i = 0; i < keysA.length; i += 1) {
+    const key = keysA[i] as string;
+    if (!Object.prototype.hasOwnProperty.call(b, key) || a[key] !== b[key]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function resolveMapDispatchProps<S, P, A extends Action> (
   store: Store<S, A>,
   mapDispatch: MapDispatchToProps<S, P, A> | null | undefined,
@@ -377,8 +409,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
        */
       public applyToScope (parentScope: ContextScope): ContextScope {
         const store = this.resolveConnectStore();
-        // Pre-mount only: first compose runs before onMount, so own-props must be
-        // stripped / mapped here. Never re-sync on dirty/update flushes after mount.
+        // Pre-mount only (#91): first compose runs before onMount, so own-props must
+        // be stripped / mapped here. Never re-sync on dirty/update flushes after mount —
+        // a mapDispatch factory that dispatches as a side effect would loop with select.
         if (!this.__connectMountCompleted) {
           this.syncConnectPropsBeforeCompose(store);
         }
@@ -539,7 +572,14 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * @returns {void}
        */
       public [RUNTIME_PROPS_RECEIVER] (nextProps: P): void {
-        this.__connectOwnProps = nextProps as unknown as Record<string, unknown>;
+        const nextOwnProps = nextProps as unknown as Record<string, unknown>;
+        // Parent compose always allocates a new props object. Re-running mapDispatch
+        // when own-props are shallow-equal re-enters factories that dispatch as a
+        // side effect: dispatch → parent select → setState → dirty parent → child
+        // UPDATE → RUNTIME_PROPS_RECEIVER → dispatch → … → GraphRuntime fail-stop.
+        // Distinct from applyToScope dirty re-sync (#91): this path is props receive.
+        const ownPropsChanged = !shallowEqualOwnProps(this.__connectOwnProps, nextOwnProps);
+        this.__connectOwnProps = nextOwnProps;
         const store = this.tryResolveConnectStore();
 
         if (store !== null) {
@@ -551,7 +591,12 @@ function buildConnectHoc<S, P, R, A extends Action> (
             this.applyMappedStateProps(nextMapped);
           }
 
-          this.refreshDispatchProps(store);
+          // Only re-bind dispatch when own-props actually changed. Factories that
+          // close over own-props must re-run; pure (dispatch)=>… factories and
+          // action-creator maps stay stable across parent identity-only updates.
+          if (ownPropsChanged) {
+            this.refreshDispatchProps(store);
+          }
           return;
         }
 

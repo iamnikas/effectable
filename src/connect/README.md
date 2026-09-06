@@ -122,6 +122,8 @@ const ConnectedFeedsWithCreators = connect(undefined, {
 
 When `GraphRuntime.reconcile` passes new props (parent rebuilt the subtree), the HOC synchronously brings `this.props` up to date **before** the next `compose()`/`onUpdate`. In particular, if `mapStateToProps` is set, it is **recomputed synchronously** on the new props (`mapStateToProps(store.getState(), nextProps)`) — without waiting for the next store emission. This eliminates stale state-derived props when a parent prop changes.
 
+`mapDispatchToProps` is re-resolved on that path **only when own-props shallow-change**. Parent `compose()` always allocates a new props object; re-invoking a `mapDispatch` factory on every identity-only update would loop when the factory dispatches (child update → parent select → dirty parent → child `RUNTIME_PROPS_RECEIVER` → …) and fail-stop nested connected trees.
+
 ## Important: store is not via props
 
 `store` is not passed through props.
