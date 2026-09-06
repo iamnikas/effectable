@@ -188,6 +188,15 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
    * with a same-batch PLACE owner.
    */
   exclusiveRuntimeBusHandlersReleased?: boolean;
+  /**
+   * Orphans from a nested full-diff whose DELETE was deferred because the parent
+   * UPDATE is in a sibling batch (`deferPendingBatchFlush`). Exclusive Command/Query
+   * slots are released when stashed; EventBus stays until ancestor flush destroys
+   * them after later sibling PLACE wires. Cleared by
+   * {@link GraphRuntime.flushPendingDeferredOrphansTree}.
+   */
+  pendingDeferredOrphans?: RuntimeFiber<unknown>[];
+
 }
 
 // ---------------------------------------------------------------------------
@@ -2130,24 +2139,32 @@ export class GraphRuntime {
   }
 
   /**
-   * Flushes REPLACE victims, then pending onUpdates, then deferred startups for a
-   * sibling batch. Victims may already be cleared before orphan DELETE; this path
-   * remains idempotent.
+   * Flushes REPLACE victims (including nested under UPDATE), then pending onUpdates,
+   * then deferred nested orphans, then deferred startups for a sibling batch.
+   * When `deferPendingBatchFlush` is true, holds all of the above for the ancestor.
+   * Victims may already be cleared before orphan DELETE; this path remains idempotent.
    *
    * @param {RuntimeFiber<unknown>[]} nextChildren - reconciled sibling fibers
+   * @param {boolean} [deferPendingBatchFlush=false] - hold teardown + lifecycle for ancestor
    * @returns {void | Promise<void>}
    */
   private flushSiblingBatchHooks (
     nextChildren: RuntimeFiber<unknown>[],
     deferPendingBatchFlush: boolean = false,
   ): void | Promise<void> {
+    // When this UPDATE is already deferred for a sibling batch, hold REPLACE-victim
+    // destroy too — nested victim onUnmount must wait until later sibling PLACE wires.
+    // Ancestor flush drains victims (tree walk), onUpdate, deferred orphans, lifecycle.
+    if (deferPendingBatchFlush) {
+      return;
+    }
     const victimsRes = this.flushPendingReplaceVictims(nextChildren);
     if (isThenable(victimsRes)) {
       return victimsRes.then(
-        () => this.flushSiblingBatchHooksAfterVictims(nextChildren, deferPendingBatchFlush),
+        () => this.flushSiblingBatchHooksAfterVictims(nextChildren, false),
       );
     }
-    return this.flushSiblingBatchHooksAfterVictims(nextChildren, deferPendingBatchFlush);
+    return this.flushSiblingBatchHooksAfterVictims(nextChildren, false);
   }
 
   /**
@@ -2162,56 +2179,66 @@ export class GraphRuntime {
   private flushPendingReplaceVictims (
     children: RuntimeFiber<unknown>[],
   ): void | Promise<void> {
-    for (let i = 0; i < children.length; i++) {
-      const child = children[i] as RuntimeFiber<unknown>;
-      const journal = child.constructionJournal;
-      const victim = journal?.pendingReplaceVictim;
-      if (victim === undefined) {
-        continue;
-      }
-      journal!.pendingReplaceVictim = undefined;
-      const destroyRes = this.destroyFiber(victim, []);
+    const victims: RuntimeFiber<unknown>[] = [];
+    this.collectPendingReplaceVictims(children, victims);
+    for (let i = 0; i < victims.length; i++) {
+      const destroyRes = this.destroyFiber(victims[i] as RuntimeFiber<unknown>, []);
       if (isThenable(destroyRes)) {
-        return this.continueFlushPendingReplaceVictimsAsync(children, i, destroyRes);
+        return this.continueDestroyFiberListAsync(victims, i, destroyRes);
       }
     }
   }
 
   /**
-   * Async continuation of {@link flushPendingReplaceVictims}.
+   * Depth-first collect of {@link FiberConstructionJournal.pendingReplaceVictim}
+   * under `children` (clears journals as it goes). Nested REPLACE under a deferred
+   * UPDATE leaves victims on descendant replacements that sibling-root flush would miss.
    *
-   * @param {RuntimeFiber<unknown>[]} children - siblings
+   * @param {RuntimeFiber<unknown>[]} children - fibers to scan
+   * @param {RuntimeFiber<unknown>[]} out - collected victims in destroy order
+   * @returns {void}
+   */
+  private collectPendingReplaceVictims (
+    children: RuntimeFiber<unknown>[],
+    out: RuntimeFiber<unknown>[],
+  ): void {
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i] as RuntimeFiber<unknown>;
+      const journal = child.constructionJournal;
+      const victim = journal?.pendingReplaceVictim;
+      if (victim !== undefined) {
+        journal!.pendingReplaceVictim = undefined;
+        out.push(victim);
+      }
+      const nested = child.children as RuntimeFiber<unknown>[];
+      if (nested.length > 0) {
+        this.collectPendingReplaceVictims(nested, out);
+      }
+    }
+  }
+
+  /**
+   * Async continuation for sequential {@link destroyFiber} over a precollected list.
+   *
+   * @param {RuntimeFiber<unknown>[]} fibers - fibers to destroy
    * @param {number} idx - index whose destroy is in flight
    * @param {PromiseLike<void>} pending - in-flight destroy
    * @returns {Promise<void>}
    */
-  private async continueFlushPendingReplaceVictimsAsync (
-    children: RuntimeFiber<unknown>[],
+  private async continueDestroyFiberListAsync (
+    fibers: RuntimeFiber<unknown>[],
     idx: number,
     pending: PromiseLike<void>,
   ): Promise<void> {
     await pending;
-    for (let i = idx + 1; i < children.length; i++) {
-      const child = children[i] as RuntimeFiber<unknown>;
-      const journal = child.constructionJournal;
-      const victim = journal?.pendingReplaceVictim;
-      if (victim === undefined) {
-        continue;
-      }
-      journal!.pendingReplaceVictim = undefined;
-      const destroyRes = this.destroyFiber(victim, []);
+    for (let i = idx + 1; i < fibers.length; i++) {
+      const destroyRes = this.destroyFiber(fibers[i] as RuntimeFiber<unknown>, []);
       if (isThenable(destroyRes)) {
         await destroyRes;
       }
     }
   }
 
-  /**
-   * Remainder of {@link flushSiblingBatchHooks} after REPLACE victims are destroyed.
-   *
-   * @param {RuntimeFiber<unknown>[]} nextChildren - reconciled sibling fibers
-   * @returns {void | Promise<void>}
-   */
   private flushSiblingBatchHooksAfterVictims (
     nextChildren: RuntimeFiber<unknown>[],
     deferPendingBatchFlush: boolean = false,
@@ -2227,6 +2254,15 @@ export class GraphRuntime {
             nextChildren, i, onUpdateFlush, 'onUpdate', deferPendingBatchFlush,
           );
         }
+      }
+
+      // Nested full-diff under a deferred UPDATE stashes orphans on the UPDATE fiber;
+      // destroy them after onUpdate (same order as eager full-diff) and before onMount.
+      const orphansFlush = this.flushPendingDeferredOrphansTree(nextChildren);
+      if (isThenable(orphansFlush)) {
+        return this.continueFlushSiblingBatchHooksAsync(
+          nextChildren, -1, orphansFlush, 'orphans', deferPendingBatchFlush,
+        );
       }
 
       // Always walk each sibling subtree: nested PLACE under an UPDATE sibling keeps
@@ -2257,23 +2293,31 @@ export class GraphRuntime {
     nextChildren: RuntimeFiber<unknown>[],
     pendingIdx: number,
     pending: PromiseLike<void>,
-    phase: 'onUpdate' | 'lifecycle',
+    phase: 'onUpdate' | 'orphans' | 'lifecycle',
     deferPendingBatchFlush: boolean = false,
   ): Promise<void> {
     await pending;
 
-    if (phase === 'onUpdate' && !deferPendingBatchFlush) {
+    if (deferPendingBatchFlush) {
+      return;
+    }
+
+    if (phase === 'onUpdate') {
       for (let i = pendingIdx + 1; i < nextChildren.length; i++) {
         const onUpdateFlush = this.flushPendingOnUpdateTree(nextChildren[i] as RuntimeFiber<unknown>);
         if (isThenable(onUpdateFlush)) {
           await onUpdateFlush;
         }
       }
+      const orphansFlush = this.flushPendingDeferredOrphansTree(nextChildren);
+      if (isThenable(orphansFlush)) {
+        await orphansFlush;
+      }
+      phase = 'lifecycle';
       pendingIdx = -1;
-    }
-
-    if (deferPendingBatchFlush) {
-      return;
+    } else if (phase === 'orphans') {
+      phase = 'lifecycle';
+      pendingIdx = -1;
     }
 
     const lifecycleStart = phase === 'lifecycle' ? pendingIdx + 1 : 0;
@@ -2282,6 +2326,53 @@ export class GraphRuntime {
       const lifecycleFlush = this.flushDeferredLifecycleTree(child);
       if (isThenable(lifecycleFlush)) {
         await lifecycleFlush;
+      }
+    }
+  }
+
+  /**
+   * Destroys orphans stashed on UPDATE fibers when nested full-diff ran under
+   * {@link deferPendingBatchFlush}. Walks `children` depth-first (compose order).
+   *
+   * @param {RuntimeFiber<unknown>[]} children - sibling roots to scan
+   * @returns {void | Promise<void>}
+   */
+  private flushPendingDeferredOrphansTree (
+    children: RuntimeFiber<unknown>[],
+  ): void | Promise<void> {
+    const orphans: RuntimeFiber<unknown>[] = [];
+    this.collectPendingDeferredOrphans(children, orphans);
+    for (let i = 0; i < orphans.length; i++) {
+      const destroyRes = this.destroyFiber(orphans[i] as RuntimeFiber<unknown>, []);
+      if (isThenable(destroyRes)) {
+        return this.continueDestroyFiberListAsync(orphans, i, destroyRes);
+      }
+    }
+  }
+
+  /**
+   * Collects and clears {@link RuntimeFiber.pendingDeferredOrphans} under `children`.
+   *
+   * @param {RuntimeFiber<unknown>[]} children - fibers to scan
+   * @param {RuntimeFiber<unknown>[]} out - collected orphans in destroy order
+   * @returns {void}
+   */
+  private collectPendingDeferredOrphans (
+    children: RuntimeFiber<unknown>[],
+    out: RuntimeFiber<unknown>[],
+  ): void {
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i] as RuntimeFiber<unknown>;
+      const pending = child.pendingDeferredOrphans;
+      if (pending !== undefined && pending.length > 0) {
+        child.pendingDeferredOrphans = undefined;
+        for (let j = 0; j < pending.length; j++) {
+          out.push(pending[j] as RuntimeFiber<unknown>);
+        }
+      }
+      const nested = child.children as RuntimeFiber<unknown>[];
+      if (nested.length > 0) {
+        this.collectPendingDeferredOrphans(nested, out);
       }
     }
   }
@@ -4121,27 +4212,62 @@ export class GraphRuntime {
         }
       }
 
-      // Destroy REPLACE victims BEFORE orphan DELETE. Otherwise an orphan onUnmount
-      // publish dual-delivers to both still-wired victim and replacement. PLACE peers
-      // are already materialized (buses wired) at this point; later flushSiblingBatchHooks
-      // remains idempotent when victims are already cleared.
-      const victimsRes = this.flushPendingReplaceVictims(nextChildren);
-      if (isThenable(victimsRes)) {
-        await victimsRes;
-      }
-
-      // Destroy orphans after onUpdate flush in original compose order (not keyed-then-
-      // unkeyed). Keyed-first teardown inverted compose order when an unkeyed sibling
-      // preceded a keyed one, so an earlier unkeyed onUnmount publish could miss a later
-      // keyed @On* listener. PLACE peers are already wired, so onUnmount publishes
-      // still reach same-batch PLACE @On*.
-      for (const child of currentChildren) {
-        if (!pendingOrphanSet.has(child)) {
-          continue;
+      // When this full-diff runs under a parent UPDATE that deferred its batch flush,
+      // hold REPLACE-victim destroy and orphan DELETE until the ancestor drains — a
+      // later sibling may still PLACE @On* that must observe onUnmount publishes.
+      // Free exclusive Command/Query on stashed orphans now so later PLACE can claim
+      // them; keep EventBus until destroy (same contract as deferred REPLACE victims).
+      if (deferPendingBatchFlush) {
+        const stashed: RuntimeFiber<unknown>[] = [];
+        for (const child of currentChildren) {
+          if (!pendingOrphanSet.has(child)) {
+            continue;
+          }
+          stashed.push(child);
         }
-        const d = this.destroyFiber(child, []);
-        if (isThenable(d)) {
-          await d;
+        if (stashed.length > 0) {
+          const buses = this.effectableRuntimeBuses;
+          if (buses !== null) {
+            for (let i = 0; i < stashed.length; i++) {
+              try {
+                this.releaseExclusiveRuntimeBusHandlersSubtree(stashed[i] as RuntimeFiber<unknown>, buses);
+              } catch {
+                // Best-effort: destroyFiber still runs the full bus disposer later.
+              }
+            }
+          }
+          const existing = parentFiber.pendingDeferredOrphans;
+          if (existing === undefined) {
+            parentFiber.pendingDeferredOrphans = stashed;
+          } else {
+            for (let i = 0; i < stashed.length; i++) {
+              existing.push(stashed[i] as RuntimeFiber<unknown>);
+            }
+          }
+        }
+      } else {
+        // Destroy REPLACE victims BEFORE orphan DELETE. Otherwise an orphan onUnmount
+        // publish dual-delivers to both still-wired victim and replacement. PLACE peers
+        // are already materialized (buses wired) at this point; later flushSiblingBatchHooks
+        // remains idempotent when victims are already cleared.
+        const victimsRes = this.flushPendingReplaceVictims(nextChildren);
+        if (isThenable(victimsRes)) {
+          await victimsRes;
+        }
+
+        // Destroy orphans after onUpdate flush in original compose order (not keyed-then-
+        // unkeyed). Keyed-first teardown inverted compose order when an unkeyed sibling
+        // preceded a keyed one, so an earlier unkeyed onUnmount publish could miss a later
+        // keyed @On* listener. PLACE peers are already wired, so onUnmount publishes
+        // still reach same-batch PLACE @On*.
+        for (const child of currentChildren) {
+          if (!pendingOrphanSet.has(child)) {
+            continue;
+          }
+          const d = this.destroyFiber(child, []);
+          if (isThenable(d)) {
+            await d;
+          }
         }
       }
 
@@ -4267,6 +4393,29 @@ export class GraphRuntime {
    * @returns {void | Promise<void>}
    */
   private destroyFiber (fiber: RuntimeFiber<unknown>, collectErrors: Error[] | null = null): void | Promise<void> {
+    // Orphans stashed for a deferred nested full-diff are not in `fiber.children`.
+    const deferredOrphans = fiber.pendingDeferredOrphans;
+    if (deferredOrphans !== undefined && deferredOrphans.length > 0) {
+      fiber.pendingDeferredOrphans = undefined;
+      for (let i = 0; i < deferredOrphans.length; i++) {
+        try {
+          const orphanRes = this.destroyFiber(
+            deferredOrphans[i] as RuntimeFiber<unknown>,
+            collectErrors,
+          );
+          if (isThenable(orphanRes)) {
+            return orphanRes.then(() => this.destroyFiber(fiber, collectErrors));
+          }
+        } catch (err: unknown) {
+          if (collectErrors !== null) {
+            collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+          } else {
+            throw err;
+          }
+        }
+      }
+    }
+
     const children = fiber.children;
     const n = children.length;
 
