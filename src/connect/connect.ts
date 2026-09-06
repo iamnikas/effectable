@@ -234,7 +234,9 @@ function getMappedPropsRecord (mapped: unknown): Record<string, unknown> | null 
  *
  * @param {Record<string, unknown>} a - previous own props
  * @param {Record<string, unknown>} b - next own props
- * @returns {boolean} true when both have the same keys and `===` values
+ * @returns {boolean} true when both have the same keys and `Object.is` values
+ *   (`Object.is` so stable `NaN` own-props compare equal — `NaN !== NaN` would
+ *   otherwise treat every parent compose as a change and re-fire mapDispatch)
  */
 function shallowEqualOwnProps (
   a: Record<string, unknown>,
@@ -250,7 +252,7 @@ function shallowEqualOwnProps (
   }
   for (let i = 0; i < keysA.length; i += 1) {
     const key = keysA[i] as string;
-    if (!Object.prototype.hasOwnProperty.call(b, key) || a[key] !== b[key]) {
+    if (!Object.prototype.hasOwnProperty.call(b, key) || !Object.is(a[key], b[key])) {
       return false;
     }
   }
