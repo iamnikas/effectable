@@ -128,4 +128,64 @@ describe('GraphRuntime REMOVE+PLACE exclusive bus handoff', () => {
     expect(rt.isActive()).toBe(true);
     await rt.unmount();
   });
+
+  it('keyed REMOVE+PLACE frees nested @OnCommand under orphan wrapper', async () => {
+    class Inner extends Component<Record<string, never>, Record<string, never>> {
+      @OnCommand('DO')
+      public handle (): void { /* nested exclusive */ }
+    }
+    class Outer extends Component<Record<string, never>, Record<string, never>> {
+      public override compose () {
+        return [h(Inner, {})];
+      }
+    }
+    class NewHandler extends Component {
+      @OnCommand('DO')
+      public handle (): void { /* new */ }
+    }
+    class Parent extends Component<{ phase: 1 | 2 }, { phase: 1 | 2 }> {
+      public override compose () {
+        return this.props.phase === 1
+          ? [h(Outer, {}, 'old')]
+          : [h(NewHandler, {}, 'new')];
+      }
+    }
+
+    const b = buses();
+    const rt = await GraphRuntime.mount(h(Parent, { phase: 1 }), undefined, b as any);
+    await expect(rt.reconcile(h(Parent, { phase: 2 }))).resolves.toBeUndefined();
+    expect(rt.isActive()).toBe(true);
+    await expect(b.commandBus.execute({ type: 'DO', payload: { id: 'x' } })).resolves.toBeUndefined();
+    await rt.unmount();
+  });
+
+  it('keyed REMOVE+PLACE frees nested @OnQuery under orphan wrapper', async () => {
+    class InnerQ extends Component<Record<string, never>, Record<string, never>> {
+      @OnQuery('GET')
+      public handle (): number { return 1; }
+    }
+    class OuterQ extends Component<Record<string, never>, Record<string, never>> {
+      public override compose () {
+        return [h(InnerQ, {})];
+      }
+    }
+    class NewQ extends Component {
+      @OnQuery('GET')
+      public handle (): number { return 2; }
+    }
+    class Parent extends Component<{ phase: 1 | 2 }, { phase: 1 | 2 }> {
+      public override compose () {
+        return this.props.phase === 1
+          ? [h(OuterQ, {}, 'old')]
+          : [h(NewQ, {}, 'new')];
+      }
+    }
+
+    const b = buses();
+    const rt = await GraphRuntime.mount(h(Parent, { phase: 1 }), undefined, b as any);
+    await expect(rt.reconcile(h(Parent, { phase: 2 }))).resolves.toBeUndefined();
+    expect(rt.isActive()).toBe(true);
+    await expect(b.queryBus.execute({ type: 'GET', payload: {} })).resolves.toBe(2);
+    await rt.unmount();
+  });
 });
