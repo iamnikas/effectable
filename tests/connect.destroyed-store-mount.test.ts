@@ -1,9 +1,12 @@
 /**
- * Regression: connect(mapState) on a destroyed store must fail mount.
+ * Regression: connect on a destroyed store must fail mount.
  *
- * createStore.select() after destroy() completes with zero next emissions.
- * Connect used to treat that as a successful onMount (user onMount skipped,
- * GraphRuntime left ACTIVE) — a zombie tree.
+ * mapState: createStore.select() after destroy() completes with zero next emissions
+ * (and syncConnectPropsBeforeCompose calls getState()). Connect used to treat that
+ * as a successful onMount — a zombie ACTIVE tree.
+ *
+ * mapDispatch-only: there is no select subscription, so the same destroy() left
+ * GraphRuntime ACTIVE with dispatch props that throw on call. Must reject via getState().
  *
  * @module Effectable/connect/destroyed-store-mount.test
  */
@@ -15,7 +18,7 @@ import {
   createStore,
   h,
 } from 'Effectable';
-import type { VirtualServiceNode } from 'Effectable';
+import type { DispatchMethod, VirtualServiceNode } from 'Effectable';
 
 interface State {
   n: number;
@@ -55,6 +58,46 @@ describe('connect: destroyed store mount', () => {
     await expect(
       GraphRuntime.mount(h(Connected, { adminToken: 'SECRET' })),
     ).rejects.toThrow(/completed before the first state emission|destroyed/i);
+
+    expect(userOnMountCalls).toBe(0);
+  });
+
+  it('rejects GraphRuntime.mount for mapDispatch-only on a destroyed store', async () => {
+    const store = createStore<State, TestAction>(
+      (state) => state,
+      { n: 1 },
+    );
+    store.destroy();
+
+    let userOnMountCalls = 0;
+
+    class Gate extends Component<{ ping?: () => void }, Record<string, never>> {
+      public constructor (props: Record<string, never>) {
+        super(props);
+      }
+
+      public override onMount (): void {
+        userOnMountCalls += 1;
+      }
+
+      public override compose (): VirtualServiceNode | null {
+        return null;
+      }
+    }
+
+    const Connected = connect(
+      store,
+      null,
+      (dispatch: DispatchMethod<TestAction>) => ({
+        ping: (): void => {
+          dispatch({ type: 'PING' });
+        },
+      }),
+    )(Gate);
+
+    await expect(
+      GraphRuntime.mount(h(Connected, {})),
+    ).rejects.toThrow(/destroyed/i);
 
     expect(userOnMountCalls).toBe(0);
   });
