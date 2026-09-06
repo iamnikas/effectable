@@ -2084,19 +2084,121 @@ export class GraphRuntime {
       return this.updateFiber(current, nextVnode, parentFiber, parentScope);
     }
 
-    // Type or key changed — destroy the old node, create a new one.
-    // Sync fast-path if both destroy and materialize completed synchronously.
+    // Type or key changed — REPLACE.
     // Collect cleanup errors (ref clear / disposer) so a throwing finalize cannot
     // abort REPLACE and fail-stop the surviving tree — same best-effort contract as unmount.
     //
-    // When deferLifecycle is set (child reconcile batch), REPLACE must not run onMount
-    // before later sibling buses are wired — otherwise a replaced publisher's mount-time
-    // publish is silently dropped by a not-yet-wired PLACE/REPLACE listener beside it.
+    // Root REPLACE (`deferLifecycle === false`): materialize the replacement first
+    // (wire @On* buses, defer onMount), destroy the victim, then flush startup.
+    // Otherwise the victim's onUnmount publish is silently dropped — nothing else
+    // flushes a deferred root, and sibling-batch destroy deferral does not apply here.
+    //
+    // Child REPLACE (`deferLifecycle === true`): destroy then materialize with deferred
+    // onMount so later sibling buses can wire before the replacement's mount publish
+    // (sibling onUnmount→PLACE ordering is a separate batch concern).
+    if (!deferLifecycle) {
+      return this.replaceFiberWireBeforeDestroy(
+        current as RuntimeFiber<unknown>,
+        nextVnode,
+        parentFiber,
+        parentScope,
+      );
+    }
+
     const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
     if (isThenable(destroyRes)) {
       return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle));
     }
     return this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle);
+  }
+
+  /**
+   * Root REPLACE: wire the replacement before destroying the victim so onUnmount
+   * publishes reach the new tree's `@On*` handlers, then flush deferred startup.
+   *
+   * @template P node props type
+   * @param {RuntimeFiber<unknown>} current - victim fiber
+   * @param {VirtualServiceNode<P>} nextVnode - replacement vnode
+   * @param {RuntimeFiber<unknown> | null} parentFiber - parent fiber (null at root)
+   * @param {ContextScope} parentScope - parent scope
+   * @returns {RuntimeFiber<P> | Promise<RuntimeFiber<P>>}
+   */
+  private replaceFiberWireBeforeDestroy<P> (
+    current: RuntimeFiber<unknown>,
+    nextVnode: VirtualServiceNode<P>,
+    parentFiber: RuntimeFiber<unknown> | null,
+    parentScope: ContextScope,
+  ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    const materialized = this.materialize(nextVnode, parentFiber, parentScope, true);
+
+    if (isThenable(materialized)) {
+      return Promise.resolve(materialized).then((next) => (
+        this.finishReplaceWireBeforeDestroy(current, next)
+      ));
+    }
+
+    return this.finishReplaceWireBeforeDestroy(current, materialized);
+  }
+
+  /**
+   * After the replacement is wired: destroy victim, flush deferred startup on `next`.
+   * On flush failure, destroy `next` so fail-stop cannot leak an orphaned replacement
+   * while `currentRoot` still names the already-destroyed victim.
+   *
+   * @template P node props type
+   * @param {RuntimeFiber<unknown>} current - victim fiber
+   * @param {RuntimeFiber<P>} next - wired replacement (lifecycle still deferred)
+   * @returns {RuntimeFiber<P> | Promise<RuntimeFiber<P>>}
+   */
+  private finishReplaceWireBeforeDestroy<P> (
+    current: RuntimeFiber<unknown>,
+    next: RuntimeFiber<P>,
+  ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    const destroyRes = this.destroyFiber(current, []);
+
+    if (isThenable(destroyRes)) {
+      return Promise.resolve(destroyRes).then(() => this.flushReplacementAfterVictimDestroy(next));
+    }
+
+    return this.flushReplacementAfterVictimDestroy(next);
+  }
+
+  /**
+   * Flush deferred startup for a root REPLACE replacement after the victim is gone.
+   *
+   * @template P node props type
+   * @param {RuntimeFiber<P>} next - replacement fiber
+   * @returns {RuntimeFiber<P> | Promise<RuntimeFiber<P>>}
+   */
+  private flushReplacementAfterVictimDestroy<P> (
+    next: RuntimeFiber<P>,
+  ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    try {
+      const flush = this.flushDeferredLifecycleTree(next as RuntimeFiber<unknown>);
+      if (isThenable(flush)) {
+        return Promise.resolve(flush).then(
+          () => next,
+          (err: unknown) => {
+            const rollback = this.destroyFiber(next as RuntimeFiber<unknown>, []);
+            if (isThenable(rollback)) {
+              return Promise.resolve(rollback).then(() => {
+                throw err;
+              });
+            }
+            throw err;
+          },
+        );
+      }
+      return next;
+    } catch (err: unknown) {
+      const rollback = this.destroyFiber(next as RuntimeFiber<unknown>, []);
+      if (isThenable(rollback)) {
+        return Promise.resolve(rollback).then(() => {
+          throw err;
+        });
+      }
+      throw err;
+    }
   }
 
   /**
