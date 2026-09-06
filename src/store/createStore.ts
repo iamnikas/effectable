@@ -50,11 +50,50 @@ export function createStore<S, A extends Action> (
   // BehaviorSubject ensures new subscribers receive the current value
   const state$ = new BehaviorSubject<S>(initialState);
 
+  // Canonical current state for getState(). Kept in sync before notification so a
+  // nested dispatch from a subscriber always reduces from the latest committed state,
+  // even while an outer state$.next is still delivering its value to later observers.
+  let currentState: S = initialState;
+
   // Flag to prevent dispatch while a reducer is running
   let isDispatching = false;
 
   // Flag to track if the store has been destroyed
   let isDestroyed = false;
+
+  // Nested dispatch from a state$/select subscriber must not leave later observers
+  // with a stale outer emission AFTER the nested (newer) state. BehaviorSubject.next
+  // is re-entrant: outer next(S1) → subscriber dispatches → next(S2) → remaining
+  // outer observers still receive S1 after S2. Publish through this gate so the
+  // outermost notify loop always finishes on the latest committed state.
+  let isPublishing = false;
+  let publishAgain = false;
+
+  /**
+   * Commits `nextState` and notifies `state$` observers without letting a nested
+   * dispatch leave a stale outer emission as the final observed value.
+   *
+   * @param {S} nextState - state to commit and publish
+   * @returns {void}
+   */
+  function publishState (nextState: S): void {
+    currentState = nextState;
+
+    if (isPublishing) {
+      publishAgain = true;
+      return;
+    }
+
+    isPublishing = true;
+    try {
+      do {
+        publishAgain = false;
+        state$.next(currentState);
+      } while (publishAgain);
+    } finally {
+      isPublishing = false;
+    }
+  }
 
   /**
    * Base dispatch without middleware
@@ -111,9 +150,6 @@ export function createStore<S, A extends Action> (
     try {
       isDispatching = true;
 
-      // Get current state
-      const currentState = state$.getValue();
-
       // Call reducer to get the new state
       newState = reducer(currentState, action);
 
@@ -130,8 +166,9 @@ export function createStore<S, A extends Action> (
       isDispatching = false;
     }
 
-    // Emit the new state on the Observable after the reduce phase completes.
-    state$.next(newState);
+    // Emit after reduce completes. Nested dispatch from a subscriber is coalesced
+    // so observers never end on a stale outer state after a newer nested state.
+    publishState(newState);
 
     return action;
   }
@@ -147,7 +184,7 @@ export function createStore<S, A extends Action> (
         'Cannot access state after the store has been destroyed.'
       );
     }
-    return state$.getValue();
+    return currentState;
   };
 
   /**
