@@ -175,7 +175,16 @@ export class HandleRegistry {
         throw new Error(`HandleRegistry.autoRegister: method is not a function: ${methodName}`);
       }
 
-      (ref as Record<string, unknown>)[methodName] = fn.bind(instance);
+      // Use defineProperty — `ref[methodName] =` on a normal object invokes the
+      // Object.prototype `__proto__` setter when methodName === '__proto__',
+      // replacing the handle's [[Prototype]] with the bound function (lost key +
+      // polluted prototype). Sibling of store/connect (#109) and Component/Bus (#135).
+      Object.defineProperty(ref, methodName, {
+        value: fn.bind(instance),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
 
     return ref;
