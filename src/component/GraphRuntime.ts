@@ -157,6 +157,12 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
    * Used for transactional rollback on failure.
    */
   constructionJournal?: FiberConstructionJournal;
+  /**
+   * Props snapshot for an `onUpdate` deferred until later PLACE/REPLACE siblings
+   * finish `@On*` bus wiring (sibling batch). Cleared when the update runs or the
+   * fiber is destroyed / re-entered.
+   */
+  pendingDeferredOnUpdate?: { prevProps: unknown };
 }
 
 // ---------------------------------------------------------------------------
@@ -2081,7 +2087,9 @@ export class GraphRuntime {
     const sameKey = (current.vnode.key ?? null) === (nextVnode.key ?? null);
 
     if (sameType && sameKey) {
-      return this.updateFiber(current, nextVnode, parentFiber, parentScope);
+      // Sibling batches pass deferLifecycle=true so UPDATE onUpdate is deferred until
+      // later PLACE/REPLACE peers finish bus wiring (same family as onMount deferral).
+      return this.updateFiber(current, nextVnode, parentFiber, parentScope, deferLifecycle);
     }
 
     // Type or key changed — destroy the old node, create a new one.
@@ -2101,12 +2109,15 @@ export class GraphRuntime {
 
   /**
    * Updates an existing fiber: applies new props to the instance,
-   * calls onUpdate, recursively diffs children.
+   * recursively diffs children, then runs `onUpdate` (or defers it during a
+   * sibling PLACE/REPLACE batch so later `@On*` listeners are already wired).
    *
    * @param {RuntimeFiber<P>} current - current fiber
    * @param {VirtualServiceNode<P>} nextVnode - new virtual node
    * @param {RuntimeFiber | null} parentFiber - parent fiber
    * @param {ContextScope} parentScope - parent scope
+   * @param {boolean} [deferOnUpdate=false] - when true (sibling reconcile batch), stash
+   *   `onUpdate` until {@link flushDeferredOnUpdates} after PLACE bus wiring
    * @returns {Promise<RuntimeFiber<P>>}
    */
   private updateFiber<P>(
@@ -2114,12 +2125,16 @@ export class GraphRuntime {
     nextVnode: VirtualServiceNode<P>,
     parentFiber: RuntimeFiber<unknown> | null,
     parentScope: ContextScope,
+    deferOnUpdate: boolean = false,
   ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
     const instance = current.instance;
 
     if (instance === null) {
       throw new Error('[Effectable] GraphRuntime: UPDATE on fiber with null instance.');
     }
+
+    // Drop any prior deferred onUpdate from a failed sibling batch.
+    current.pendingDeferredOnUpdate = undefined;
 
     const prevProps = instance.props;
     const propsReceiver = (
@@ -2154,21 +2169,12 @@ export class GraphRuntime {
     // Build scope for child nodes (ContextProvider may have updated values)
     const childScope = this.buildChildScope(instance, parentScope);
 
-    // Call onUpdate if props or context changed (React 16.5 class-component style: one hook)
+    // onUpdate runs after child reconcile (and after applyFiberUpdate) so same-pass
+    // PLACE children have wired `@On*` handlers before a parent publish. Sibling
+    // batches additionally defer via pendingDeferredOnUpdate (see deferOnUpdate).
     const propsChanged = prevProps !== instance.props;
-    if ((propsChanged || contextChanged) && current.engine.canUpdate()) {
-      try {
-        instance.onUpdate(prevProps, instance.props);
-      } catch (error: unknown) {
-        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
-        if (isThenable(cleanupResult)) {
-          return cleanupResult.then(() => {
-            throw error;
-          });
-        }
-        throw error;
-      }
-    }
+    const shouldOnUpdate =
+      (propsChanged || contextChanged) && current.engine.canUpdate();
 
     // Reconcile child nodes (sync fast-path if all children are sync).
     // Ref commit is deferred to applyFiberUpdate so a compose()/child-reconcile
@@ -2214,6 +2220,12 @@ export class GraphRuntime {
           }
           throw error;
         }
+        this.finishFiberOnUpdate(
+          current as RuntimeFiber<unknown>,
+          prevProps,
+          shouldOnUpdate,
+          deferOnUpdate,
+        );
         return current;
       });
     }
@@ -2233,7 +2245,82 @@ export class GraphRuntime {
       }
       throw error;
     }
+    this.finishFiberOnUpdate(
+      current as RuntimeFiber<unknown>,
+      prevProps,
+      shouldOnUpdate,
+      deferOnUpdate,
+    );
     return current;
+  }
+
+  /**
+   * Runs or defers `onUpdate` after a successful child reconcile + ref commit.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - updated fiber
+   * @param {unknown} prevProps - props before this UPDATE
+   * @param {boolean} shouldOnUpdate - whether props/context changed and engine allows update
+   * @param {boolean} deferOnUpdate - stash for sibling-batch flush instead of running now
+   * @returns {void}
+   */
+  private finishFiberOnUpdate (
+    fiber: RuntimeFiber<unknown>,
+    prevProps: unknown,
+    shouldOnUpdate: boolean,
+    deferOnUpdate: boolean,
+  ): void {
+    if (!shouldOnUpdate) {
+      return;
+    }
+    if (deferOnUpdate) {
+      fiber.pendingDeferredOnUpdate = { prevProps };
+      return;
+    }
+    this.invokeFiberOnUpdate(fiber, prevProps);
+  }
+
+  /**
+   * Invokes `instance.onUpdate(prevProps, props)` with fail-cleanup on throw.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber whose instance receives onUpdate
+   * @param {unknown} prevProps - previous props snapshot
+   * @returns {void}
+   */
+  private invokeFiberOnUpdate (fiber: RuntimeFiber<unknown>, prevProps: unknown): void {
+    const instance = fiber.instance;
+    if (instance === null || !fiber.engine.canUpdate()) {
+      return;
+    }
+    try {
+      instance.onUpdate(prevProps, instance.props);
+    } catch (error: unknown) {
+      const cleanupResult = this.runFiberFailedCleanup(fiber, error);
+      if (isThenable(cleanupResult)) {
+        // Match prior UPDATE onUpdate contract: sync callers do not await async cleanup;
+        // best-effort schedule then rethrow.
+        void Promise.resolve(cleanupResult).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Flushes `pendingDeferredOnUpdate` on fibers in compose order after PLACE/REPLACE
+   * siblings have completed bus wiring (and preferably after deferred onMount flush).
+   *
+   * @param {RuntimeFiber<unknown>[]} children - reconciled child list
+   * @returns {void}
+   */
+  private flushDeferredOnUpdates (children: RuntimeFiber<unknown>[]): void {
+    for (let i = 0; i < children.length; i += 1) {
+      const child = children[i] as RuntimeFiber<unknown>;
+      const pending = child.pendingDeferredOnUpdate;
+      if (pending === undefined) {
+        continue;
+      }
+      child.pendingDeferredOnUpdate = undefined;
+      this.invokeFiberOnUpdate(child, pending.prevProps);
+    }
   }
 
   /**
@@ -2501,6 +2588,10 @@ export class GraphRuntime {
         stableResult.push(reconciled);
       }
 
+      // Stable path is UPDATE-only (no PLACE), but reconcileFiber still passes
+      // deferLifecycle=true — flush any deferred onUpdate before returning.
+      this.flushDeferredOnUpdates(stableResult);
+
       return stableResult;
     }
 
@@ -2543,6 +2634,7 @@ export class GraphRuntime {
       resultSoFar.push(isThenable(reconciled) ? await reconciled : (reconciled as RuntimeFiber<unknown>));
     }
 
+    this.flushDeferredOnUpdates(resultSoFar);
     return resultSoFar;
   }
 
@@ -2755,6 +2847,10 @@ export class GraphRuntime {
         }
       }
 
+      // Flush UPDATE onUpdate deferred during this sibling batch — after PLACE buses
+      // (and their onMount) so publishes are not silently dropped.
+      this.flushDeferredOnUpdates(nextChildren);
+
       return nextChildren;
     } catch (primaryError: unknown) {
       // HOLE 3: On throw, clean up new fibers in nextChildren
@@ -2765,6 +2861,9 @@ export class GraphRuntime {
       for (const child of nextChildren) {
         // Skip if this fiber is identity-in currentChildren (UPDATE, not PLACE/REPLACE)
         if (currentChildrenSet.has(child)) {
+          // Failed mid-batch: drop deferred onUpdate so a later reconcile cannot
+          // replay a stale props snapshot on a surviving UPDATE sibling.
+          child.pendingDeferredOnUpdate = undefined;
           continue;
         }
 
