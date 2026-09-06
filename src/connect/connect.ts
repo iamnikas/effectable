@@ -22,7 +22,10 @@
  *   sync no-op while wiring is active (avoids double-subscribe without blocking remount).
  * - Subclass `super.onMount()` / `super.onUnmount()` after `await` must not re-enter wiring
  *   (sync reentry alone is cleared when the Promise is returned; an async generation gate
- *   prevents infinite subscribe / double dispose). Remount after `onUnmount` still works.
+ *   prevents infinite subscribe / double dispose). Remount after `onUnmount` still works
+ *   via own-entry hooks; a stale in-flight `await super.onMount()` / `super.onUnmount()`
+ *   after remount must not re-enter (gate is not generation-equality-only, and must not be
+ *   cleared by sync remount / stale unmount `finally`).
  * - `mapStateToProps` subscribe failures fail the mount; mapDispatch-only hosts still get the
  *   post-mount kick-off after a successful mount. Mounting either mode on a destroyed store fails.
  * - Nested HOC wrap `connect(...)(connect(...)(Ctor))` is rejected: inheritance shares one
@@ -464,16 +467,19 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * `super.onMount()` (Connected.prototype) a safe no-op. Own-entry
        * `this.onMount()` / GraphRuntime still remount via `__connectEntryOnMount`.
        * Cleared when `onMount` returns — including when it returns a Promise — so it
-       * alone cannot cover `await …; await super.onMount()` (see `__connectMountAsyncGateGen`).
+       * alone cannot cover `await …; await super.onMount()` (see `__connectMountAsyncInFlight`).
        */
       private __connectMountReentry = false;
       /**
-       * Mount generation for which an async Connected `onMount` Promise is in flight.
-       * Blocks `super.onMount()` after `await` from re-entering wiring (infinite
-       * subscribe / OOM). Cleared when the Promise settles or on `onUnmount` so a
-       * real remount is not treated as reentry.
+       * Count of in-flight async Connected `onMount` Promises. Any non-zero value
+       * blocks subclass `super.onMount()` after `await` from re-entering wiring
+       * (infinite subscribe / OOM). Uses a refcount rather than generation equality:
+       * remount advances `__connectMountGeneration` and a newer Promise's `finally`
+       * would otherwise clear a single gate field while an older mount is still
+       * suspended before `await super.onMount()`. Own-entry remount via
+       * `__connectEntryOnMount` bypasses this gate. Not cleared by `onUnmount`.
        */
-      private __connectMountAsyncGateGen = 0;
+      private __connectMountAsyncInFlight = 0;
       /**
        * True while Connected unmount teardown is on the sync stack. Makes subclass
        * `super.onUnmount()` a safe no-op. Own-entry `this.onUnmount()` still runs
@@ -481,10 +487,12 @@ function buildConnectHoc<S, P, R, A extends Action> (
        */
       private __connectUnmountReentry = false;
       /**
-       * True while an async Connected `onUnmount` Promise is in flight. Blocks
-       * `super.onUnmount()` after `await` from re-running teardown.
+       * Count of in-flight async Connected `onUnmount` Promises. Any non-zero value
+       * blocks `super.onUnmount()` after `await`. Refcount (not a boolean) so a stale
+       * unmount `finally` cannot clear the gate while a newer async unmount is still
+       * in flight after remount.
        */
-      private __connectUnmountAsyncGate = false;
+      private __connectUnmountAsyncInFlight = 0;
       /**
        * Stable own-property mount entry (GraphRuntime / `this.onMount()`). Distinct from
        * `Connected.prototype.onMount` so `super.onMount()` can no-op on reentry while
@@ -590,25 +598,17 @@ function buildConnectHoc<S, P, R, A extends Action> (
       private enterConnectOnMount (): void | Promise<void> {
         const wasReentry = this.__connectMountReentry;
         this.__connectMountReentry = true;
-        let asyncMount = false;
         try {
           const result = this.runConnectOnMount();
           if (isPromiseLike(result)) {
-            asyncMount = true;
-            const mountGeneration = this.__connectMountGeneration;
-            this.__connectMountAsyncGateGen = mountGeneration;
+            this.__connectMountAsyncInFlight += 1;
             return Promise.resolve(result as Promise<void>).finally(() => {
-              if (this.__connectMountAsyncGateGen === mountGeneration) {
-                this.__connectMountAsyncGateGen = 0;
-              }
+              this.__connectMountAsyncInFlight -= 1;
             });
           }
           return result;
         } finally {
           this.__connectMountReentry = wasReentry;
-          if (!asyncMount) {
-            this.__connectMountAsyncGateGen = 0;
-          }
         }
       }
 
@@ -620,22 +620,17 @@ function buildConnectHoc<S, P, R, A extends Action> (
       private enterConnectOnUnmount (): void | Promise<void> {
         const wasReentry = this.__connectUnmountReentry;
         this.__connectUnmountReentry = true;
-        let asyncUnmount = false;
         try {
           const result = this.runConnectOnUnmount();
           if (isPromiseLike(result)) {
-            asyncUnmount = true;
-            this.__connectUnmountAsyncGate = true;
+            this.__connectUnmountAsyncInFlight += 1;
             return Promise.resolve(result as Promise<void>).finally(() => {
-              this.__connectUnmountAsyncGate = false;
+              this.__connectUnmountAsyncInFlight -= 1;
             });
           }
           return result;
         } finally {
           this.__connectUnmountReentry = wasReentry;
-          if (!asyncUnmount) {
-            this.__connectUnmountAsyncGate = false;
-          }
         }
       }
 
@@ -1042,12 +1037,10 @@ function buildConnectHoc<S, P, R, A extends Action> (
         }
         // Async reentry: after `await`, sync reentry is already cleared. Without this gate,
         // `await …; await super.onMount()` re-enters runConnectOnMount → nested user hook →
-        // infinite subscribe (OOM). Held only for the in-flight mount generation; onUnmount
-        // clears it so remount is not blocked.
-        if (
-          this.__connectMountAsyncGateGen !== 0 &&
-          this.__connectMountAsyncGateGen === this.__connectMountGeneration
-        ) {
+        // infinite subscribe (OOM). Refcount > 0 blocks even when a newer remount's Promise
+        // has already settled (a single generation gate field would clear too early and
+        // let a stale `await super.onMount()` through). Own-entry remount bypasses this method.
+        if (this.__connectMountAsyncInFlight > 0) {
           return;
         }
 
@@ -1305,16 +1298,17 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * @returns {void | Promise<void>}
        */
       public override onUnmount (): void | Promise<void> {
-        // Allow remount while a prior async onMount Promise is still settling — that
-        // Promise must not keep the async mount gate closed across onUnmount→onMount.
-        this.__connectMountAsyncGateGen = 0;
+        // Do not touch `__connectMountAsyncInFlight` here: a prior async onMount may still
+        // resume into `await super.onMount()` after remount. Own-entry remount bypasses
+        // the mount gate; each in-flight Promise decrements the refcount in its finally.
 
         // Sync reentry: subclass `super.onUnmount()` while Connected teardown is on the stack.
         if (this.__connectUnmountReentry) {
           return;
         }
         // Async reentry: `await …; await super.onUnmount()` must not re-run teardown.
-        if (this.__connectUnmountAsyncGate) {
+        // Refcount > 0 blocks; a stale unmount finally only decrements its own claim.
+        if (this.__connectUnmountAsyncInFlight > 0) {
           return;
         }
 
