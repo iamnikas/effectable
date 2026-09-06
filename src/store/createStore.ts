@@ -202,9 +202,12 @@ export function createStore<S, A extends Action> (
    * currentPath$.subscribe(path => console.log('Path:', path));
    */
   const select = <T>(selectorFn: Selector<S, T>): Observable<T> => {
+    // Object.is so stable NaN (and +0/-0) does not re-emit: default === treats
+    // NaN !== NaN, so a selector that keeps returning NaN would notify on every
+    // dispatch — and a subscriber that re-dispatches on NaN loops until OOM.
     return state$.pipe(
       map(selectorFn),
-      distinctUntilChanged()
+      distinctUntilChanged(Object.is)
     );
   };
 
