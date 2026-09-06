@@ -1158,6 +1158,28 @@ export class GraphRuntime {
    * @param {RuntimeFiber<unknown>} fiber - fiber whose subtree needs rebuild
    * @returns {void | Promise<void>}
    */
+
+  /**
+   * Assigns `fiber.children` and keeps {@link FiberConstructionJournal.mountedChildren}
+   * in sync when a journal exists.
+   *
+   * Mount aliases `fiber.children` to `journal.mountedChildren`. Later UPDATE / dirty
+   * reconcile reassigns `fiber.children` to a fresh array without updating the journal,
+   * so destroyed sibling fibers stayed reachable until the parent unmounted (leak under
+   * keyed list churn).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber whose children are being replaced
+   * @param {Fiber[]} children - next child fibers
+   * @returns {void}
+   */
+  private setFiberChildren (fiber: RuntimeFiber<unknown>, children: Fiber[]): void {
+    fiber.children = children;
+    const journal = fiber.constructionJournal;
+    if (journal !== undefined) {
+      journal.mountedChildren = children as RuntimeFiber<unknown>[];
+    }
+  }
+
   private reconcileDirtyFiber (fiber: RuntimeFiber<unknown>): void | Promise<void> {
     if (this.state === RUNTIME_STATE.UNMOUNTING || this.state === RUNTIME_STATE.UNMOUNTED) {
       return;
@@ -1182,7 +1204,7 @@ export class GraphRuntime {
       if (isThenable(childrenRes)) {
         return childrenRes.then(
           (nextChildren) => {
-            fiber.children = nextChildren as Fiber[];
+            this.setFiberChildren(fiber, nextChildren as Fiber[]);
           },
           (error: unknown) => {
             const cleanupResult = this.runFiberFailedCleanup(fiber, error);
@@ -1196,7 +1218,7 @@ export class GraphRuntime {
         );
       }
 
-      fiber.children = childrenRes as Fiber[];
+      this.setFiberChildren(fiber, childrenRes as Fiber[]);
     } catch (error: unknown) {
       const cleanupResult = this.runFiberFailedCleanup(fiber, error);
       if (isThenable(cleanupResult)) {
@@ -2331,7 +2353,7 @@ export class GraphRuntime {
     };
 
     const finishParent = (): void | Promise<void> => {
-      fiber.children = [];
+      this.setFiberChildren(fiber, []);
       const cleanupResult = fiber.engine.runFailedCleanup(instance, true);
       if (isThenable(cleanupResult)) {
         return cleanupResult.then(
@@ -2507,7 +2529,7 @@ export class GraphRuntime {
 
     current.vnode = nextVnode;
     current.parentFiber = parentFiber as RuntimeFiber<unknown> | null;
-    current.children = nextChildren as Fiber[];
+    this.setFiberChildren(current as RuntimeFiber<unknown>, nextChildren as Fiber[]);
     current.effectTag = FIBER_EFFECT_TAG.UPDATE;
     current.scope = parentScope;
     current.lifecycleStatus = current.engine.getStatus();
