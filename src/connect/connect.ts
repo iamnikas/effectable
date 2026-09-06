@@ -317,6 +317,17 @@ function resolveMapDispatchProps<S, P, A extends Action> (
       return null;
     }
 
+    // Same class as mapState thenable (#156): `typeof promise === 'object'`, so an
+    // async mapDispatch factory was installed as `__connectDispatchProps`. Spreading
+    // a Promise into props yields no callbacks and can leak thenable identity into
+    // `this.props`. Reject synchronously — async mapDispatch is not supported.
+    if (isPromiseLike(out)) {
+      throw new Error(
+        '[Effectable.connect] mapDispatchToProps must return a plain object ' +
+        'synchronously; Promise/thenable results are not supported',
+      );
+    }
+
     return out as Record<string, unknown>;
   }
 
