@@ -73,7 +73,7 @@ describe('connect subclass-of-Connected prototype lifecycle', () => {
       public override onMount (): void {
         // Natural subclass pattern: call super (Connected wiring). Must be a no-op
         // while wiring is already on the stack — otherwise double-subscribe.
-        super.onMount();
+        super.onMount?.();
         calls.push(`ext:n=${String(this.props.n)}`);
       }
     }
