@@ -2071,12 +2071,15 @@ export class GraphRuntime {
    */
   private flushSiblingBatchHooks (
     nextChildren: RuntimeFiber<unknown>[],
+    skipPendingOnUpdateFlush: boolean = false,
   ): void | Promise<void> {
     const victimsRes = this.flushPendingReplaceVictims(nextChildren);
     if (isThenable(victimsRes)) {
-      return victimsRes.then(() => this.flushSiblingBatchHooksAfterVictims(nextChildren));
+      return victimsRes.then(
+        () => this.flushSiblingBatchHooksAfterVictims(nextChildren, skipPendingOnUpdateFlush),
+      );
     }
-    return this.flushSiblingBatchHooksAfterVictims(nextChildren);
+    return this.flushSiblingBatchHooksAfterVictims(nextChildren, skipPendingOnUpdateFlush);
   }
 
   /**
@@ -2143,11 +2146,19 @@ export class GraphRuntime {
    */
   private flushSiblingBatchHooksAfterVictims (
     nextChildren: RuntimeFiber<unknown>[],
+    skipPendingOnUpdateFlush: boolean = false,
   ): void | Promise<void> {
-    for (let i = 0; i < nextChildren.length; i++) {
-      const onUpdateFlush = this.flushPendingOnUpdateTree(nextChildren[i] as RuntimeFiber<unknown>);
-      if (isThenable(onUpdateFlush)) {
-        return this.continueFlushSiblingBatchHooksAsync(nextChildren, i, onUpdateFlush, 'onUpdate');
+    // When the parent UPDATE itself has deferred onUpdate (#186 sibling batch), nested
+    // child reconciles must not flush descendant onUpdates yet — a later sibling may
+    // still PLACE @On* handlers. Ancestor flushPendingOnUpdateTree drains them.
+    if (!skipPendingOnUpdateFlush) {
+      for (let i = 0; i < nextChildren.length; i++) {
+        const onUpdateFlush = this.flushPendingOnUpdateTree(nextChildren[i] as RuntimeFiber<unknown>);
+        if (isThenable(onUpdateFlush)) {
+          return this.continueFlushSiblingBatchHooksAsync(
+            nextChildren, i, onUpdateFlush, 'onUpdate', skipPendingOnUpdateFlush,
+          );
+        }
       }
     }
 
@@ -2156,7 +2167,9 @@ export class GraphRuntime {
       if (child.constructionJournal?.lifecycleDeferred === true) {
         const lifecycleFlush = this.flushDeferredLifecycleTree(child);
         if (isThenable(lifecycleFlush)) {
-          return this.continueFlushSiblingBatchHooksAsync(nextChildren, i, lifecycleFlush, 'lifecycle');
+          return this.continueFlushSiblingBatchHooksAsync(
+            nextChildren, i, lifecycleFlush, 'lifecycle', skipPendingOnUpdateFlush,
+          );
         }
       }
     }
@@ -2176,10 +2189,11 @@ export class GraphRuntime {
     pendingIdx: number,
     pending: PromiseLike<void>,
     phase: 'onUpdate' | 'lifecycle',
+    skipPendingOnUpdateFlush: boolean = false,
   ): Promise<void> {
     await pending;
 
-    if (phase === 'onUpdate') {
+    if (phase === 'onUpdate' && !skipPendingOnUpdateFlush) {
       for (let i = pendingIdx + 1; i < nextChildren.length; i++) {
         const onUpdateFlush = this.flushPendingOnUpdateTree(nextChildren[i] as RuntimeFiber<unknown>);
         if (isThenable(onUpdateFlush)) {
@@ -3091,6 +3105,7 @@ export class GraphRuntime {
         nextChildVnodes,
         current as RuntimeFiber<unknown>,
         childScope,
+        deferOnUpdate,
       );
     } catch (error: unknown) {
       rollbackEarlyRefCommit();
@@ -3444,6 +3459,7 @@ export class GraphRuntime {
     nextVnodes: VirtualServiceNode[],
     parentFiber: RuntimeFiber<unknown>,
     childScope: ContextScope,
+    deferPendingOnUpdateFlush: boolean = false,
   ): RuntimeFiber<unknown>[] | Promise<RuntimeFiber<unknown>[]> {
     // === FAST PATH: stable children (N≤32, same type+key per position) ===
     // 9.31x speedup vs full diff for stable trees (typical HFT scenario)
@@ -3482,13 +3498,14 @@ export class GraphRuntime {
         if (isThenable(reconciled)) {
           return this.continueStableReconcileAsync(
             stableResult, reconciled, i, nextVnodes, currentChildren, parentFiber, childScope,
+            deferPendingOnUpdateFlush,
           );
         }
 
         stableResult.push(reconciled);
       }
 
-      const batchFlush = this.flushSiblingBatchHooks(stableResult);
+      const batchFlush = this.flushSiblingBatchHooks(stableResult, deferPendingOnUpdateFlush);
       if (isThenable(batchFlush)) {
         return Promise.resolve(batchFlush).then(() => stableResult);
       }
@@ -3497,7 +3514,9 @@ export class GraphRuntime {
     }
 
     // === FULL DIFF PATH — always async (complex logic; sync path not optimized here) ===
-    return this.reconcileChildrenFullDiff(currentChildren, nextVnodes, parentFiber, childScope);
+    return this.reconcileChildrenFullDiff(
+      currentChildren, nextVnodes, parentFiber, childScope, deferPendingOnUpdateFlush,
+    );
   }
 
   /**
@@ -3520,6 +3539,7 @@ export class GraphRuntime {
     currentChildren: RuntimeFiber<unknown>[],
     parentFiber: RuntimeFiber<unknown>,
     childScope: ContextScope,
+    deferPendingOnUpdateFlush: boolean = false,
   ): Promise<RuntimeFiber<unknown>[]> {
     this.stableAsyncContinueCount += 1;
     resultSoFar.push(await pending);
@@ -3535,7 +3555,7 @@ export class GraphRuntime {
       resultSoFar.push(isThenable(reconciled) ? await reconciled : (reconciled as RuntimeFiber<unknown>));
     }
 
-    const batchFlush = this.flushSiblingBatchHooks(resultSoFar);
+    const batchFlush = this.flushSiblingBatchHooks(resultSoFar, deferPendingOnUpdateFlush);
     if (isThenable(batchFlush)) {
       await batchFlush;
     }
@@ -3606,6 +3626,7 @@ export class GraphRuntime {
     nextVnodes: VirtualServiceNode[],
     parentFiber: RuntimeFiber<unknown>,
     childScope: ContextScope,
+    deferPendingOnUpdateFlush: boolean = false,
   ): Promise<RuntimeFiber<unknown>[]> {
     // Validate unique keys BEFORE any side effects (Option A: React v16.5 contract)
     this.validateUniqueKeys(currentChildren, parentFiber, 'current');
@@ -3902,12 +3923,18 @@ export class GraphRuntime {
       // under later UPDATE siblings has finished wiring, and orphan @On* still receive
       // handoff (#186). Sibling PLACE/REPLACE from pass 1 are already wired; #125 only
       // covered sibling PLACE — nested PLACE under a later UPDATE still needed this.
-      for (let i = 0; i < nextChildren.length; i++) {
-        const onUpdateFlush = this.flushPendingOnUpdateTree(
-          nextChildren[i] as RuntimeFiber<unknown>,
-        );
-        if (isThenable(onUpdateFlush)) {
-          await onUpdateFlush;
+      // When this full-diff runs under a parent UPDATE that already deferred onUpdate
+      // (sibling batch), skip flushing here so descendant onUpdates wait for the
+      // ancestor flush — otherwise a nested publisher under Early fires before Late's
+      // nested PLACE wires @On* handlers.
+      if (!deferPendingOnUpdateFlush) {
+        for (let i = 0; i < nextChildren.length; i++) {
+          const onUpdateFlush = this.flushPendingOnUpdateTree(
+            nextChildren[i] as RuntimeFiber<unknown>,
+          );
+          if (isThenable(onUpdateFlush)) {
+            await onUpdateFlush;
+          }
         }
       }
 
@@ -3938,7 +3965,7 @@ export class GraphRuntime {
       // onUpdates already flushed above; this pass runs deferred PLACE/REPLACE onMount
       // in compose order after every new sibling (and nested PLACE) is wired.
       // REPLACE victims may already be cleared above (before orphan DELETE); idempotent.
-      const batchFlush = this.flushSiblingBatchHooks(nextChildren);
+      const batchFlush = this.flushSiblingBatchHooks(nextChildren, deferPendingOnUpdateFlush);
       if (isThenable(batchFlush)) {
         await batchFlush;
       }
