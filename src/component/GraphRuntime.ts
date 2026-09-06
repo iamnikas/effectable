@@ -2540,7 +2540,21 @@ export class GraphRuntime {
     //    PLACE/REPLACE buses wire — otherwise a victim onUnmount publish is silently dropped
     //    by a not-yet-wired PLACE listener in the same batch. Stash the victim on the
     //    replacement journal; flushPendingReplaceVictims destroys it after structure.
+    // 3) Exclusive Command/Query slots must still be released before the replacement
+    //    materializes (same contract as orphan pre-PLACE release). Keep @OnEvent until
+    //    destroy so deferred victim onUnmount publishes still fan out.
     if (deferLifecycle) {
+      if (this.effectableRuntimeBuses !== null) {
+        try {
+          this.releaseExclusiveRuntimeBusHandlersSubtree(
+            current as RuntimeFiber<unknown>,
+            this.effectableRuntimeBuses,
+          );
+        } catch {
+          // Best-effort: a throwing unregister must not block REPLACE materialize.
+          // destroyFiber still runs the full bus disposer later.
+        }
+      }
       const attachVictim = (fiber: RuntimeFiber<P>): RuntimeFiber<P> => {
         fiber.constructionJournal!.pendingReplaceVictim = current as RuntimeFiber<unknown>;
         return fiber;
