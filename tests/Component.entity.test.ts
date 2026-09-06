@@ -307,6 +307,201 @@ describe('Component standalone', () => {
   });
 });
 
+describe('Component single writer (state)', () => {
+  async function closeConstructorStateGate (): Promise<void> {
+    await Promise.resolve();
+  }
+
+  it('warns on direct this.state = after construction and leaves state unchanged', async () => {
+    class Probe extends Component<{ n: number }, Record<string, never>> {
+      constructor () {
+        super({});
+        this.state = { n: 0 };
+      }
+    }
+
+    const c = new Probe();
+    await closeConstructorStateGate();
+
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      c.state = { n: 7 };
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy.mock.calls[0]?.[0]).toEqual(
+        expect.stringContaining('direct assignment to `state` is not supported'),
+      );
+      expect(warnSpy.mock.calls[0]?.[0]).toEqual(expect.stringContaining('setState'));
+      expect(warnSpy.mock.calls[0]?.[0]).toEqual(expect.stringContaining('ref'));
+      // Illicit assignment must not mutate state.
+      expect(c.state.n).toBe(0);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('constructor this.state = and super(props, initial) do not warn', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      class ViaCtorAssign extends Component<{ n: number }, Record<string, never>> {
+        constructor () {
+          super({});
+          this.state = { n: 1 };
+        }
+      }
+
+      class ViaSuperInitial extends Component<{ n: number }, Record<string, never>> {
+        constructor () {
+          super({}, { n: 2 });
+        }
+      }
+
+      const a = new ViaCtorAssign();
+      const b = new ViaSuperInitial();
+      expect(a.state.n).toBe(1);
+      expect(b.state.n).toBe(2);
+      expect(warnSpy).not.toHaveBeenCalled();
+      await closeConstructorStateGate();
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('setState does not warn and still calls onUpdate + SCHEDULE_UPDATE_HOOK', async () => {
+    class Hooked extends Component<{ n: number }, Record<string, never>> {
+      public updates: Array<{ prev: number; next: number }> = [];
+
+      constructor () {
+        super({});
+        this.state = { n: 0 };
+      }
+
+      public override onUpdate (prev: { n: number }, next: { n: number }): void {
+        this.updates.push({ prev: prev.n, next: next.n });
+      }
+    }
+
+    const c = new Hooked();
+    await closeConstructorStateGate();
+
+    let hookCalls = 0;
+    (c as unknown as Record<symbol, unknown>)[SCHEDULE_UPDATE_HOOK] = (): void => {
+      hookCalls += 1;
+    };
+
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      c.setState({ n: 3 });
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(c.state.n).toBe(3);
+      expect(c.updates).toEqual([{ prev: 0, next: 3 }]);
+      expect(hookCalls).toBe(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('mutableState setState path does not warn and still calls onUpdate + schedule hook', async () => {
+    class Mutable extends Component<{ n: number }, Record<string, never>> {
+      public static override readonly mutableState = true;
+
+      public updates: Array<{ sameRef: boolean; n: number }> = [];
+
+      constructor () {
+        super({});
+        this.state = { n: 0 };
+      }
+
+      public override onUpdate (prev: { n: number }, next: { n: number }): void {
+        this.updates.push({ sameRef: prev === next, n: next.n });
+      }
+    }
+
+    const c = new Mutable();
+    await closeConstructorStateGate();
+    const before = c.state;
+
+    let hookCalls = 0;
+    (c as unknown as Record<symbol, unknown>)[SCHEDULE_UPDATE_HOOK] = (): void => {
+      hookCalls += 1;
+    };
+
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      c.setState({ n: 9 });
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(c.state).toBe(before);
+      expect(c.state.n).toBe(9);
+      expect(c.updates).toEqual([{ sameRef: true, n: 9 }]);
+      expect(hookCalls).toBe(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('setState updates this.state when subclass class-field shadows the accessor', async () => {
+    class FieldInit extends Component<{ n: number }, Record<string, never>> {
+      public updates: number[] = [];
+
+      constructor () {
+        super({});
+        // Same as `state = { n: 0 }` after super(): own data property shadows accessors.
+        Object.defineProperty(this, 'state', {
+          value: { n: 0 },
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+
+      public override onUpdate (_prev: { n: number }, next: { n: number }): void {
+        this.updates.push(next.n);
+      }
+    }
+
+    const c = new FieldInit();
+    await closeConstructorStateGate();
+    expect(c.state.n).toBe(0);
+
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      c.setState({ n: 5 });
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(c.state.n).toBe(5);
+      expect(c.updates).toEqual([5]);
+
+      c.setState((s) => ({ n: s.n + 1 }));
+      expect(c.state.n).toBe(6);
+      expect(c.updates).toEqual([5, 6]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('mutableState setState updates class-field shadowed state in place', async () => {
+    class FieldMutable extends Component<{ n: number }, Record<string, never>> {
+      public static override readonly mutableState = true;
+
+      constructor () {
+        super({});
+        Object.defineProperty(this, 'state', {
+          value: { n: 0 },
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+    }
+
+    const c = new FieldMutable();
+    await closeConstructorStateGate();
+    const before = c.state;
+    c.setState({ n: 4 });
+    expect(c.state).toBe(before);
+    expect(c.state.n).toBe(4);
+  });
+});
+
 describe('mount without compose()', () => {
   it('component without compose() override mounts via GraphRuntime with explicitChildren', async () => {
     class NoComposeHost extends Component<Record<string, unknown>, Record<string, unknown>> {
