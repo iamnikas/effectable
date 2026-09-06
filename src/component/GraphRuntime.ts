@@ -19,8 +19,9 @@
  *   materialization is buffered and applied after the mount/reconcile pass.
  * - UPDATE `commitRef` runs after successful compose and *before* child reconcile so
  *   same-pass PLACE `onMount` observes parent `nextRef` (mount path already commits before
- *   deferred onMount flush). Child-reconcile failure rolls the early commit back; compose
- *   failure never touches refs.
+ *   deferred onMount flush). Child-reconcile failure and root `onUpdate` failure (before
+ *   `applyFiberUpdate` publishes `nextRef` onto `fiber.vnode.ref`) roll the early commit
+ *   back; compose failure never touches refs.
  * - Failed cleanup is children-first and does not invoke a phantom parent `onUnmount`.
  * - Orphan DELETE finalize is best-effort so survivors are not fail-stopped for cleanup noise.
  *
