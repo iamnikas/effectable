@@ -476,6 +476,48 @@ describe('createStore', () => {
       subA.unsubscribe();
       store.destroy();
     });
+
+    it('nested dispatch during the initial state$ replay must deliver the nested state to that subscriber', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      const seen: number[] = [];
+      const sub = store.state$.subscribe((state) => {
+        seen.push(state.count);
+        if (state.count === 0) {
+          store.dispatch({ type: 'SET', payload: 99 });
+        }
+      });
+
+      expect(store.getState().count).toBe(99);
+      expect(seen).toEqual([0, 99]);
+
+      sub.unsubscribe();
+      store.destroy();
+    });
+
+    it('nested dispatch during the initial select replay must deliver the nested value', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      const seen: number[] = [];
+      const sub = store.select((state) => state.count).subscribe((count) => {
+        seen.push(count);
+        if (count === 0) {
+          store.dispatch({ type: 'SET', payload: 99 });
+        }
+      });
+
+      expect(store.getState().count).toBe(99);
+      expect(seen).toEqual([0, 99]);
+
+      sub.unsubscribe();
+      store.destroy();
+    });
   });
 
   describe('enhancer (B07)', () => {

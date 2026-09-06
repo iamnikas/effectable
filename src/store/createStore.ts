@@ -75,14 +75,23 @@ export function createStore<S, A extends Action> (
    * Public state stream: replay committed `currentState` on subscribe, then
    * forward publishes. After destroy, new subscribers complete with no next
    * (matches prior BehaviorSubject-after-complete contract used by connect).
+   *
+   * Subscribe to `notifications$` *before* the replay next — same order as
+   * RxJS BehaviorSubject (`_subscribe` then emit `_value`). Otherwise a nested
+   * `dispatch` inside the first emission publishes on `notifications$` before
+   * this subscriber is attached and the nested state is silently dropped.
    */
   const stateObservable$ = new Observable<S>((subscriber) => {
     if (isDestroyed) {
       subscriber.complete();
       return undefined;
     }
+    const notificationSub = notifications$.subscribe(subscriber);
+    if (isDestroyed || subscriber.closed) {
+      return notificationSub;
+    }
     subscriber.next(currentState);
-    return notifications$.subscribe(subscriber);
+    return notificationSub;
   });
 
   /**
