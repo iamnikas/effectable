@@ -204,7 +204,10 @@ export function createStore<S, A extends Action> (
   const select = <T>(selectorFn: Selector<S, T>): Observable<T> => {
     return state$.pipe(
       map(selectorFn),
-      distinctUntilChanged()
+      // Default `===` treats NaN as always-changed (NaN !== NaN), so a stable
+      // selected NaN re-emits on every dispatch and can sync-loop forever when a
+      // subscriber dispatches on NaN. Object.is(NaN, NaN) is true.
+      distinctUntilChanged((prev, next) => Object.is(prev, next))
     );
   };
 

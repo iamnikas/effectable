@@ -183,6 +183,31 @@ describe('createStore', () => {
       sub.unsubscribe();
       store.destroy();
     });
+
+    it('select does not re-emit when selected value stays NaN', () => {
+      type NanState = { v: number };
+      type NanAction = { type: 'NOOP' };
+      const store = createStore<NanState, NanAction>(
+        (state, _action) => state,
+        { v: NaN },
+      );
+      let emissions = 0;
+      const sub = store.select((state) => state.v).subscribe((v) => {
+        emissions += 1;
+        if (emissions > 20) {
+          throw new Error(`infinite select loop on NaN: emissions=${emissions}`);
+        }
+        if (Number.isNaN(v)) {
+          store.dispatch({ type: 'NOOP' });
+        }
+      });
+
+      expect(emissions).toBe(1);
+      expect(Number.isNaN(store.getState().v)).toBe(true);
+
+      sub.unsubscribe();
+      store.destroy();
+    });
   });
 
   describe('action validation (B04)', () => {
