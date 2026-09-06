@@ -513,14 +513,14 @@ export class GraphRuntime {
   }
 
   /**
-   * Before PLACE in a full-diff sibling batch, release exclusive Command/Query slots that
-   * deferred UPDATEs will free only later (pass 2). A surviving keyed wrapper can keep a
-   * nested `@OnCommand`/`@OnQuery` live across pass-1 PLACE of a sibling that registers
-   * the same type — fail-stop (#182). Temporarily apply next props, compose next children,
-   * release unpaired / REPLACE-victim exclusive subtrees, recurse into nested UPDATEs.
-   * EventBus stays intact (#158).
+   * Before PLACE under a sibling UPDATE walk, release exclusive Command/Query slots that
+   * later UPDATEs will free only after earlier nested PLACE has already wired.
+   * Used by full-diff before pass-1 PLACE (#182) and by the stable fast-path before its
+   * left-to-right UPDATE loop (same hole without deferred UPDATEs). Temporarily apply
+   * next props, compose next children, release unpaired / REPLACE-victim exclusive
+   * subtrees, recurse into nested UPDATEs. EventBus stays intact (#158).
    *
-   * @param {RuntimeFiber<unknown>} fiber - deferred UPDATE fiber
+   * @param {RuntimeFiber<unknown>} fiber - UPDATE fiber to preview
    * @param {VirtualServiceNode<unknown>} nextVnode - next vnode for that fiber
    * @param {NonNullable<GraphRuntime['effectableRuntimeBuses']>} buses - runtime buses
    * @returns {void}
@@ -3446,6 +3446,27 @@ export class GraphRuntime {
     // 9.31x speedup vs full diff for stable trees (typical HFT scenario)
     if (this.isStableChildren(currentChildren, nextVnodes)) {
       const n = nextVnodes.length;
+
+      // Stable path UPDATEs run left-to-right to completion (including nested PLACE).
+      // Preview every sibling and free exclusive Command/Query slots that later UPDATEs
+      // will drop, so an earlier nested PLACE can claim them without fail-stop.
+      // Full-diff already does this via releaseExclusiveUnderDeferredUpdate (#182);
+      // stable fast-path never entered that helper before.
+      if (this.effectableRuntimeBuses !== null) {
+        const buses = this.effectableRuntimeBuses;
+        for (let i = 0; i < n; i++) {
+          try {
+            this.releaseExclusiveUnderDeferredUpdate(
+              currentChildren[i] as RuntimeFiber<unknown>,
+              nextVnodes[i] as VirtualServiceNode<unknown>,
+              buses,
+            );
+          } catch {
+            // Best-effort — real UPDATE still runs below.
+          }
+        }
+      }
+
       const stableResult: RuntimeFiber<unknown>[] = [];
 
       for (let i = 0; i < n; i++) {
