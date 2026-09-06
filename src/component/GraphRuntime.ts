@@ -2101,7 +2101,11 @@ export class GraphRuntime {
 
   /**
    * Updates an existing fiber: applies new props to the instance,
-   * calls onUpdate, recursively diffs children.
+   * recursively diffs children, then calls onUpdate.
+   *
+   * onUpdate runs after child reconcile so same-pass PLACE children have
+   * already wired `@On*` handlers — otherwise a parent publish in onUpdate is
+   * silently dropped (sibling UPDATE+PLACE is handled separately in full-diff).
    *
    * @param {RuntimeFiber<P>} current - current fiber
    * @param {VirtualServiceNode<P>} nextVnode - new virtual node
@@ -2153,22 +2157,8 @@ export class GraphRuntime {
 
     // Build scope for child nodes (ContextProvider may have updated values)
     const childScope = this.buildChildScope(instance, parentScope);
-
-    // Call onUpdate if props or context changed (React 16.5 class-component style: one hook)
     const propsChanged = prevProps !== instance.props;
-    if ((propsChanged || contextChanged) && current.engine.canUpdate()) {
-      try {
-        instance.onUpdate(prevProps, instance.props);
-      } catch (error: unknown) {
-        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
-        if (isThenable(cleanupResult)) {
-          return cleanupResult.then(() => {
-            throw error;
-          });
-        }
-        throw error;
-      }
-    }
+    const shouldNotifyUpdate = (propsChanged || contextChanged) && current.engine.canUpdate();
 
     // Reconcile child nodes (sync fast-path if all children are sync).
     // Ref commit is deferred to applyFiberUpdate so a compose()/child-reconcile
@@ -2194,6 +2184,29 @@ export class GraphRuntime {
       childScope,
     );
 
+    /**
+     * Runs deferred onUpdate after children are linked. Failures tear down the
+     * fiber (children are already attached via applyFiberUpdate).
+     *
+     * @returns {void | Promise<RuntimeFiber<P>>}
+     */
+    const runDeferredOnUpdate = (): void | Promise<RuntimeFiber<P>> => {
+      if (!shouldNotifyUpdate) {
+        return;
+      }
+      try {
+        instance.onUpdate(prevProps, instance.props);
+      } catch (error: unknown) {
+        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
+        if (isThenable(cleanupResult)) {
+          return cleanupResult.then(() => {
+            throw error;
+          });
+        }
+        throw error;
+      }
+    };
+
     if (isThenable(childrenRes)) {
       return childrenRes.then((nextChildren) => {
         try {
@@ -2214,6 +2227,10 @@ export class GraphRuntime {
           }
           throw error;
         }
+        const updateRes = runDeferredOnUpdate();
+        if (isThenable(updateRes)) {
+          return updateRes;
+        }
         return current;
       });
     }
@@ -2232,6 +2249,10 @@ export class GraphRuntime {
         });
       }
       throw error;
+    }
+    const updateRes = runDeferredOnUpdate();
+    if (isThenable(updateRes)) {
+      return updateRes;
     }
     return current;
   }
