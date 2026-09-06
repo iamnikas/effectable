@@ -41,6 +41,19 @@ export const RUNTIME_PROPS_RECEIVER = Symbol('effectable:runtime_props_receiver'
 export const SCHEDULE_UPDATE_HOOK = Symbol('effectable:schedule_update_hook');
 
 /**
+ * Post-construct rebind hook installed by `connect` on Connected instances.
+ *
+ * Class fields on a **subclass of Connected** initialize after `Connected`'s constructor
+ * finishes, so they can overwrite the own `onMount` / `onUnmount` wiring that
+ * `connect` installed. GraphRuntime invokes this symbol (when present) immediately
+ * after `new vnode.type(...)` and before {@link LifecycleEngine.initHookFlags}, so
+ * connect can re-capture those subclass fields and restore its lifecycle hooks.
+ *
+ * Not part of the public component API.
+ */
+export const CONNECT_REBIND_LIFECYCLE = Symbol('effectable:connect_rebind_lifecycle');
+
+/**
  * Internal contract for a component that intercepts `props` updates from GraphRuntime.
  *
  * Not part of the public API for user components; intended for infrastructure HOCs.

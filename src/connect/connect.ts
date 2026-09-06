@@ -20,7 +20,7 @@
 
 import type { Action } from '../store/types';
 import type { Store } from '../store/types';
-import { RUNTIME_PROPS_RECEIVER } from '../component/types';
+import { CONNECT_REBIND_LIFECYCLE, RUNTIME_PROPS_RECEIVER } from '../component/types';
 import {
   CONTEXT_FIELDS_META_KEY,
   HAS_CONTEXT_FIELDS_KEY,
@@ -225,12 +225,6 @@ function buildConnectHoc<S, P, R, A extends Action> (
        */
       private __connectTornDown = false;
       /**
-       * Set when the store observable completes (typically `store.destroy()`).
-       * Reconcile must not call `getState()` on a destroyed store — that throw fail-stops
-       * the entire GraphRuntime. Last mapped props are kept until unmount/remount.
-       */
-      private __connectStoreDestroyed = false;
-      /**
        * Bumped at the start of every `onMount`. Async `super.onMount` completions capture the
        * generation so a stale promise from a previous mount cannot complete / kick off after
        * remount cleared `__connectTornDown` while the new mount is still pending.
@@ -253,19 +247,47 @@ function buildConnectHoc<S, P, R, A extends Action> (
         this.__connectOwnProps = this.props as unknown as Record<string, unknown>;
 
         // Class-field lifecycle hooks are own properties and shadow Connected.prototype.
-        // Capture them, then reinstall Connected wiring so GraphRuntime still runs connect.
+        // Capture BaseCtor fields here, then reinstall Connected wiring. Subclass-of-Connected
+        // class fields initialize *after* this constructor and can overwrite the wiring again;
+        // GraphRuntime calls CONNECT_REBIND_LIFECYCLE post-construct to re-capture those.
+        this.installConnectLifecycleHooks();
+        (this as unknown as Record<symbol, unknown>)[CONNECT_REBIND_LIFECYCLE] = () => {
+          this.installConnectLifecycleHooks();
+        };
+      }
+
+      /**
+       * Captures any own `onMount` / `onUnmount` that is not Connected wiring, then
+       * reinstalls `Connected.prototype` hooks as own properties.
+       *
+       * Safe to call from the Connected constructor (BaseCtor class fields) and again
+       * after full construction (subclass-of-Connected class fields).
+       *
+       * @returns {void}
+       */
+      private installConnectLifecycleHooks (): void {
         const self = this as {
           onMount?: unknown;
           onUnmount?: unknown;
         };
-        if (Object.prototype.hasOwnProperty.call(this, 'onMount') && typeof self.onMount === 'function') {
+        const protoMount = Connected.prototype.onMount;
+        const protoUnmount = Connected.prototype.onUnmount;
+        if (
+          Object.prototype.hasOwnProperty.call(this, 'onMount') &&
+          typeof self.onMount === 'function' &&
+          self.onMount !== protoMount
+        ) {
           this.__connectOwnOnMount = self.onMount as () => void | Promise<void>;
         }
-        if (Object.prototype.hasOwnProperty.call(this, 'onUnmount') && typeof self.onUnmount === 'function') {
+        if (
+          Object.prototype.hasOwnProperty.call(this, 'onUnmount') &&
+          typeof self.onUnmount === 'function' &&
+          self.onUnmount !== protoUnmount
+        ) {
           this.__connectOwnOnUnmount = self.onUnmount as () => void | Promise<void>;
         }
-        self.onMount = Connected.prototype.onMount;
-        self.onUnmount = Connected.prototype.onUnmount;
+        self.onMount = protoMount;
+        self.onUnmount = protoUnmount;
       }
 
       /**
@@ -340,11 +362,34 @@ function buildConnectHoc<S, P, R, A extends Action> (
       /**
        * Publishes the resolved store into the connected component's subtree.
        *
+       * GraphRuntime calls this during materialization **before** the first `compose()`.
+       * Sync mapped props here so strict mode does not leak parent own-props into that
+       * compose (and so mapState/mapDispatch fields are visible without waiting for
+       * `onMount` + post-mount kick-off). Otherwise a gate that branches on own props
+       * can PLACE/onMount the wrong child subtree for one generation.
+       *
        * @param {ContextScope} parentScope - parent scope
        * @returns {ContextScope} scope for child nodes
        */
       public applyToScope (parentScope: ContextScope): ContextScope {
-        return extendScope(parentScope, CONNECT_STORE_CONTEXT, this.resolveConnectStore());
+        const store = this.resolveConnectStore();
+        this.syncConnectPropsBeforeCompose(store);
+        return extendScope(parentScope, CONNECT_STORE_CONTEXT, store);
+      }
+
+      /**
+       * Applies dispatch + current mapState props before the first `compose()`.
+       *
+       * @param {Store<S, A>} store - resolved store
+       * @returns {void}
+       */
+      private syncConnectPropsBeforeCompose (store: Store<S, A>): void {
+        this.refreshDispatchProps(store);
+        if (mapStateToProps != null) {
+          this.applyMappedStateProps(
+            mapStateToProps(store.getState(), this.__connectOwnProps as unknown as P)
+          );
+        }
       }
 
       /**
@@ -378,20 +423,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * @returns {Store<S, A> | null}
        */
       private tryResolveConnectStore (): Store<S, A> | null {
-        // After store.destroy(), getState()/dispatch throw. Treat as unresolved for reconcile
-        // so RUNTIME_PROPS_RECEIVER rebuilds from last mapped props instead of fail-stopping.
-        if (this.__connectStoreDestroyed) {
-          return null;
-        }
-
         if (this.__connectStore !== null) {
-          // Belt-and-suspenders: if subscription was already dropped, complete may not run.
-          try {
-            this.__connectStore.getState();
-          } catch {
-            this.__connectStoreDestroyed = true;
-            return null;
-          }
           return this.__connectStore;
         }
 
@@ -528,7 +560,6 @@ function buildConnectHoc<S, P, R, A extends Action> (
         // PR #59 reset only `__connectTornDown`; leaving `__connectFirstPass` false skipped
         // user `onMount` and froze store→props delivery (`__connectMountCompleted` never set).
         this.__connectTornDown = false;
-        this.__connectStoreDestroyed = false;
         this.__connectFirstPass = true;
         this.__connectKickoffScheduled = false;
         this.__connectDeliveredUpdateAfterMount = false;
@@ -593,11 +624,6 @@ function buildConnectHoc<S, P, R, A extends Action> (
           return;
         }
 
-        let pendingMountResult: void | Promise<void> | null = null;
-        // A sync throw in super.onMount on the first pass happens before
-        // this.__connectSubscription is assigned (subscribe has not yet returned a Subscription) —
-        // store the error and dispose after assignment, without rethrowing inside RxJS next.
-        let syncFirstPassError: unknown = null;
         // Selector / mapStateToProps throw during subscribe (first BehaviorSubject emission)
         // or before mount completes: surface as onMount failure instead of a zombie ACTIVE tree.
         let syncSubscribeError: unknown = null;
@@ -607,60 +633,20 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this.__connectOwnProps as unknown as P
         );
 
-        // Capture the Subscription before assigning to the instance field. The first
-        // BehaviorSubject emission runs `super.onMount` synchronously inside `subscribe()`,
-        // so the user may call `onUnmount` / nested `onMount` while `__connectSubscription`
-        // is still null. Assigning blindly after `subscribe()` returns would resurrect a
-        // torn-down subscription or overwrite a newer remount's handle (leaking the new one).
+        // First select emission only applies mapped props. User `onMount` runs AFTER
+        // `subscribe()` returns so a nested `dispatch` + throwing `mapStateToProps` is not a
+        // reentrant observer error (RxJS `reportUnhandledError` / process crash) and cannot
+        // orphan a Promise that `onMount` never returned to the caller.
+        //
+        // Capture the Subscription locally before assigning to the instance field (#83): a
+        // teardown or nested remount during the sync first emission must not resurrect a
+        // disposed handle or overwrite a newer remount's subscription.
         const subscription = store.select(selector).subscribe({
           next: (mapped: R) => {
             this.applyMappedStateProps(mapped);
 
             if (this.__connectFirstPass) {
               this.__connectFirstPass = false;
-
-              if (!hasSuperOnMount) {
-                this.completeConnectMount();
-                return;
-              }
-
-              let mountResult: void | Promise<void>;
-              try {
-                mountResult = (superOnMount as () => void | Promise<void>).call(this);
-              } catch (error) {
-                syncFirstPassError = error;
-                return;
-              }
-
-              if (!isPromiseLike(mountResult)) {
-                // Nested store emit during sync super.onMount may have already errored the
-                // subscription (mapState throw). Do not complete mount / deliver onUpdate
-                // before the post-subscribe rethrow — that ordered onUpdate before failed cleanup.
-                if (syncSubscribeError !== null) {
-                  return;
-                }
-                this.completeConnectMount();
-                return;
-              }
-
-              pendingMountResult = Promise.resolve(mountResult as Promise<void>).then(() => {
-                if (this.__connectMountGeneration !== mountGeneration) {
-                  return;
-                }
-                if (syncSubscribeError !== null) {
-                  this.disposeConnectSubscription();
-                  this.__connectPendingUpdate = false;
-                  throw syncSubscribeError;
-                }
-                this.completeConnectMount();
-              }, (error: unknown) => {
-                if (this.__connectMountGeneration !== mountGeneration) {
-                  throw error;
-                }
-                this.disposeConnectSubscription();
-                this.__connectPendingUpdate = false;
-                throw error;
-              });
               return;
             }
 
@@ -686,9 +672,15 @@ function buildConnectHoc<S, P, R, A extends Action> (
             // The component keeps last mapped props; callers should treat mapper throws as bugs.
           },
           complete: () => {
-            // store.destroy() completes select(); mark dead so later reconcile skips getState().
-            this.__connectStoreDestroyed = true;
-            this.__connectSubscription = null;
+            // Destroyed store (or any completed-without-next select): BehaviorSubject.complete()
+            // means new subscribers get complete only — no first `next`. Without this, connect
+            // would return successfully, skip user onMount, and leave GraphRuntime ACTIVE.
+            if (this.__connectFirstPass || !this.__connectMountCompleted) {
+              syncSubscribeError = new Error(
+                '[Effectable.connect] Store select completed before the first state emission ' +
+                '(store may have been destroyed).'
+              );
+            }
           },
         });
 
@@ -699,24 +691,72 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this.__connectSubscription = subscription;
           if (
             this.__connectTornDown ||
-            syncFirstPassError !== null ||
             syncSubscribeError !== null
           ) {
             this.disposeConnectSubscription();
           }
         }
 
-        if (syncFirstPassError !== null) {
-          throw syncFirstPassError;
-        }
-
         if (syncSubscribeError !== null) {
           throw syncSubscribeError;
         }
 
-        if (pendingMountResult !== null) {
-          return pendingMountResult;
+        // Nested remount during subscribe owns the instance — do not run this mount's onMount.
+        if (this.__connectMountGeneration !== mountGeneration) {
+          return;
         }
+
+        if (!hasSuperOnMount) {
+          this.completeConnectMount();
+          return;
+        }
+
+        let mountResult: void | Promise<void>;
+        try {
+          mountResult = (superOnMount as () => void | Promise<void>).call(this);
+        } catch (error: unknown) {
+          this.disposeConnectSubscription();
+          throw error;
+        }
+
+        // Nested remount during user onMount owns the instance.
+        if (this.__connectMountGeneration !== mountGeneration) {
+          return;
+        }
+
+        // Nested store emit during sync super.onMount may have errored the subscription.
+        if (syncSubscribeError !== null) {
+          this.disposeConnectSubscription();
+          if (isPromiseLike(mountResult)) {
+            // Suppress orphan rejection — caller receives the syncSubscribeError throw instead.
+            void Promise.resolve(mountResult as Promise<void>).then(() => undefined, () => undefined);
+          }
+          throw syncSubscribeError;
+        }
+
+        if (!isPromiseLike(mountResult)) {
+          this.completeConnectMount();
+          return;
+        }
+
+        return Promise.resolve(mountResult as Promise<void>).then(() => {
+          if (this.__connectMountGeneration !== mountGeneration) {
+            return;
+          }
+          if (syncSubscribeError !== null) {
+            this.disposeConnectSubscription();
+            this.__connectPendingUpdate = false;
+            throw syncSubscribeError;
+          }
+          this.completeConnectMount();
+        }, (error: unknown) => {
+          if (this.__connectMountGeneration !== mountGeneration) {
+            throw error;
+          }
+          this.disposeConnectSubscription();
+          this.__connectPendingUpdate = false;
+          throw error;
+        });
       }
 
       /**
