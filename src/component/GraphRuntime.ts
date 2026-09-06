@@ -1583,6 +1583,29 @@ export class GraphRuntime {
   public async unmount (options?: { rejectOnCleanupError?: boolean }): Promise<void> {
     const rejectOnCleanupError = options?.rejectOnCleanupError === true;
 
+    // Reentrant unmount MUST be handled before joining cachedUnmountPromise.
+    // Otherwise a second await from onMount/onUpdate (sibling PLACE after the first
+    // child already scheduled deferred teardown, or a retry after catch) joins that
+    // promise while the current op is still running — classic queue deadlock:
+    // current op waits on lifecycle, lifecycle waits on the deferred unmount.
+    if (this.operationAsyncContext.getStore() === true) {
+      if (this.state === RUNTIME_STATE.UNMOUNTED) {
+        return;
+      }
+      if (this.state !== RUNTIME_STATE.FAILED && this.state !== RUNTIME_STATE.UNMOUNTING) {
+        this.state = RUNTIME_STATE.UNMOUNTING;
+      }
+      if (this.cachedUnmountPromise === null) {
+        this.cachedUnmountPromise = this.enqueueOperationUnchecked(async () => {
+          await this.runUnmountOperation(rejectOnCleanupError);
+        });
+      }
+      throw new Error(
+        '[Effectable] GraphRuntime: unmount cannot be awaited from inside an in-flight ' +
+          'graph operation (e.g. onMount/onUpdate); teardown was scheduled on the operation queue.',
+      );
+    }
+
     // If unmount is in progress, return the cached promise (HOLE 1)
     // Must check BEFORE the UNMOUNTED early-return so concurrent callers join the in-flight unmount
     if (this.cachedUnmountPromise !== null) {
@@ -1598,19 +1621,6 @@ export class GraphRuntime {
     // If already FAILED, stay FAILED until unmount completes
     if (this.state !== RUNTIME_STATE.FAILED) {
       this.state = RUNTIME_STATE.UNMOUNTING;
-    }
-
-    // Reentrant unmount from onMount/onUpdate: schedule teardown on the queue (so the
-    // current op's while-loop runs it next) but reject the awaiter — awaiting the cached
-    // promise here would deadlock. External callers still join via cachedUnmountPromise.
-    if (this.operationAsyncContext.getStore() === true) {
-      this.cachedUnmountPromise = this.enqueueOperationUnchecked(async () => {
-        await this.runUnmountOperation(rejectOnCleanupError);
-      });
-      throw new Error(
-        '[Effectable] GraphRuntime: unmount cannot be awaited from inside an in-flight ' +
-          'graph operation (e.g. onMount/onUpdate); teardown was scheduled on the operation queue.',
-      );
     }
 
     // Create and cache the unmount promise
