@@ -39,8 +39,7 @@ describe('connect mapStateToProps thenable rejection', () => {
 
     const Connected = connect(
       store,
-      // Cast: production typings forbid async mappers; runtime must still reject them.
-      (async (s: State) => ({ n: s.n })) as (s: State) => { n: number },
+      async (s: State) => ({ n: s.n }),
     )(Gate);
 
     await expect(GraphRuntime.mount(h(Connected, {}))).rejects.toThrow(
@@ -72,7 +71,7 @@ describe('connect mapStateToProps thenable rejection', () => {
 
     const Connected = connect(
       store,
-      (() => thenable) as (s: State) => { n: number },
+      () => thenable,
     )(Gate);
 
     await expect(GraphRuntime.mount(h(Connected, {}))).rejects.toThrow(
