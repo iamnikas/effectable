@@ -239,7 +239,11 @@ function buildNode (
 
     if (isPlainObject(value)) {
       const keys = Object.keys(value);
-      const keysOut: Record<string, SemanticJsonNode> = {};
+      // Null-prototype bag: `keysOut[key] =` on a normal `{}` invokes the
+      // `__proto__` setter when `key === '__proto__'`, replacing [[Prototype]]
+      // with the child node, dropping the key from Object.keys, and leaking
+      // inherited fields (e.g. `keys.kind`) onto the bag.
+      const keysOut: Record<string, SemanticJsonNode> = Object.create(null);
       const limit = options.maxKeysPerObject;
       let processed = 0;
       for (let i = 0; i < keys.length; i++) {
