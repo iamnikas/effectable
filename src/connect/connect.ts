@@ -13,7 +13,8 @@
  * - Class-field `onMount` / `onUnmount` (own instance properties) still go through connect wiring
  *   and do not shadow store subscribe / unsubscribe.
  * - Subclass-of-Connected prototype `override onMount` / `onUnmount` still run after wiring
- *   (own Connected hooks shadow Ext.prototype for GraphRuntime entry; connect re-resolves them).
+ *   (own Connected hooks shadow Ext.prototype for GraphRuntime entry; connect re-resolves them),
+ *   including when the wrapped base used a class-field lifecycle hook (must not win over Ext).
  *   Own-entry `this.onMount()` remount works during user hooks; subclass `super.onMount()` is a
  *   sync no-op while wiring is active (avoids double-subscribe without blocking remount).
  * - `mapStateToProps` subscribe failures fail the mount; mapDispatch-only hosts still get the
@@ -128,18 +129,25 @@ function isStoreLike (value: unknown): boolean {
  * Resolves the user `onMount` / `onUnmount` connect should invoke after its own wiring.
  *
  * Order:
- * 1. Own class-field hook captured in the Connected constructor (`ownCaptured`)
- * 2. Nearest prototype-own hook on the instance chain below `connectedProto`
- *    (so `class Ext extends Connected { override onMount() {…} }` is found)
- * 3. Hook on the wrapped constructor prototype (`wrappedProto`)
+ * 1. Own class-field captured via CONNECT_REBIND (`ownCapturedFromSubclass`)
+ *    — most specific own property on a subclass-of-Connected instance
+ * 2. Nearest prototype-own hook on the chain *above* `connectedProto`
+ *    (e.g. `class Ext extends Connected { override onMount() }`, or an intermediate Mid)
+ * 3. Own class-field captured in the Connected constructor from the wrapped base
+ * 4. Prototype-own hooks *below* `connectedProto`, then the wrapped constructor prototype
  *
  * Connected installs own lifecycle properties that shadow subclass prototype methods for
- * GraphRuntime entry; without (2), those overrides are skipped while store wiring still runs.
+ * GraphRuntime entry; without (2), Ext.prototype overrides are skipped while store wiring
+ * still runs. (2) must precede (3): a wrapped base class-field in `ownCaptured` would
+ * otherwise permanently hide Ext.prototype (#93 left that gap). (1) must precede (2):
+ * preferring every above-Connected prototype over any ownCaptured makes an intermediate
+ * Mid.prototype beat Ext's class-field (CONNECT_REBIND capture).
  *
  * @param {object} instance - connected instance
  * @param {'onMount' | 'onUnmount'} hookName - lifecycle hook name
- * @param {(() => void | Promise<void>) | null} ownCaptured - class-field hook captured at construct time
- * @param {object} connectedProto - `Connected.prototype` (skipped while walking)
+ * @param {(() => void | Promise<void>) | null} ownCaptured - class-field hook captured at construct / rebind
+ * @param {boolean} ownCapturedFromSubclass - true when `ownCaptured` came from CONNECT_REBIND
+ * @param {object} connectedProto - `Connected.prototype` (boundary for subclass vs wrapped walks)
  * @param {object} wrappedProto - wrapped component `Constructor.prototype`
  * @returns {(() => void | Promise<void>) | null} user hook, or null if none
  */
@@ -147,19 +155,35 @@ function resolveUserConnectLifecycleHook (
   instance: object,
   hookName: 'onMount' | 'onUnmount',
   ownCaptured: (() => void | Promise<void>) | null,
+  ownCapturedFromSubclass: boolean,
   connectedProto: object,
   wrappedProto: object
 ): (() => void | Promise<void>) | null {
+  // Subclass-of-Connected class-field (CONNECT_REBIND) beats Mid/Ext.prototype.
+  if (ownCaptured !== null && ownCapturedFromSubclass) {
+    return ownCaptured;
+  }
+
+  // Subclass-of-Connected prototype overrides beat a captured wrapped class-field.
+  let proto: object | null = Object.getPrototypeOf(instance) as object | null;
+  while (proto !== null && proto !== Object.prototype && proto !== connectedProto) {
+    if (Object.prototype.hasOwnProperty.call(proto, hookName)) {
+      const hook = (proto as Record<string, unknown>)[hookName];
+      if (typeof hook === 'function') {
+        return hook as () => void | Promise<void>;
+      }
+    }
+    proto = Object.getPrototypeOf(proto) as object | null;
+  }
+
   if (ownCaptured !== null) {
     return ownCaptured;
   }
 
-  let proto: object | null = Object.getPrototypeOf(instance) as object | null;
+  // Wrapped base prototype hooks (and further ancestors below Connected.prototype).
+  proto = Object.getPrototypeOf(connectedProto) as object | null;
   while (proto !== null && proto !== Object.prototype) {
-    if (
-      proto !== connectedProto &&
-      Object.prototype.hasOwnProperty.call(proto, hookName)
-    ) {
+    if (Object.prototype.hasOwnProperty.call(proto, hookName)) {
       const hook = (proto as Record<string, unknown>)[hookName];
       if (typeof hook === 'function') {
         return hook as () => void | Promise<void>;
@@ -384,6 +408,12 @@ function buildConnectHoc<S, P, R, A extends Action> (
       private __connectOwnOnMount: (() => void | Promise<void>) | null = null;
       private __connectOwnOnUnmount: (() => void | Promise<void>) | null = null;
       /**
+       * True when the corresponding `__connectOwnOn*` capture came from CONNECT_REBIND
+       * (subclass-of-Connected class field), not from the Connected constructor (wrapped base).
+       */
+      private __connectOwnOnMountFromSubclass = false;
+      private __connectOwnOnUnmountFromSubclass = false;
+      /**
        * True while Connected mount wiring is on the stack. Makes subclass
        * `super.onMount()` (Connected.prototype) a safe no-op. Own-entry
        * `this.onMount()` / GraphRuntime still remount via `__connectEntryOnMount`.
@@ -420,9 +450,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
         // Capture BaseCtor fields here, then reinstall Connected wiring. Subclass-of-Connected
         // class fields initialize *after* this constructor and can overwrite the wiring again;
         // GraphRuntime calls CONNECT_REBIND_LIFECYCLE post-construct to re-capture those.
-        this.installConnectLifecycleHooks();
+        this.installConnectLifecycleHooks(false);
         (this as unknown as Record<symbol, unknown>)[CONNECT_REBIND_LIFECYCLE] = () => {
-          this.installConnectLifecycleHooks();
+          this.installConnectLifecycleHooks(true);
         };
       }
 
@@ -433,9 +463,11 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * Safe to call from the Connected constructor (BaseCtor class fields) and again
        * after full construction (subclass-of-Connected class fields).
        *
+       * @param {boolean} fromSubclassRebind - true when invoked via CONNECT_REBIND after
+       *   subclass construction (marks captures as subclass-origin for resolve order)
        * @returns {void}
        */
-      private installConnectLifecycleHooks (): void {
+      private installConnectLifecycleHooks (fromSubclassRebind: boolean): void {
         const self = this as {
           onMount?: unknown;
           onUnmount?: unknown;
@@ -451,6 +483,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
           self.onMount !== entryMount
         ) {
           this.__connectOwnOnMount = self.onMount as () => void | Promise<void>;
+          this.__connectOwnOnMountFromSubclass = fromSubclassRebind;
         }
         if (
           Object.prototype.hasOwnProperty.call(this, 'onUnmount') &&
@@ -459,6 +492,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
           self.onUnmount !== entryUnmount
         ) {
           this.__connectOwnOnUnmount = self.onUnmount as () => void | Promise<void>;
+          this.__connectOwnOnUnmountFromSubclass = fromSubclassRebind;
         }
         self.onMount = entryMount;
         self.onUnmount = entryUnmount;
@@ -509,6 +543,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this,
           hookName,
           hookName === 'onMount' ? this.__connectOwnOnMount : this.__connectOwnOnUnmount,
+          hookName === 'onMount'
+            ? this.__connectOwnOnMountFromSubclass
+            : this.__connectOwnOnUnmountFromSubclass,
           Connected.prototype,
           Constructor.prototype as object
         );
@@ -858,6 +895,8 @@ function buildConnectHoc<S, P, R, A extends Action> (
        */
       public override onMount (): void | Promise<void> {
         // Subclass `super.onMount()` while Connected wiring is already on the stack.
+        // Remount via `this.onMount()` uses `__connectEntryOnMount` (#114); do not
+        // weaken this gate with a torn-down exception.
         if (this.__connectMountReentry) {
           return;
         }
