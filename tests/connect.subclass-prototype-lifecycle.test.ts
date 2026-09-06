@@ -194,4 +194,65 @@ describe('connect subclass-of-Connected prototype lifecycle', () => {
     expect(calls).toEqual(['base-field:n=0']);
     await rt.unmount();
   });
+
+  it('subclass class-field beats intermediate Connected-subclass prototype onMount', async () => {
+    const store = makeStore();
+    const calls: string[] = [];
+
+    class Base extends Component<Record<string, never>, { n?: number }> {
+      public override onMount = (): void => {
+        calls.push('base-field');
+      };
+    }
+
+    const Connected = connect(store, (s: S) => ({ n: s.n }))(Base);
+
+    class Mid extends Connected {
+      public override onMount (): void {
+        calls.push('mid-proto');
+      }
+    }
+
+    class Ext extends Mid {
+      public override onMount = (): void => {
+        calls.push(`ext-field:n=${String(this.props.n)}`);
+      };
+    }
+
+    const rt = await GraphRuntime.mount(h(Ext, {}));
+    expect(calls).toEqual(['ext-field:n=0']);
+    store.dispatch({ type: 'INC' });
+    await Promise.resolve();
+    expect((rt.getRootInstance() as InstanceType<typeof Ext>).props.n).toBe(1);
+    await rt.unmount();
+  });
+
+  it('subclass class-field beats intermediate Connected-subclass prototype onUnmount', async () => {
+    const store = makeStore();
+    const calls: string[] = [];
+
+    class Base extends Component<Record<string, never>, { n?: number }> {
+      public override onUnmount = (): void => {
+        calls.push('base-unmount-field');
+      };
+    }
+
+    const Connected = connect(store, (s: S) => ({ n: s.n }))(Base);
+
+    class Mid extends Connected {
+      public override onUnmount (): void {
+        calls.push('mid-unmount-proto');
+      }
+    }
+
+    class Ext extends Mid {
+      public override onUnmount = (): void => {
+        calls.push('ext-unmount-field');
+      };
+    }
+
+    const rt = await GraphRuntime.mount(h(Ext, {}));
+    await rt.unmount();
+    expect(calls).toEqual(['ext-unmount-field']);
+  });
 });
