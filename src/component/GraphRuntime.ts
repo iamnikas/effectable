@@ -1825,12 +1825,43 @@ export class GraphRuntime {
 
     if (isThenable(childrenRes)) {
       return childrenRes.then((nextChildren) => {
-        this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
+        try {
+          this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
+        } catch (error: unknown) {
+          // Children already PLACE/UPDATE/DELETE'd. A throwing commitRef leaves
+          // PLACE/REPLACE fibers unreachable from current.children — failStop cannot
+          // reclaim them. Tear them down before rethrowing (HOLE 3 sibling).
+          const orphanRes = this.destroyOrphanedPlacedChildren(
+            current.children as RuntimeFiber<unknown>[],
+            nextChildren,
+            error,
+          );
+          if (isThenable(orphanRes)) {
+            return orphanRes.then(() => {
+              throw error;
+            });
+          }
+          throw error;
+        }
         return current;
       });
     }
 
-    this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, childrenRes);
+    try {
+      this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, childrenRes);
+    } catch (error: unknown) {
+      const orphanRes = this.destroyOrphanedPlacedChildren(
+        current.children as RuntimeFiber<unknown>[],
+        childrenRes,
+        error,
+      );
+      if (isThenable(orphanRes)) {
+        return orphanRes.then(() => {
+          throw error;
+        });
+      }
+      throw error;
+    }
     return current;
   }
 
@@ -1935,6 +1966,88 @@ export class GraphRuntime {
     }
 
     return finishParent();
+  }
+
+  /**
+   * Destroys PLACE/REPLACE fibers in `nextChildren` that are not identity-in `currentChildren`.
+   * Used when child reconcile succeeded but a later step (e.g. ref commit in
+   * {@link applyFiberUpdate}) throws — those new fibers are not linked onto the parent
+   * yet, so fail-stop teardown of `currentRoot` cannot reach them.
+   *
+   * @param {RuntimeFiber<unknown>[]} currentChildren - parent children before apply
+   * @param {RuntimeFiber<unknown>[]} nextChildren - reconciled next children
+   * @param {unknown} primaryError - error to attach rollback failures onto
+   * @returns {void | Promise<void>}
+   */
+  private destroyOrphanedPlacedChildren (
+    currentChildren: RuntimeFiber<unknown>[],
+    nextChildren: RuntimeFiber<unknown>[],
+    primaryError: unknown,
+  ): void | Promise<void> {
+    const currentChildrenSet = new Set(currentChildren);
+    const rollbackErrors: Error[] = [];
+
+    const attachRollbackErrors = (): void => {
+      if (rollbackErrors.length === 0 || !(primaryError instanceof Error)) {
+        return;
+      }
+      const existing = (primaryError as Error & { rollbackErrors?: Error[] }).rollbackErrors;
+      (primaryError as Error & { rollbackErrors?: Error[] }).rollbackErrors =
+        existing !== undefined ? existing.concat(rollbackErrors) : rollbackErrors.slice();
+    };
+
+    for (let i = 0; i < nextChildren.length; i += 1) {
+      const child = nextChildren[i] as RuntimeFiber<unknown>;
+      if (currentChildrenSet.has(child)) {
+        continue;
+      }
+      try {
+        const destroyRes = this.destroyFiber(child, rollbackErrors);
+        if (isThenable(destroyRes)) {
+          return destroyRes.then(
+            async () => {
+              for (let j = i + 1; j < nextChildren.length; j += 1) {
+                const rest = nextChildren[j] as RuntimeFiber<unknown>;
+                if (currentChildrenSet.has(rest)) {
+                  continue;
+                }
+                try {
+                  const r = this.destroyFiber(rest, rollbackErrors);
+                  if (isThenable(r)) {
+                    await r;
+                  }
+                } catch (err: unknown) {
+                  rollbackErrors.push(err instanceof Error ? err : new Error(String(err)));
+                }
+              }
+              attachRollbackErrors();
+            },
+            async (err: unknown) => {
+              rollbackErrors.push(err instanceof Error ? err : new Error(String(err)));
+              for (let j = i + 1; j < nextChildren.length; j += 1) {
+                const rest = nextChildren[j] as RuntimeFiber<unknown>;
+                if (currentChildrenSet.has(rest)) {
+                  continue;
+                }
+                try {
+                  const r = this.destroyFiber(rest, rollbackErrors);
+                  if (isThenable(r)) {
+                    await r;
+                  }
+                } catch (inner: unknown) {
+                  rollbackErrors.push(inner instanceof Error ? inner : new Error(String(inner)));
+                }
+              }
+              attachRollbackErrors();
+            },
+          );
+        }
+      } catch (err: unknown) {
+        rollbackErrors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    attachRollbackErrors();
   }
 
   /**
