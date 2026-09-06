@@ -391,7 +391,7 @@ console.log(selector.recomputations()); // 1 or 2
 
 ### distinctUntilChanged
 
-The `select()` method automatically applies `distinctUntilChanged`:
+The `select()` method automatically applies `distinctUntilChanged` with `Object.is` equality (so a stable `NaN` result does not re-emit on every dispatch):
 
 ```typescript
 // Subscription will not fire if currentPath did not change

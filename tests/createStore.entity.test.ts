@@ -183,6 +183,49 @@ describe('createStore', () => {
       sub.unsubscribe();
       store.destroy();
     });
+
+    it('select does not re-emit a stable NaN across unrelated dispatches', () => {
+      interface DivState {
+        a: number;
+        b: number;
+        tick: number;
+      }
+      type DivAction =
+        | { type: 'SET_DIV0'; payload?: undefined }
+        | { type: 'TICK'; payload?: undefined };
+
+      const store = createStore<DivState, DivAction>(
+        (state, action) => {
+          if (action.type === 'SET_DIV0') {
+            return { ...state, a: 0, b: 0 };
+          }
+          if (action.type === 'TICK') {
+            return { ...state, tick: state.tick + 1 };
+          }
+          return state;
+        },
+        { a: 1, b: 1, tick: 0 },
+      );
+
+      let emissions = 0;
+      const sub = store.select((s) => {
+        return s.a / s.b;
+      }).subscribe((v) => {
+        emissions += 1;
+        // Subscriber-driven dispatch: with ===, NaN !== NaN re-enters forever.
+        if (Number.isNaN(v) && emissions < 50) {
+          store.dispatch({ type: 'TICK' });
+        }
+      });
+
+      store.dispatch({ type: 'SET_DIV0' });
+
+      // BehaviorSubject seed (1) + one NaN; further TICKs must be suppressed.
+      expect(emissions).toBe(2);
+
+      sub.unsubscribe();
+      store.destroy();
+    });
   });
 
   describe('action validation (B04)', () => {

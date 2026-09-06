@@ -155,7 +155,7 @@ export interface Store<S = any, A extends Action = Action> {
   /**
    * Universal method for applying selectors (RxJS extension)
    *
-   * Automatically applies distinctUntilChanged to avoid
+   * Automatically applies distinctUntilChanged (Object.is) to avoid
    * unnecessary emissions when the selector result is unchanged.
    *
    * @template T - Selector result type

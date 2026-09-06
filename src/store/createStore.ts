@@ -191,7 +191,8 @@ export function createStore<S, A extends Action> (
    * Universal select method for applying selectors
    *
    * Applies a selector function to each new state
-   * and automatically filters unchanged results via distinctUntilChanged.
+   * and automatically filters unchanged results via distinctUntilChanged
+   * with `Object.is` (so a stable `NaN` does not re-emit on every dispatch).
    *
    * @template T - Selector result type
    * @param selectorFn - Selector function
@@ -204,7 +205,10 @@ export function createStore<S, A extends Action> (
   const select = <T>(selectorFn: Selector<S, T>): Observable<T> => {
     return state$.pipe(
       map(selectorFn),
-      distinctUntilChanged()
+      // Default `===` treats NaN as always-changed (NaN !== NaN). Selectors that
+      // yield NaN (e.g. 0/0) would then re-emit on every state$ tick — including
+      // subscriber-driven dispatch — and loop until OOM / fail-stop.
+      distinctUntilChanged(Object.is)
     );
   };
 
