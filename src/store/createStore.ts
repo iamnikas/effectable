@@ -76,17 +76,23 @@ export function createStore<S, A extends Action> (
   let pendingDestroyComplete = false;
 
   /**
-   * Public state stream: replay committed `currentState` on subscribe, then
-   * forward publishes. After destroy, new subscribers complete with no next
-   * (matches prior BehaviorSubject-after-complete contract used by connect).
+   * Public state stream: attach to the notification channel first, then replay
+   * committed `currentState`. Order matters — BehaviorSubject registered the
+   * observer before emitting `_value`, so a dispatch during that first emission
+   * still reached the same subscriber. Replaying before `notifications$.subscribe`
+   * dropped that update (#124 residual). After destroy, new subscribers complete
+   * with no next (connect destroyed-store contract).
    */
   const stateObservable$ = new Observable<S>((subscriber) => {
     if (isDestroyed) {
       subscriber.complete();
       return undefined;
     }
-    subscriber.next(currentState);
-    return notifications$.subscribe(subscriber);
+    const inner = notifications$.subscribe(subscriber);
+    if (!isDestroyed && !subscriber.closed) {
+      subscriber.next(currentState);
+    }
+    return inner;
   });
 
   /**
