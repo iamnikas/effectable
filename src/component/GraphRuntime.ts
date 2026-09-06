@@ -2068,6 +2068,9 @@ export class GraphRuntime {
    * @param {boolean} [deferLifecycle=false] - when true, REPLACE materialize wires buses but
    *   defers onMount until the sibling batch flush in {@link reconcileChildren} (same contract
    *   as PLACE). Root reconcile must leave this false — nothing else flushes the root.
+   * @param {RuntimeFiber<unknown>[]} [deferredDestroys] - sibling-batch collector; when provided
+   *   with deferLifecycle, REPLACE victims are destroyed after peer wiring (so onUnmount
+   *   publishes reach same-batch PLACE listeners).
    * @returns {Promise<RuntimeFiber<P>>}
    */
   private reconcileFiber<P>(
@@ -2076,6 +2079,7 @@ export class GraphRuntime {
     parentFiber: RuntimeFiber<unknown> | null,
     parentScope: ContextScope,
     deferLifecycle: boolean = false,
+    deferredDestroys?: RuntimeFiber<unknown>[],
   ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
     const sameType = current.vnode.type === nextVnode.type;
     const sameKey = (current.vnode.key ?? null) === (nextVnode.key ?? null);
@@ -2084,14 +2088,30 @@ export class GraphRuntime {
       return this.updateFiber(current, nextVnode, parentFiber, parentScope);
     }
 
-    // Type or key changed — destroy the old node, create a new one.
+    // Type or key changed — REPLACE.
+    //
+    // Sibling batches (deferLifecycle + deferredDestroys): materialize/wire the
+    // replacement first and postpone destroying the victim until after every peer
+    // in the batch has wired @On* handlers. Otherwise the victim's onUnmount
+    // publish is silently dropped by a not-yet-wired later PLACE listener (#108
+    // deferred replacement onMount only — not victim teardown).
+    //
+    // Root / non-batch REPLACE keeps destroy-then-materialize (unmount before mount).
+    if (deferLifecycle && deferredDestroys !== undefined) {
+      const materializeRes = this.materialize(nextVnode, parentFiber, parentScope, true);
+      const rememberVictim = (fiber: RuntimeFiber<P>): RuntimeFiber<P> => {
+        deferredDestroys.push(current as RuntimeFiber<unknown>);
+        return fiber;
+      };
+      if (isThenable(materializeRes)) {
+        return materializeRes.then(rememberVictim);
+      }
+      return rememberVictim(materializeRes as RuntimeFiber<P>);
+    }
+
     // Sync fast-path if both destroy and materialize completed synchronously.
     // Collect cleanup errors (ref clear / disposer) so a throwing finalize cannot
     // abort REPLACE and fail-stop the surviving tree — same best-effort contract as unmount.
-    //
-    // When deferLifecycle is set (child reconcile batch), REPLACE must not run onMount
-    // before later sibling buses are wired — otherwise a replaced publisher's mount-time
-    // publish is silently dropped by a not-yet-wired PLACE/REPLACE listener beside it.
     const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
     if (isThenable(destroyRes)) {
       return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle));
@@ -2635,6 +2655,8 @@ export class GraphRuntime {
     const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
     const nextChildren: RuntimeFiber<unknown>[] = [];
     let unkeyedIdx = 0;
+    // REPLACE victims whose onUnmount must wait until PLACE/REPLACE peers wire.
+    const deferredDestroys: RuntimeFiber<unknown>[] = [];
 
     try {
       if (hasKeyedCurrent) {
@@ -2672,6 +2694,7 @@ export class GraphRuntime {
                 parentFiber,
                 childScope,
                 true,
+              deferredDestroys,
               );
               nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
             } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
@@ -2684,6 +2707,7 @@ export class GraphRuntime {
                 parentFiber,
                 childScope,
                 true,
+              deferredDestroys,
               );
               nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
             } else {
@@ -2723,6 +2747,7 @@ export class GraphRuntime {
               parentFiber,
               childScope,
               true,
+              deferredDestroys,
             );
             nextChildren.push(isThenable(reconciledRes) ? await reconciledRes : reconciledRes);
           } else {
@@ -2745,6 +2770,15 @@ export class GraphRuntime {
         }
       }
 
+      // Destroy REPLACE victims only after peers wired — so onUnmount publishes
+      // reach same-batch PLACE @On* listeners (mirrors #108 onMount deferral).
+      for (const victim of deferredDestroys) {
+        const d = this.destroyFiber(victim, []);
+        if (isThenable(d)) {
+          await d;
+        }
+      }
+
       // Flush PLACE/REPLACE startups in compose order after every new sibling is wired.
       for (const child of nextChildren) {
         if (child.constructionJournal?.lifecycleDeferred === true) {
@@ -2760,7 +2794,19 @@ export class GraphRuntime {
       // HOLE 3: On throw, clean up new fibers in nextChildren
       // that are NOT identity-in currentChildren (PLACE/REPLACE results).
       // Do not destroy UPDATE siblings (same object as current child).
+      // Also destroy REPLACE victims whose teardown was deferred past peer wiring.
       const rollbackErrors: Error[] = [];
+
+      for (const victim of deferredDestroys) {
+        try {
+          const d = this.destroyFiber(victim, rollbackErrors);
+          if (isThenable(d)) {
+            await d;
+          }
+        } catch (err: unknown) {
+          rollbackErrors.push(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
 
       for (const child of nextChildren) {
         // Skip if this fiber is identity-in currentChildren (UPDATE, not PLACE/REPLACE)
