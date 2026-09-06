@@ -2610,6 +2610,22 @@ export class GraphRuntime {
     parentFiber: RuntimeFiber<unknown> | null,
     parentScope: ContextScope,
   ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    // Free exclusive Command/Query slots on the victim subtree before the replacement
+    // wires the same types (#173). Sibling REPLACE already does this when deferLifecycle
+    // is set; root REPLACE must match. Keep @OnEvent until destroy — victim onUnmount
+    // publishes after the replacement is wired (publisher need not stay subscribed).
+    if (this.effectableRuntimeBuses !== null) {
+      try {
+        this.releaseExclusiveRuntimeBusHandlersSubtree(
+          current as RuntimeFiber<unknown>,
+          this.effectableRuntimeBuses,
+        );
+      } catch {
+        // Best-effort: a throwing unregister must not block root REPLACE handoff.
+        // destroyFiber still runs the full bus disposer later.
+      }
+    }
+
     const afterMaterialize = (
       nextFiber: RuntimeFiber<P>,
     ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
