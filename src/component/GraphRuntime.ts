@@ -2234,7 +2234,8 @@ export class GraphRuntime {
 
   /**
    * Updates an existing fiber: applies new props to the instance,
-   * calls onUpdate, recursively diffs children.
+   * recursively diffs children (wiring PLACE @On* handlers), then calls onUpdate
+   * so publishes reach newly composed own children.
    *
    * @param {RuntimeFiber<P>} current - current fiber
    * @param {VirtualServiceNode<P>} nextVnode - new virtual node
@@ -2287,21 +2288,14 @@ export class GraphRuntime {
     // Build scope for child nodes (ContextProvider may have updated values)
     const childScope = this.buildChildScope(instance, parentScope);
 
-    // Call onUpdate if props or context changed (React 16.5 class-component style: one hook)
+    // Props/context already applied so compose() sees the new inputs. Defer onUpdate
+    // until AFTER child reconcile: PLACE children wire @On* during materialize, and an
+    // onUpdate publish must reach newly composed own children (same contract as
+    // sibling UPDATE→PLACE deferral). Calling onUpdate before reconcileChildren
+    // silently drops those events.
     const propsChanged = prevProps !== instance.props;
-    if ((propsChanged || contextChanged) && current.engine.canUpdate()) {
-      try {
-        instance.onUpdate(prevProps, instance.props);
-      } catch (error: unknown) {
-        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
-        if (isThenable(cleanupResult)) {
-          return cleanupResult.then(() => {
-            throw error;
-          });
-        }
-        throw error;
-      }
-    }
+    const shouldCallOnUpdate =
+      (propsChanged || contextChanged) && current.engine.canUpdate();
 
     // Reconcile child nodes (sync fast-path if all children are sync).
     // Ref commit is deferred to applyFiberUpdate so a compose()/child-reconcile
@@ -2327,46 +2321,56 @@ export class GraphRuntime {
       childScope,
     );
 
-    if (isThenable(childrenRes)) {
-      return childrenRes.then((nextChildren) => {
+    /**
+     * After children are reconciled (buses wired for PLACE), commit the fiber update
+     * then run onUpdate so publishes reach newly composed own @On* children.
+     *
+     * @param {RuntimeFiber<unknown>[]} nextChildren - reconciled children
+     * @returns {RuntimeFiber<P> | Promise<RuntimeFiber<P>>}
+     */
+    const commitAndNotify = (
+      nextChildren: RuntimeFiber<unknown>[],
+    ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
+      try {
+        this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
+      } catch (error: unknown) {
+        // Children already PLACE/UPDATE/DELETE'd. A throwing commitRef leaves
+        // PLACE/REPLACE fibers unreachable from current.children — failStop cannot
+        // reclaim them. Tear them down before rethrowing (HOLE 3 sibling).
+        const orphanRes = this.destroyOrphanedPlacedChildren(
+          current.children as RuntimeFiber<unknown>[],
+          nextChildren,
+          error,
+        );
+        if (isThenable(orphanRes)) {
+          return orphanRes.then(() => {
+            throw error;
+          });
+        }
+        throw error;
+      }
+
+      if (shouldCallOnUpdate) {
         try {
-          this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
+          instance.onUpdate(prevProps, instance.props);
         } catch (error: unknown) {
-          // Children already PLACE/UPDATE/DELETE'd. A throwing commitRef leaves
-          // PLACE/REPLACE fibers unreachable from current.children — failStop cannot
-          // reclaim them. Tear them down before rethrowing (HOLE 3 sibling).
-          const orphanRes = this.destroyOrphanedPlacedChildren(
-            current.children as RuntimeFiber<unknown>[],
-            nextChildren,
-            error,
-          );
-          if (isThenable(orphanRes)) {
-            return orphanRes.then(() => {
+          const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
+          if (isThenable(cleanupResult)) {
+            return cleanupResult.then(() => {
               throw error;
             });
           }
           throw error;
         }
-        return current;
-      });
+      }
+      return current;
+    };
+
+    if (isThenable(childrenRes)) {
+      return childrenRes.then((nextChildren) => commitAndNotify(nextChildren));
     }
 
-    try {
-      this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, childrenRes);
-    } catch (error: unknown) {
-      const orphanRes = this.destroyOrphanedPlacedChildren(
-        current.children as RuntimeFiber<unknown>[],
-        childrenRes,
-        error,
-      );
-      if (isThenable(orphanRes)) {
-        return orphanRes.then(() => {
-          throw error;
-        });
-      }
-      throw error;
-    }
-    return current;
+    return commitAndNotify(childrenRes);
   }
 
   /**
