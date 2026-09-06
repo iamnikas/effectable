@@ -62,8 +62,10 @@ describe('GraphRuntime materialize commitRef zombie ref', () => {
 
     // Setter already wrote the instance before throwing; rollback must clear it.
     expect(stored).toBeNull();
-    // Child was materialized then rolled back.
-    expect(Leaf.mountCount).toBe(1);
-    expect(Leaf.unmountCount).toBe(1);
+    // Children materialize with deferLifecycle=true, so onMount has not run yet when
+    // parent commitRef throws. Rollback still destroys the deferred subtree without
+    // ever invoking Leaf.onMount — mount/unmount counters stay at 0.
+    expect(Leaf.mountCount).toBe(0);
+    expect(Leaf.unmountCount).toBe(0);
   });
 });
