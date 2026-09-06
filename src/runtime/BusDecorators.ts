@@ -220,11 +220,46 @@ export function instanceUsesRuntimeBusDecorators (instance: object): boolean {
 }
 
 /**
- * Unregisters only exclusive `@OnCommand` / `@OnQuery` handlers for an instance.
+ * Collects exclusive `@OnCommand` / `@OnQuery` type strings declared on a
+ * component constructor chain (used to free only slots a PLACE/REPLACE needs).
  *
- * Used when an orphan must release exclusive bus slots before a same-batch PLACE
- * registers the same types, while leaving `@OnEvent` subscriptions intact so a
- * deferred sibling UPDATE can still publish into the orphan before destroy.
+ * @param {unknown} componentType - vnode `type` (component constructor or other)
+ * @returns {{ commandTypes: Set<string>; queryTypes: Set<string> }} declared exclusive types
+ */
+export function collectExclusiveHandlerTypesFromType (componentType: unknown): {
+  commandTypes: Set<string>;
+  queryTypes: Set<string>;
+} {
+  const commandTypes = new Set<string>();
+  const queryTypes = new Set<string>();
+
+  if (typeof componentType !== 'function') {
+    return { commandTypes, queryTypes };
+  }
+
+  for (const ctor of getConstructorChainLeafFirst(componentType)) {
+    for (const { type } of getHandlerEntries(ctor, ON_COMMAND_ENTRIES)) {
+      commandTypes.add(type);
+    }
+    for (const { type } of getHandlerEntries(ctor, ON_QUERY_ENTRIES)) {
+      queryTypes.add(type);
+    }
+  }
+
+  return { commandTypes, queryTypes };
+}
+
+/**
+ * Unregisters exclusive `@OnCommand` / `@OnQuery` handlers for an instance.
+ *
+ * Used when an orphan must release exclusive bus slots before a same-batch
+ * PLACE/REPLACE registers the same types, while leaving `@OnEvent` subscriptions
+ * intact so a deferred sibling UPDATE can still publish into the orphan before destroy.
+ *
+ * When `onlyTypes` is provided, only those command/query types are unregistered.
+ * Callers should pass the incoming vnode's declared exclusive types so orphans that
+ * are not conflicting with a PLACE keep their handlers through deferred UPDATEs
+ * (UPDATE `execute`/`query` handoff before orphan destroy).
  *
  * The instance's full {@link wireRuntimeBuses} disposer remains valid: later
  * unregister teardown is idempotent once types are cleared.
@@ -234,6 +269,8 @@ export function instanceUsesRuntimeBusDecorators (instance: object): boolean {
  * @template TEvent
  * @param {object} instance - wired component instance
  * @param {RuntimeBusesBundle<TCommand, TQuery, TEvent>} buses - runtime bus bundle
+ * @param {{ commandTypes?: ReadonlySet<string>; queryTypes?: ReadonlySet<string> }} [onlyTypes]
+ *   optional filter; omit to release every exclusive type declared on the instance
  * @returns {void}
  */
 export function releaseExclusiveRuntimeBusHandlers<
@@ -243,6 +280,10 @@ export function releaseExclusiveRuntimeBusHandlers<
 > (
   instance: object,
   buses: RuntimeBusesBundle<TCommand, TQuery, TEvent>,
+  onlyTypes?: {
+    commandTypes?: ReadonlySet<string>;
+    queryTypes?: ReadonlySet<string>;
+  },
 ): void {
   const leafCtor = instance.constructor as Function;
   const commandTypes = new Set<string>();
@@ -250,10 +291,20 @@ export function releaseExclusiveRuntimeBusHandlers<
 
   for (const ctor of getConstructorChainLeafFirst(leafCtor)) {
     for (const { type } of getHandlerEntries(ctor, ON_COMMAND_ENTRIES)) {
-      commandTypes.add(type);
+      if (
+        onlyTypes?.commandTypes === undefined ||
+        onlyTypes.commandTypes.has(type)
+      ) {
+        commandTypes.add(type);
+      }
     }
     for (const { type } of getHandlerEntries(ctor, ON_QUERY_ENTRIES)) {
-      queryTypes.add(type);
+      if (
+        onlyTypes?.queryTypes === undefined ||
+        onlyTypes.queryTypes.has(type)
+      ) {
+        queryTypes.add(type);
+      }
     }
   }
 

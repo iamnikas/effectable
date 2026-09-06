@@ -66,6 +66,7 @@ import type {
 } from '../runtime/types';
 import type { RuntimeBusesBundle } from '../runtime/BusDecorators';
 import {
+  collectExclusiveHandlerTypesFromType,
   releaseExclusiveRuntimeBusHandlers,
   wireRuntimeBusesIfDecorated,
 } from '../runtime/BusDecorators';
@@ -434,11 +435,17 @@ export class GraphRuntime {
    *
    * @param {RuntimeFiber<unknown>} fiber - orphan root (or any subtree root)
    * @param {RuntimeBusesBundle<RuntimeCommand, RuntimeQuery, RuntimeEvent>} buses - runtime buses
+   * @param {{ commandTypes?: ReadonlySet<string>; queryTypes?: ReadonlySet<string> }} [onlyTypes]
+   *   optional filter of types an incoming PLACE/REPLACE will claim (#178)
    * @returns {void}
    */
   private releaseExclusiveRuntimeBusHandlersSubtree (
     fiber: RuntimeFiber<unknown>,
     buses: NonNullable<GraphRuntime['effectableRuntimeBuses']>,
+    onlyTypes?: {
+      commandTypes?: ReadonlySet<string>;
+      queryTypes?: ReadonlySet<string>;
+    },
   ): void {
     const children = fiber.children;
     for (let i = 0; i < children.length; i += 1) {
@@ -447,12 +454,13 @@ export class GraphRuntime {
         this.releaseExclusiveRuntimeBusHandlersSubtree(
           child as RuntimeFiber<unknown>,
           buses,
+          onlyTypes,
         );
       }
     }
     const instance = fiber.instance;
     if (instance !== null) {
-      releaseExclusiveRuntimeBusHandlers(instance, buses);
+      releaseExclusiveRuntimeBusHandlers(instance, buses, onlyTypes);
     }
   }
 
@@ -3295,23 +3303,45 @@ export class GraphRuntime {
     const nextChildren: RuntimeFiber<unknown>[] = [];
     let unkeyedIdx = 0;
 
-    // Release orphan exclusive Command/Query slots BEFORE any PLACE materialize.
-    // Those buses allow only one handler per type: PLACE `@OnCommand`/`@OnQuery` for a
-    // type still owned by a not-yet-destroyed orphan throws and fail-stops.
-    // Walk the orphan *subtree* — exclusive handlers often live on nested children under
-    // a keyed wrapper (#170). Keep `@OnEvent` subscriptions until destroy — deferred
-    // sibling UPDATE may still publish into the orphan before onUnmount (#158).
-    if (this.effectableRuntimeBuses !== null) {
+    // Orphans that will be unpaired after this full-diff. Exclusive Command/Query slots
+    // are released only when an incoming PLACE/REPLACE needs those types — not eagerly
+    // for every orphan. Eager release broke #158-style UPDATE→orphan `execute`/`query`
+    // handoff when no PLACE claimed the type (handler already gone before deferred UPDATE).
+    // Walk orphan *subtrees* (#170 nested exclusive under wrappers). `@OnEvent` stays
+    // until destroy either way (multi-subscriber; #158).
+    const fullDiffOrphans = this.collectFullDiffOrphans(
+      currentChildren,
+      nextVnodes,
+      hasKeyedCurrent,
+    );
+
+    /**
+     * Free orphan exclusive slots that `nextVnode` will register, right before PLACE/REPLACE
+     * materialize. No-op when the incoming type declares no exclusive handlers.
+     *
+     * @param {VirtualServiceNode<unknown>} nextVnode - incoming sibling vnode
+     * @returns {void}
+     */
+    const releaseOrphanExclusiveForIncoming = (
+      nextVnode: VirtualServiceNode<unknown>,
+    ): void => {
+      if (this.effectableRuntimeBuses === null) {
+        return;
+      }
+      const onlyTypes = collectExclusiveHandlerTypesFromType(nextVnode.type);
+      if (onlyTypes.commandTypes.size === 0 && onlyTypes.queryTypes.size === 0) {
+        return;
+      }
       const buses = this.effectableRuntimeBuses;
-      for (const orphan of this.collectFullDiffOrphans(currentChildren, nextVnodes, hasKeyedCurrent)) {
+      for (const orphan of fullDiffOrphans) {
         try {
-          this.releaseExclusiveRuntimeBusHandlersSubtree(orphan, buses);
+          this.releaseExclusiveRuntimeBusHandlersSubtree(orphan, buses, onlyTypes);
         } catch {
           // Best-effort: a throwing unregister must not skip remaining orphans or block PLACE.
           // destroyFiber still runs the full bus disposer later.
         }
       }
-    }
+    };
 
     // Pass-1 defers same-type UPDATE until after PLACE/REPLACE siblings are wired.
     // Otherwise UPDATE `onUpdate` can publish before a later PLACE sibling's `@On*`
@@ -3353,6 +3383,9 @@ export class GraphRuntime {
         return;
       }
 
+      // REPLACE materializes a new instance that may need exclusive slots still held
+      // by a same-batch orphan (victim destroy frees only the victim's own types).
+      releaseOrphanExclusiveForIncoming(nextVnode);
       const reconciledRes = this.reconcileFiber(
         currentFiber,
         nextVnode,
@@ -3405,7 +3438,9 @@ export class GraphRuntime {
                 nextVnode as VirtualServiceNode<unknown>,
               );
             } else {
-              // New node — PLACE: defer startup so later sibling buses wire first.
+              // New node — PLACE: free conflicting orphan exclusive slots, then materialize
+              // with deferred startup so later sibling buses wire first.
+              releaseOrphanExclusiveForIncoming(nextVnode as VirtualServiceNode<unknown>);
               const newRes = this.materialize(nextVnode, parentFiber, childScope, true);
               nextChildren.push(isThenable(newRes) ? await newRes : newRes);
             }
@@ -3435,7 +3470,9 @@ export class GraphRuntime {
               nextVnode as VirtualServiceNode<unknown>,
             );
           } else {
-            // New node — PLACE: defer startup so later sibling buses wire first.
+            // New node — PLACE: free conflicting orphan exclusive slots, then materialize
+            // with deferred startup so later sibling buses wire first.
+            releaseOrphanExclusiveForIncoming(nextVnode as VirtualServiceNode<unknown>);
             const newRes = this.materialize(nextVnode, parentFiber, childScope, true);
             nextChildren.push(isThenable(newRes) ? await newRes : newRes);
           }
