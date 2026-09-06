@@ -15,6 +15,7 @@ import {
   createStore,
   h,
 } from 'Effectable';
+import type { DispatchMethod } from 'Effectable';
 
 describe('connect nested mapDispatch factory side-effect', () => {
   type S = { n: number };
@@ -46,7 +47,7 @@ describe('connect nested mapDispatch factory side-effect', () => {
     const Connected = connect(
       store,
       (s: S) => ({ n: s.n }),
-      (dispatch: (a: A) => A) => {
+      (dispatch: DispatchMethod<A>) => {
         mapDispatchCalls += 1;
         dispatch({ type: 'TICK' });
         return { ping: () => dispatch({ type: 'TICK' }) };
@@ -76,7 +77,7 @@ describe('connect nested mapDispatch factory side-effect', () => {
     const ConnectedChild = connect(
       store,
       (s: S) => ({ n: s.n }),
-      (dispatch: (a: A) => A) => {
+      (dispatch: DispatchMethod<A>) => {
         mapDispatchCalls += 1;
         dispatch({ type: 'TICK' });
         return { ping: () => dispatch({ type: 'TICK' }) };
@@ -117,29 +118,42 @@ describe('connect nested mapDispatch factory side-effect', () => {
     let lastSeenId: number | undefined;
     const store = createStore(makeReducer(), { n: 0 });
 
-    class Child extends Component<
-      object,
-      { n?: number; id?: number; readId?: () => number | undefined; ping?: () => void }
-    > {
+    type ChildOwnProps = { id?: number };
+    type ChildProps = {
+      n?: number;
+      id?: number;
+      readId?: () => number | undefined;
+      ping?: () => void;
+    };
+
+    class Child extends Component<object, ChildProps> {
       public override compose () {
         return [];
       }
     }
 
+    function mapDispatchWithOwnProps (
+      dispatch: DispatchMethod<A>,
+      props: ChildOwnProps
+    ): Pick<ChildProps, 'readId' | 'ping'> {
+      lastSeenId = props.id;
+      return {
+        readId: () => lastSeenId,
+        ping: () => dispatch({ type: 'TICK' }),
+      };
+    }
+
     const ConnectedChild = connect(
       store,
       (s: S) => ({ n: s.n }),
-      (dispatch: (a: A) => A, props: { id?: number }) => {
-        lastSeenId = props.id;
-        return {
-          readId: () => lastSeenId,
-          ping: () => dispatch({ type: 'TICK' }),
-        };
-      },
+      mapDispatchWithOwnProps,
     )(Child);
 
     class Parent extends Component<{ id: number }, { n?: number }> {
-      public state: { id: number } = { id: 1 };
+      constructor (props: { n?: number }) {
+        super(props);
+        this.state = { id: 1 };
+      }
 
       public override compose () {
         return [h(ConnectedChild, { id: this.state.id })];
