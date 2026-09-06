@@ -436,6 +436,8 @@ function buildConnectHoc<S, P, R, A extends Action> (
 
       /**
        * Applies a new object from `mapStateToProps` as the current state-derived props.
+       * Non-object results (`null` / array / primitive) clear prior state-derived props so
+       * a live object→non-object transition cannot leave stale keys on `this.props`.
        *
        * @param {unknown} mapped
        * @returns {boolean} `true` if state-derived props actually updated
@@ -447,7 +449,14 @@ function buildConnectHoc<S, P, R, A extends Action> (
 
         const mappedProps = getMappedPropsRecord(mapped);
         if (mappedProps === null) {
-          return false;
+          this.__connectPrevMapped = mapped;
+          if (this.__connectStateProps === null) {
+            return false;
+          }
+
+          this.__connectStateProps = null;
+          this.rebuildConnectProps();
+          return true;
         }
 
         this.__connectPrevMapped = mapped;
@@ -594,7 +603,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
         // torn-down subscription or overwrite a newer remount's handle (leaking the new one).
         const subscription = store.select(selector).subscribe({
           next: (mapped: R) => {
-            this.applyMappedStateProps(mapped);
+            const statePropsChanged = this.applyMappedStateProps(mapped);
 
             if (this.__connectFirstPass) {
               this.__connectFirstPass = false;
@@ -649,7 +658,15 @@ function buildConnectHoc<S, P, R, A extends Action> (
             }
 
             if (!this.__connectMountCompleted) {
+              // Keep the pending bit even when this emission was a no-op clear of already-empty
+              // state props — a later emission may still need the post-mount flush.
               this.__connectPendingUpdate = true;
+              return;
+            }
+
+            // Skip spurious onUpdate when mapState re-emitted an unsupported shape that did
+            // not change props (already cleared). A successful clear still delivers.
+            if (!statePropsChanged) {
               return;
             }
 
