@@ -19,8 +19,9 @@
  *   materialization is buffered and applied after the mount/reconcile pass.
  * - UPDATE `commitRef` runs after successful compose and *before* child reconcile so
  *   same-pass PLACE `onMount` observes parent `nextRef` (mount path already commits before
- *   deferred onMount flush). Child-reconcile failure rolls the early commit back; compose
- *   failure never touches refs.
+ *   deferred onMount flush). Child-reconcile failure and root `onUpdate` failure (before
+ *   `applyFiberUpdate` publishes `nextRef` onto `fiber.vnode.ref`) roll the early commit
+ *   back; compose failure never touches refs.
  * - Failed cleanup is children-first and does not invoke a phantom parent `onUnmount`.
  * - Orphan DELETE finalize is best-effort so survivors are not fail-stopped for cleanup noise.
  *
@@ -3094,6 +3095,10 @@ export class GraphRuntime {
         try {
           instance.onUpdate(prevProps, instance.props);
         } catch (error: unknown) {
+          // Early commitRef already bound nextRef, but fiber.vnode.ref still names
+          // previousRef until applyFiberUpdate. Without rollback, fail-stop clears
+          // only previousRef and leaves a zombie nextRef (use-after-teardown).
+          rollbackEarlyRefCommit();
           const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
           if (isThenable(cleanupResult)) {
             return cleanupResult.then(() => {
@@ -3110,6 +3115,11 @@ export class GraphRuntime {
         // Children already PLACE/UPDATE/DELETE'd. A throwing applyFiberUpdate leaves
         // PLACE/REPLACE fibers unreachable from current.children — failStop cannot
         // reclaim them. Tear them down before rethrowing (HOLE 3 sibling).
+        // If vnode was not swapped yet, roll the early ref commit back the same way
+        // as an onUpdate failure; after swap, fail-stop clears nextRef via vnode.ref.
+        if (current.vnode !== nextVnode) {
+          rollbackEarlyRefCommit();
+        }
         const orphanRes = this.destroyOrphanedPlacedChildren(
           current.children as RuntimeFiber<unknown>[],
           nextChildren,
