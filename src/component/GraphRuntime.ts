@@ -3435,6 +3435,15 @@ export class GraphRuntime {
         nextChildren[pending.slot] = isThenable(updatedRes) ? await updatedRes : updatedRes;
       }
 
+      // Destroy REPLACE victims BEFORE orphan DELETE. Otherwise an orphan onUnmount
+      // publish dual-delivers to both still-wired victim and replacement. PLACE peers
+      // are already materialized (buses wired) at this point; later flushSiblingBatchHooks
+      // remains idempotent when victims are already cleared.
+      const victimsRes = this.flushPendingReplaceVictims(nextChildren);
+      if (isThenable(victimsRes)) {
+        await victimsRes;
+      }
+
       // Destroy orphans after UPDATEs (best-effort finalize errors). PLACE peers are
       // already wired, so onUnmount publishes still reach same-batch PLACE @On*.
       for (const orphan of pendingOrphans) {
@@ -3446,6 +3455,7 @@ export class GraphRuntime {
 
       // Deferred onUpdates first (so UPDATE publishes see wired PLACE @On*), then
       // PLACE/REPLACE startups in compose order after every new sibling is wired.
+      // REPLACE victims may already be cleared above (before orphan DELETE); idempotent.
       const batchFlush = this.flushSiblingBatchHooks(nextChildren);
       if (isThenable(batchFlush)) {
         await batchFlush;
