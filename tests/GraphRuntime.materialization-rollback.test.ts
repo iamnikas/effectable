@@ -218,6 +218,59 @@ describe('GraphRuntime materialization rollback (issue #12)', () => {
       expect(error).not.toBeNull();
       expect(testRef.current).toBeNull();
     });
+
+    it('REF-ASSIGN-THEN-THROW: setter that stores then throws still clears ref on mount rollback', async () => {
+      let stored: Component<Record<string, never>, Record<string, never>> | null = null;
+      const assignThenThrowRef: RefObject<Component<Record<string, never>, Record<string, never>>> = {
+        get current (): Component<Record<string, never>, Record<string, never>> | null {
+          return stored;
+        },
+        set current (next: Component<Record<string, never>, Record<string, never>> | null) {
+          stored = next;
+          if (next !== null) {
+            throw new Error('ref setter assign-then-throw');
+          }
+        },
+      };
+
+      class Leaf extends Component<Record<string, never>, Record<string, never>> {
+        public mountCount = 0;
+        public unmountCount = 0;
+
+        public override onMount (): void {
+          this.mountCount += 1;
+        }
+
+        public override onUnmount (): void {
+          this.unmountCount += 1;
+        }
+      }
+
+      let leaf: Leaf | null = null;
+
+      class TrackingLeaf extends Leaf {
+        public constructor (props: Record<string, never>) {
+          super(props);
+          leaf = this;
+        }
+      }
+
+      class Host extends Component<Record<string, never>, Record<string, never>> {
+        public override compose (): VirtualServiceNode[] {
+          return [h(TrackingLeaf)];
+        }
+      }
+
+      await expect(GraphRuntime.mount(h(Host, {}, assignThenThrowRef))).rejects.toThrow(
+        'ref setter assign-then-throw',
+      );
+
+      expect(stored).toBeNull();
+      expect(assignThenThrowRef.current).toBeNull();
+      expect(leaf).not.toBeNull();
+      expect(leaf!.mountCount).toBe(1);
+      expect(leaf!.unmountCount).toBe(1);
+    });
   });
 
   describe('bus wiring rollback', () => {
