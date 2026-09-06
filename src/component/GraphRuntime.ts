@@ -408,6 +408,36 @@ export class GraphRuntime {
   }
 
   /**
+   * Releases exclusive Command/Query registrations for `fiber` and every mounted
+   * descendant. Root-only release is not enough when `@OnCommand` / `@OnQuery` live
+   * on nested children under a keyed wrapper that is about to be orphaned.
+   * EventBus subscriptions are left intact (see exclusive pre-PLACE release below).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - orphan root (or any subtree root)
+   * @param {RuntimeBusesBundle<RuntimeCommand, RuntimeQuery, RuntimeEvent>} buses - runtime buses
+   * @returns {void}
+   */
+  private releaseExclusiveRuntimeBusHandlersSubtree (
+    fiber: RuntimeFiber<unknown>,
+    buses: NonNullable<GraphRuntime['effectableRuntimeBuses']>,
+  ): void {
+    const children = fiber.children;
+    for (let i = 0; i < children.length; i += 1) {
+      const child = children[i];
+      if (child !== undefined) {
+        this.releaseExclusiveRuntimeBusHandlersSubtree(
+          child as RuntimeFiber<unknown>,
+          buses,
+        );
+      }
+    }
+    const instance = fiber.instance;
+    if (instance !== null) {
+      releaseExclusiveRuntimeBusHandlers(instance, buses);
+    }
+  }
+
+  /**
    * Fibers that will be unpaired after the next-child match (full-diff orphans).
    * Pure: mirrors keyed/unkeyed matching without materializing or destroying.
    *
@@ -2970,18 +3000,14 @@ export class GraphRuntime {
     // Release orphan exclusive Command/Query slots BEFORE any PLACE materialize.
     // Those buses allow only one handler per type: PLACE `@OnCommand`/`@OnQuery` for a
     // type still owned by a not-yet-destroyed orphan throws and fail-stops.
-    // Keep `@OnEvent` subscriptions until destroy — deferred sibling UPDATE may still
-    // publish into the orphan before onUnmount (#158). EventBus is multi-subscriber, and
-    // orphan `onUnmount` publishes after PLACE wires without needing the orphan subscribed.
+    // Walk the orphan *subtree* — exclusive handlers often live on nested children under
+    // a keyed wrapper (#170). Keep `@OnEvent` subscriptions until destroy — deferred
+    // sibling UPDATE may still publish into the orphan before onUnmount (#158).
     if (this.effectableRuntimeBuses !== null) {
       const buses = this.effectableRuntimeBuses;
       for (const orphan of this.collectFullDiffOrphans(currentChildren, nextVnodes, hasKeyedCurrent)) {
-        const instance = orphan.instance;
-        if (instance === null) {
-          continue;
-        }
         try {
-          releaseExclusiveRuntimeBusHandlers(instance, buses);
+          this.releaseExclusiveRuntimeBusHandlersSubtree(orphan, buses);
         } catch {
           // Best-effort: a throwing unregister must not skip remaining orphans or block PLACE.
           // destroyFiber still runs the full bus disposer later.
