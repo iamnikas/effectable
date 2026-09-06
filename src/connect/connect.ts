@@ -234,10 +234,21 @@ function attachConnectStoreContext (
  *
  * @param {unknown} mapped - result of `mapStateToProps` or `mapDispatchToProps`
  * @returns {Record<string, unknown> | null} props dictionary, or `null` if the shape is unsupported
+ * @throws {Error} when `mapped` is a Promise/thenable (async mappers are not supported)
  */
 function getMappedPropsRecord (mapped: unknown): Record<string, unknown> | null {
   if (mapped === null || typeof mapped !== 'object' || Array.isArray(mapped)) {
     return null;
+  }
+
+  // Promises are objects, so without this check an `async` mapState (or any thenable)
+  // is treated as a props Record. Spreading/reading keys from a Promise yields no own
+  // mapped fields — mount succeeds with silent undefined state props.
+  if (isPromiseLike(mapped)) {
+    throw new Error(
+      '[Effectable.connect] mapStateToProps must return a plain object synchronously; '
+      + 'Promise/thenable results are not supported',
+    );
   }
 
   return mapped as Record<string, unknown>;
