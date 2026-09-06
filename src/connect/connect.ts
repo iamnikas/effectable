@@ -576,7 +576,17 @@ function buildConnectHoc<S, P, R, A extends Action> (
 
         const mappedProps = getMappedPropsRecord(mapped);
         if (mappedProps === null) {
-          return false;
+          // Non-object mapState results are ignored on first apply, but a later
+          // null/array/primitive must clear previously applied state props.
+          // Otherwise logout-style mappers leave revoked fields on this.props
+          // (remount already cleared via __connectStateProps = null; live emits did not).
+          this.__connectPrevMapped = mapped;
+          if (this.__connectStateProps === null) {
+            return false;
+          }
+          this.__connectStateProps = null;
+          this.rebuildConnectProps();
+          return true;
         }
 
         this.__connectPrevMapped = mapped;
