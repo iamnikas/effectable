@@ -183,6 +183,45 @@ describe('createStore', () => {
       sub.unsubscribe();
       store.destroy();
     });
+
+    it('select does not re-emit when the selector result stays NaN', () => {
+      type NanState = { v: number };
+      type NanAction = { type: 'TOUCH' };
+
+      const store = createStore<NanState, NanAction>(
+        (state = { v: Number.NaN }, action) => {
+          if (action.type === 'TOUCH') {
+            return { v: Number.NaN };
+          }
+
+          return state;
+        },
+        { v: Number.NaN },
+      );
+
+      let emits = 0;
+      let loopGuard = 0;
+      const sub = store.select((state) => {
+        return state.v;
+      }).subscribe((v) => {
+        emits += 1;
+        if (Number.isNaN(v)) {
+          loopGuard += 1;
+          if (loopGuard > 20) {
+            throw new Error('select NaN distinctUntilChanged infinite loop');
+          }
+          // Realistic: normalize / recover by dispatching when seeing NaN.
+          store.dispatch({ type: 'TOUCH' });
+        }
+      });
+
+      expect(emits).toBe(1);
+      store.dispatch({ type: 'TOUCH' });
+      expect(emits).toBe(1);
+
+      sub.unsubscribe();
+      store.destroy();
+    });
   });
 
   describe('action validation (B04)', () => {
