@@ -3081,9 +3081,11 @@ export class GraphRuntime {
     let unkeyedIdx = 0;
 
     // Release exclusive Command/Query slots BEFORE any PLACE materialize for:
-    // - orphans (REMOVE+PLACE; nested handlers under keyed wrappers too), and
-    // - REPLACE victims (matched key/position, type/key change) — PLACE siblings
-    //   earlier in compose order can run while the victim is still alive.
+    // - orphans (REMOVE+PLACE; root-only here — nested orphan walk is #170; type-scoped
+    //   release so UPDATE→orphan execute/query survives when no PLACE claims the type is #178), and
+    // - REPLACE victims (matched key/position, type/key change) — PLACE siblings earlier
+    //   in compose order can run while the victim is still alive. Victims are destroyed in
+    //   pass 1, so releasing their exclusive subtree cannot break pass-2 UPDATE handoff.
     // Those buses allow only one handler per type: PLACE `@OnCommand`/`@OnQuery` for a
     // type still owned by a not-yet-destroyed leaving fiber throws and fail-stops.
     // Keep `@OnEvent` subscriptions until destroy — deferred sibling UPDATE may still
@@ -3091,16 +3093,23 @@ export class GraphRuntime {
     // still reaches earlier PLACE `@OnEvent` peers. EventBus is multi-subscriber.
     if (this.effectableRuntimeBuses !== null) {
       const buses = this.effectableRuntimeBuses;
-      const leaving: RuntimeFiber<unknown>[] = [
-        ...this.collectFullDiffOrphans(currentChildren, nextVnodes, hasKeyedCurrent),
-        ...this.collectFullDiffReplaceVictims(currentChildren, nextVnodes, hasKeyedCurrent),
-      ];
-      for (const fiber of leaving) {
+      for (const orphan of this.collectFullDiffOrphans(currentChildren, nextVnodes, hasKeyedCurrent)) {
+        const instance = orphan.instance;
+        if (instance === null) {
+          continue;
+        }
         try {
-          this.releaseExclusiveRuntimeBusHandlersSubtree(fiber, buses);
+          releaseExclusiveRuntimeBusHandlers(instance, buses);
         } catch {
-          // Best-effort: a throwing unregister must not skip remaining fibers or block PLACE.
+          // Best-effort: a throwing unregister must not skip remaining orphans or block PLACE.
           // destroyFiber still runs the full bus disposer later.
+        }
+      }
+      for (const victim of this.collectFullDiffReplaceVictims(currentChildren, nextVnodes, hasKeyedCurrent)) {
+        try {
+          this.releaseExclusiveRuntimeBusHandlersSubtree(victim, buses);
+        } catch {
+          // Best-effort: same contract as orphan exclusive pre-release above.
         }
       }
     }
