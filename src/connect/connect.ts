@@ -430,6 +430,11 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this.applyMappedStateProps(
             mapStateToProps(store.getState(), this.__connectOwnProps as unknown as P)
           );
+        } else {
+          // mapDispatch-only / mapper-less hosts never read state while wiring.
+          // Touch getState so a destroyed store fails before compose/children
+          // (parity with the mapState path, which already calls getState here).
+          store.getState();
         }
       }
 
@@ -638,6 +643,21 @@ function buildConnectHoc<S, P, R, A extends Action> (
         const hasSuperOnMount = typeof superOnMount === 'function';
 
         if (mapStateToProps == null) {
+          // Destroyed-store guard (parity with mapState select complete-without-next / #87).
+          // Without this, GraphRuntime.mount succeeds for mapDispatch-only hosts and leaves
+          // an ACTIVE tree whose dispatch props throw on use; user onMount may already run.
+          try {
+            store.getState();
+          } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (/destroyed/i.test(message)) {
+              throw new Error(
+                '[Effectable.connect] Cannot mount connected component: store has been destroyed.'
+              );
+            }
+            throw error;
+          }
+
           /**
            * Completes the mapState-null mount path and, when dispatch props exist, schedules
            * the same post-mount compose rebuild as the mapState path.

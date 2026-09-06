@@ -1,9 +1,13 @@
 /**
- * Regression: connect(mapState) on a destroyed store must fail mount.
+ * Regression: connect on a destroyed store must fail mount.
  *
  * createStore.select() after destroy() completes with zero next emissions.
- * Connect used to treat that as a successful onMount (user onMount skipped,
- * GraphRuntime left ACTIVE) — a zombie tree.
+ * Connect(mapState) used to treat that as a successful onMount (user onMount
+ * skipped, GraphRuntime left ACTIVE) — a zombie tree.
+ *
+ * connect(null, mapDispatch) never called getState/select during wiring, so the
+ * same destroy-then-mount sequence used to leave an ACTIVE tree whose dispatch
+ * props throw on use (and user onMount already ran).
  *
  * @module Effectable/connect/destroyed-store-mount.test
  */
@@ -55,6 +59,44 @@ describe('connect: destroyed store mount', () => {
     await expect(
       GraphRuntime.mount(h(Connected, { adminToken: 'SECRET' })),
     ).rejects.toThrow(/completed before the first state emission|destroyed/i);
+
+    expect(userOnMountCalls).toBe(0);
+  });
+
+  it('rejects GraphRuntime.mount when mapDispatch-only store is already destroyed', async () => {
+    const store = createStore<State, TestAction>(
+      (state) => state,
+      { n: 1 },
+    );
+    store.destroy();
+
+    let userOnMountCalls = 0;
+
+    class Gate extends Component<{ bump?: () => void }, { bump?: () => void }> {
+      public constructor (props: { bump?: () => void }) {
+        super(props);
+      }
+
+      public override onMount (): void {
+        userOnMountCalls += 1;
+      }
+
+      public override compose (): VirtualServiceNode | null {
+        return null;
+      }
+    }
+
+    const Connected = connect(
+      store,
+      null,
+      (dispatch: (action: TestAction) => TestAction) => ({
+        bump: () => dispatch({ type: 'BUMP' }),
+      }),
+    )(Gate);
+
+    await expect(
+      GraphRuntime.mount(h(Connected, {})),
+    ).rejects.toThrow(/destroyed/i);
 
     expect(userOnMountCalls).toBe(0);
   });
