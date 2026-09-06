@@ -123,6 +123,46 @@ function isStoreLike (value: unknown): boolean {
 }
 
 /**
+ * Distinguishes {@link ConnectOptions} from an action-creators map.
+ *
+ * `connect`'s single runtime signature shares argument slots between `mapDispatch`
+ * (object of action creators) and `ConnectOptions`. Call sites such as
+ * `connect(store, mapState, { ownPropsModeMerge: true })` are type-legal because
+ * the third parameter is `MapDispatchToProps | ConnectOptions`, but without this
+ * guard the options object is bound as an empty action-creators map and merge
+ * mode is silently ignored.
+ *
+ * Heuristic: a non-null plain object that declares `ownPropsModeMerge` as a
+ * boolean/undefined and has no function-valued own keys is options — not creators.
+ *
+ * @param {unknown} value - candidate third/fourth argument
+ * @returns {boolean} `true` when `value` should be parsed as {@link ConnectOptions}
+ */
+function isConnectOptions (value: unknown): value is ConnectOptions {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const record = value as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(record, 'ownPropsModeMerge')) {
+    return false;
+  }
+
+  const flag = record['ownPropsModeMerge'];
+  if (flag !== undefined && typeof flag !== 'boolean') {
+    return false;
+  }
+
+  for (const key of Object.keys(record)) {
+    if (typeof record[key] === 'function') {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * Resolves the user `onMount` / `onUnmount` connect should invoke after its own wiring.
  *
  * Order:
@@ -1127,12 +1167,32 @@ export function connect<S, P = unknown, R = unknown, A extends Action = Action> 
   if (isStoreLike(storeOrMapStateToProps)) {
     store = storeOrMapStateToProps as Store<S, A>;
     mapStateToProps = mapStateToPropsOrMapDispatchToProps as MapStateToProps<S, P, R> | undefined;
-    mapDispatchToProps = mapDispatchToPropsOrOptions as MapDispatchToProps<S, P, A> | undefined;
-    options = maybeOptions;
+    // Store-first: `connect(store, mapState, { ownPropsModeMerge })` must not treat
+    // options as an action-creators map when the dedicated 4th-arg slot is unused.
+    if (
+      maybeOptions === undefined &&
+      isConnectOptions(mapDispatchToPropsOrOptions)
+    ) {
+      mapDispatchToProps = undefined;
+      options = mapDispatchToPropsOrOptions;
+    } else {
+      mapDispatchToProps = mapDispatchToPropsOrOptions as MapDispatchToProps<S, P, A> | undefined;
+      options = maybeOptions;
+    }
   } else {
     mapStateToProps = storeOrMapStateToProps as MapStateToProps<S, P, R> | undefined;
-    mapDispatchToProps = mapStateToPropsOrMapDispatchToProps as MapDispatchToProps<S, P, A> | undefined;
-    options = mapDispatchToPropsOrOptions as ConnectOptions | undefined;
+    // Child-first: `connect(mapState, { ownPropsModeMerge })` (no mapDispatch) —
+    // same slot collision as the store-first 3-arg form.
+    if (
+      mapDispatchToPropsOrOptions === undefined &&
+      isConnectOptions(mapStateToPropsOrMapDispatchToProps)
+    ) {
+      mapDispatchToProps = undefined;
+      options = mapStateToPropsOrMapDispatchToProps;
+    } else {
+      mapDispatchToProps = mapStateToPropsOrMapDispatchToProps as MapDispatchToProps<S, P, A> | undefined;
+      options = mapDispatchToPropsOrOptions as ConnectOptions | undefined;
+    }
   }
 
   const ownPropsMode: OwnPropsMode = options !== undefined && options.ownPropsModeMerge === true
