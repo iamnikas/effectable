@@ -236,7 +236,7 @@ function getMappedPropsRecord (mapped: unknown): Record<string, unknown> | null 
  *
  * @param {Record<string, unknown>} a - previous own props
  * @param {Record<string, unknown>} b - next own props
- * @returns {boolean} true when both have the same keys and `===` values
+ * @returns {boolean} true when both have the same keys and `Object.is`-equal values
  */
 function shallowEqualOwnProps (
   a: Record<string, unknown>,
@@ -252,7 +252,10 @@ function shallowEqualOwnProps (
   }
   for (let i = 0; i < keysA.length; i += 1) {
     const key = keysA[i] as string;
-    if (!Object.prototype.hasOwnProperty.call(b, key) || a[key] !== b[key]) {
+    // Object.is: NaN equals NaN (and -0 ≠ +0). Using !== made stable NaN own-props
+    // always look changed, so side-effecting mapDispatch factories re-entered on every
+    // parent reconcile and looped with a connected parent into GraphRuntime fail-stop.
+    if (!Object.prototype.hasOwnProperty.call(b, key) || !Object.is(a[key], b[key])) {
       return false;
     }
   }
