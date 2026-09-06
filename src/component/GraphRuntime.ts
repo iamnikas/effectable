@@ -2739,6 +2739,12 @@ export class GraphRuntime {
       nextVnode: VirtualServiceNode<unknown>;
     }> = [];
 
+    // Orphan DELETE must run *after* deferred UPDATEs (pass 2). #119 moved orphan
+    // destroy before pass 2 so PLACE could wire first, but that also ran sibling
+    // onUnmount before UPDATE onUpdate — silent handoff loss / stale props on the
+    // surviving listener. Collect orphans here; release the keyed Map before pass 2.
+    const pendingOrphans: RuntimeFiber<unknown>[] = [];
+
     /**
      * Same type+key → schedule UPDATE for pass 2; otherwise REPLACE with deferred startup.
      *
@@ -2822,14 +2828,9 @@ export class GraphRuntime {
             }
           }
 
-          // Destroy remaining unpaired current children (keyed).
-          // Best-effort: collect finalize errors so one throwing ref clear cannot
-          // skip remaining orphans and fail-stop the whole runtime.
+          // Queue unpaired keyed orphans — destroy after pass-2 UPDATEs (see pendingOrphans).
           for (const [, orphan] of keyedCurrentMap) {
-            const d = this.destroyFiber(orphan, []);
-            if (isThenable(d)) {
-              await d;
-            }
+            pendingOrphans.push(orphan);
           }
         } finally {
           this.reconcileDepth--;
@@ -2858,20 +2859,19 @@ export class GraphRuntime {
         }
       }
 
-      // Destroy remaining unpaired unkeyed children (best-effort finalize errors).
+      // Queue unpaired unkeyed orphans (destroyed after pass-2 UPDATEs).
       for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
         const orphan = unkeyedCurrent[i];
 
         if (orphan !== undefined) {
-          const d = this.destroyFiber(orphan, []);
-          if (isThenable(d)) {
-            await d;
-          }
+          pendingOrphans.push(orphan);
         }
       }
 
       // Pass 2: run deferred UPDATEs. PLACE/REPLACE siblings are already wired, so
       // onUpdate publishes reach new @On* handlers before deferred onMount flush.
+      // Orphans remain alive until after this pass so UPDATE↔DELETE handoff keeps
+      // pre-#119 order (onUpdate before sibling onUnmount).
       for (const pending of pendingUpdates) {
         const updatedRes = this.updateFiber(
           pending.current,
@@ -2880,6 +2880,15 @@ export class GraphRuntime {
           childScope,
         );
         nextChildren[pending.slot] = isThenable(updatedRes) ? await updatedRes : updatedRes;
+      }
+
+      // Destroy orphans after UPDATEs (best-effort finalize errors). PLACE peers are
+      // already wired, so onUnmount publishes still reach same-batch PLACE @On*.
+      for (const orphan of pendingOrphans) {
+        const d = this.destroyFiber(orphan, []);
+        if (isThenable(d)) {
+          await d;
+        }
       }
 
       // Flush PLACE/REPLACE startups in compose order after every new sibling is wired.
