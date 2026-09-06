@@ -397,22 +397,27 @@ export class GraphRuntime {
   }
 
   /**
-   * Builds the value assigned to `ref.current` for a mounted instance.
+   * Builds the value to assign to `ref.current` for a mounted instance.
    *
    * When the constructor declares `@UseImperativeHandle` methods, only those methods
    * are exposed (bound to the instance) — matching the refs.ts / CONCEPT contract.
-   * Without an allowlist, the full instance is assigned (legacy escape hatch).
+   * Without an allowlist, the full instance is returned (legacy escape hatch).
+   *
+   * Does **not** mutate {@link imperativeRefByOwner}: the caller must update the map
+   * only after `ref.current = value` succeeds. Updating the map before assignment made
+   * UPDATE same-ref throw-before-assign drop the previous handle from the map while
+   * `ref.current` still held it, so fail-stop finalize could no longer identity-match
+   * and left a zombie handle after destroy.
    *
    * @param {Component<unknown, unknown>} instance - mounted component instance
    * @returns {unknown} instance or limited imperative handle object
    */
-  private resolveRefCurrentValue (instance: Component<unknown, unknown>): unknown {
+  private buildRefCurrentValue (instance: Component<unknown, unknown>): unknown {
     const methods = getImperativeHandleMethods(
       instance.constructor as unknown as Parameters<typeof getImperativeHandleMethods>[0],
     );
 
     if (methods.length === 0) {
-      this.imperativeRefByOwner.delete(instance);
       return instance;
     }
 
@@ -431,7 +436,6 @@ export class GraphRuntime {
       handle[methodKey] = (fn as (...args: unknown[]) => unknown).bind(instance);
     }
 
-    this.imperativeRefByOwner.set(instance, handle);
     return handle;
   }
 
@@ -484,16 +488,43 @@ export class GraphRuntime {
     // the previous ref object — fail-stop finalize clears only the old ref (zombie nextRef).
     // Materialize assign-then-throw is covered by journal.refBound (#96/#98); this path covers
     // the UPDATE swap hole and is a safe no-op when the setter never assigned.
+    //
+    // Publish imperativeRefByOwner only AFTER a successful assign. Updating the map inside
+    // build (pre-assign) made same-ref throw-before-assign drop the previous handle from the
+    // map while ref.current still held it — fail-stop could no longer identity-match (#110 sibling).
     if (nextRef !== undefined) {
+      if (instance === null) {
+        nextRef.current = null;
+        return;
+      }
+
+      const previousHandle = this.imperativeRefByOwner.get(instance);
+      const nextValue = this.buildRefCurrentValue(instance);
+      const isHandle = nextValue !== instance;
+
       try {
-        nextRef.current = instance === null ? null : this.resolveRefCurrentValue(instance);
+        nextRef.current = nextValue;
+        if (isHandle) {
+          this.imperativeRefByOwner.set(instance, nextValue);
+        } else {
+          this.imperativeRefByOwner.delete(instance);
+        }
       } catch (error: unknown) {
-        if (instance !== null) {
-          try {
+        try {
+          if (nextRef.current === nextValue || nextRef.current === instance) {
+            // assign-then-throw: temporarily publish map so clearRefSafe can match.
+            if (isHandle) {
+              this.imperativeRefByOwner.set(instance, nextValue);
+            }
             this.clearRefSafe(nextRef, instance);
-          } catch {
-            // Best-effort: do not mask the original setter error.
+          } else if (previousHandle !== undefined) {
+            // throw-before-assign: restore previous handle for later fail-stop finalize.
+            this.imperativeRefByOwner.set(instance, previousHandle);
+          } else {
+            this.imperativeRefByOwner.delete(instance);
           }
+        } catch {
+          // Best-effort: do not mask the original setter error.
         }
         throw error;
       }
