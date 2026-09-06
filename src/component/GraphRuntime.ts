@@ -231,6 +231,13 @@ export class GraphRuntime {
    * Incremented before async work, decremented in finally.
    */
   private reconcileDepth = 0;
+  /**
+   * REPLACE victims whose {@link destroyFiber} is deferred until sibling PLACE/REPLACE
+   * buses are wired (child reconcile batches with {@code deferLifecycle=true}).
+   * Stacked per {@link reconcileChildrenFullDiff} nesting level.
+   */
+  private deferredReplaceVictimsStack: RuntimeFiber<unknown>[][] = [];
+
 
   /**
    * Set of fiber nodes whose `compose()` subtrees need rebuild.
@@ -2089,9 +2096,19 @@ export class GraphRuntime {
     // Collect cleanup errors (ref clear / disposer) so a throwing finalize cannot
     // abort REPLACE and fail-stop the surviving tree — same best-effort contract as unmount.
     //
-    // When deferLifecycle is set (child reconcile batch), REPLACE must not run onMount
-    // before later sibling buses are wired — otherwise a replaced publisher's mount-time
-    // publish is silently dropped by a not-yet-wired PLACE/REPLACE listener beside it.
+    // When deferLifecycle is set (child reconcile batch):
+    // - REPLACE must not run onMount before later sibling buses are wired (#108).
+    // - REPLACE victim destroy/onUnmount must also wait until later PLACE siblings are
+    //   wired — otherwise an onUnmount publish is silently dropped by a not-yet-wired
+    //   listener beside it.
+    if (deferLifecycle) {
+      const bucket = this.deferredReplaceVictimsStack[this.deferredReplaceVictimsStack.length - 1];
+      if (bucket !== undefined) {
+        bucket.push(current as RuntimeFiber<unknown>);
+        return this.materialize(nextVnode, parentFiber, parentScope, true);
+      }
+    }
+
     const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
     if (isThenable(destroyRes)) {
       return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle));
@@ -2636,6 +2653,8 @@ export class GraphRuntime {
     const nextChildren: RuntimeFiber<unknown>[] = [];
     let unkeyedIdx = 0;
 
+    this.deferredReplaceVictimsStack.push([]);
+
     try {
       if (hasKeyedCurrent) {
         // Acquire Map from the depth-indexed pool (5.1x: Map.clear() vs new Map())
@@ -2745,6 +2764,19 @@ export class GraphRuntime {
         }
       }
 
+      // Destroy deferred REPLACE victims now that later PLACE/REPLACE siblings are wired,
+      // so onUnmount publishes can reach `@On*` handlers subscribed in this same batch.
+      const deferredVictims = this.deferredReplaceVictimsStack[this.deferredReplaceVictimsStack.length - 1];
+      if (deferredVictims !== undefined) {
+        for (const victim of deferredVictims) {
+          const d = this.destroyFiber(victim, []);
+          if (isThenable(d)) {
+            await d;
+          }
+        }
+        deferredVictims.length = 0;
+      }
+
       // Flush PLACE/REPLACE startups in compose order after every new sibling is wired.
       for (const child of nextChildren) {
         if (child.constructionJournal?.lifecycleDeferred === true) {
@@ -2755,12 +2787,26 @@ export class GraphRuntime {
         }
       }
 
+      this.deferredReplaceVictimsStack.pop();
       return nextChildren;
     } catch (primaryError: unknown) {
       // HOLE 3: On throw, clean up new fibers in nextChildren
       // that are NOT identity-in currentChildren (PLACE/REPLACE results).
       // Do not destroy UPDATE siblings (same object as current child).
       const rollbackErrors: Error[] = [];
+
+      // REPLACE victims were deferred past structure — destroy them on rollback too.
+      const deferredVictims = this.deferredReplaceVictimsStack.pop() ?? [];
+      for (const victim of deferredVictims) {
+        try {
+          const d = this.destroyFiber(victim, rollbackErrors);
+          if (isThenable(d)) {
+            await d;
+          }
+        } catch (err: unknown) {
+          rollbackErrors.push(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
 
       for (const child of nextChildren) {
         // Skip if this fiber is identity-in currentChildren (UPDATE, not PLACE/REPLACE)
