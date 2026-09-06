@@ -299,7 +299,15 @@ function assignBusProps (
   const keys = getStringPropKeys(ctor, metaKey);
   const record = instance as Record<string, unknown>;
   for (const key of keys) {
-    record[key] = value;
+    // defineProperty — `record[key] =` invokes the Object.prototype `__proto__`
+    // setter when a decorated field is named `__proto__`, replacing the
+    // instance [[Prototype]] with the bus and dropping Component methods.
+    Object.defineProperty(record, key, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
 }
 
