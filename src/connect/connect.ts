@@ -1292,8 +1292,14 @@ function buildConnectHoc<S, P, R, A extends Action> (
           throw error;
         }
 
-        // Nested remount during user onMount owns the instance.
+        // Nested remount during user onMount owns the instance for wiring/complete.
+        // Still return an in-flight user Promise: dropping it made enterConnectOnMount
+        // look sync, so `__connectMountAsyncInFlight` never claimed the outer await and
+        // a later `await super.onMount()` re-entered after the nested remount settled (#160).
         if (this.__connectMountGeneration !== mountGeneration) {
+          if (isPromiseLike(mountResult)) {
+            return mountResult as Promise<void>;
+          }
           return;
         }
 
