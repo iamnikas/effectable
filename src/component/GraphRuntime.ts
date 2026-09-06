@@ -1836,12 +1836,16 @@ export class GraphRuntime {
 
     fiber.children = fiber.constructionJournal!.mountedChildren as Fiber[];
 
-    // Bind ref to the instance (centralized via commitRef)
+    // Bind ref to the instance (centralized via commitRef).
+    // Mark refBound/refOwner BEFORE commitRef: a setter may assign `current`
+    // then throw. If the flags were set only after a successful return,
+    // rollback would skip the identity-safe clear and leave a zombie ref
+    // (root was never published, so failStop cannot reclaim it).
     if (vnode.ref !== undefined) {
       try {
-        this.commitRef(undefined, null, vnode.ref, instance);
         fiber.constructionJournal!.refBound = true;
         fiber.constructionJournal!.refOwner = instance;
+        this.commitRef(undefined, null, vnode.ref, instance);
       } catch (err: unknown) {
         const error = err instanceof Error ? err : new Error(String(err));
         const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
@@ -1922,11 +1926,12 @@ export class GraphRuntime {
 
     fiber.children = journal.mountedChildren as Fiber[];
 
+    // Mark refBound/refOwner BEFORE commitRef (see sync materialize path).
     if (vnode.ref !== undefined) {
       try {
-        this.commitRef(undefined, null, vnode.ref, instance);
         journal.refBound = true;
         journal.refOwner = instance;
+        this.commitRef(undefined, null, vnode.ref, instance);
       } catch (err: unknown) {
         const error = err instanceof Error ? err : new Error(String(err));
         const rollbackRes = this.rollbackFailedMaterialization(fiber, error);
