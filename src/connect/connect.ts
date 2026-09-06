@@ -14,6 +14,8 @@
  *   and do not shadow store subscribe / unsubscribe.
  * - Subclass-of-Connected prototype `override onMount` / `onUnmount` still run after wiring
  *   (own Connected hooks shadow Ext.prototype for GraphRuntime entry; connect re-resolves them).
+ *   Own-entry `this.onMount()` remount works during user hooks; subclass `super.onMount()` is a
+ *   sync no-op while wiring is active (avoids double-subscribe without blocking remount).
  * - `mapStateToProps` subscribe failures fail the mount; mapDispatch-only hosts still get the
  *   post-mount kick-off after a successful mount.
  * - Nested HOC wrap `connect(...)(connect(...)(Ctor))` is rejected: inheritance shares one
@@ -382,20 +384,37 @@ function buildConnectHoc<S, P, R, A extends Action> (
       private __connectOwnOnMount: (() => void | Promise<void>) | null = null;
       private __connectOwnOnUnmount: (() => void | Promise<void>) | null = null;
       /**
-       * True while Connected `onMount` wiring is on the stack. Makes subclass
-       * `super.onMount()` a safe no-op (avoids re-entrant subscribe). Separate from
-       * unmount reentry so async onMount cannot block onUnmount teardown.
+       * True while Connected mount wiring is on the stack. Makes subclass
+       * `super.onMount()` (Connected.prototype) a safe no-op. Own-entry
+       * `this.onMount()` / GraphRuntime still remount via `__connectEntryOnMount`.
+       * Separate from unmount reentry so async onMount cannot block teardown.
        */
       private __connectMountReentry = false;
       /**
-       * True while Connected `onUnmount` teardown is on the stack. Makes subclass
-       * `super.onUnmount()` a safe no-op (avoids double dispose).
+       * True while Connected unmount teardown is on the stack. Makes subclass
+       * `super.onUnmount()` a safe no-op. Own-entry `this.onUnmount()` still runs
+       * via `__connectEntryOnUnmount` (nested save/restore of this flag).
        */
       private __connectUnmountReentry = false;
+      /**
+       * Stable own-property mount entry (GraphRuntime / `this.onMount()`). Distinct from
+       * `Connected.prototype.onMount` so `super.onMount()` can no-op on reentry while
+       * nested remount via `this.onMount()` still runs.
+       */
+      private __connectEntryOnMount: () => void | Promise<void>;
+      /**
+       * Stable own-property unmount entry (GraphRuntime / `this.onUnmount()`).
+       */
+      private __connectEntryOnUnmount: () => void | Promise<void>;
 
       constructor (props: P) {
         super(props);
         this.__connectOwnProps = this.props as unknown as Record<string, unknown>;
+
+        // Own entries must stay !== Connected.prototype hooks so installConnectLifecycleHooks
+        // never re-captures them as user class-field hooks on rebind.
+        this.__connectEntryOnMount = () => this.enterConnectOnMount();
+        this.__connectEntryOnUnmount = () => this.enterConnectOnUnmount();
 
         // Class-field lifecycle hooks are own properties and shadow Connected.prototype.
         // Capture BaseCtor fields here, then reinstall Connected wiring. Subclass-of-Connected
@@ -409,7 +428,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
 
       /**
        * Captures any own `onMount` / `onUnmount` that is not Connected wiring, then
-       * reinstalls `Connected.prototype` hooks as own properties.
+       * reinstalls own-entry Connected hooks (not prototype methods — see mount reentry).
        *
        * Safe to call from the Connected constructor (BaseCtor class fields) and again
        * after full construction (subclass-of-Connected class fields).
@@ -423,22 +442,57 @@ function buildConnectHoc<S, P, R, A extends Action> (
         };
         const protoMount = Connected.prototype.onMount;
         const protoUnmount = Connected.prototype.onUnmount;
+        const entryMount = this.__connectEntryOnMount;
+        const entryUnmount = this.__connectEntryOnUnmount;
         if (
           Object.prototype.hasOwnProperty.call(this, 'onMount') &&
           typeof self.onMount === 'function' &&
-          self.onMount !== protoMount
+          self.onMount !== protoMount &&
+          self.onMount !== entryMount
         ) {
           this.__connectOwnOnMount = self.onMount as () => void | Promise<void>;
         }
         if (
           Object.prototype.hasOwnProperty.call(this, 'onUnmount') &&
           typeof self.onUnmount === 'function' &&
-          self.onUnmount !== protoUnmount
+          self.onUnmount !== protoUnmount &&
+          self.onUnmount !== entryUnmount
         ) {
           this.__connectOwnOnUnmount = self.onUnmount as () => void | Promise<void>;
         }
-        self.onMount = protoMount;
-        self.onUnmount = protoUnmount;
+        self.onMount = entryMount;
+        self.onUnmount = entryUnmount;
+      }
+
+      /**
+       * Runs connect mount wiring. Nested own-entry remount saves/restores the reentry
+       * flag so an outer `super.onMount()` guard stays active afterward.
+       *
+       * @returns {void | Promise<void>}
+       */
+      private enterConnectOnMount (): void | Promise<void> {
+        const wasReentry = this.__connectMountReentry;
+        this.__connectMountReentry = true;
+        try {
+          return this.runConnectOnMount();
+        } finally {
+          this.__connectMountReentry = wasReentry;
+        }
+      }
+
+      /**
+       * Runs connect unmount teardown with nested save/restore of the reentry flag.
+       *
+       * @returns {void | Promise<void>}
+       */
+      private enterConnectOnUnmount (): void | Promise<void> {
+        const wasReentry = this.__connectUnmountReentry;
+        this.__connectUnmountReentry = true;
+        try {
+          return this.runConnectOnUnmount();
+        } finally {
+          this.__connectUnmountReentry = wasReentry;
+        }
       }
 
       /**
@@ -796,23 +850,19 @@ function buildConnectHoc<S, P, R, A extends Action> (
       }
 
       /**
-       * Wires dispatch props and, if needed, a state subscription; then calls the base class `onMount`.
+       * Prototype entry used by subclass `super.onMount()`. GraphRuntime and
+       * `this.onMount()` use `__connectEntryOnMount` instead so nested remount works
+       * while `super.onMount()` during an active mount remains a no-op.
        *
        * @returns {void | Promise<void>} synchronously or a Promise if the superclass `onMount` is async
        */
       public override onMount (): void | Promise<void> {
-        // Subclass `super.onMount()` while Connected wiring is already on the stack
-        // (sync only — do not hold across async user onMount, or remount is blocked).
+        // Subclass `super.onMount()` while Connected wiring is already on the stack.
         if (this.__connectMountReentry) {
           return;
         }
 
-        this.__connectMountReentry = true;
-        try {
-          return this.runConnectOnMount();
-        } finally {
-          this.__connectMountReentry = false;
-        }
+        return this.enterConnectOnMount();
       }
 
       /**
@@ -1028,36 +1078,40 @@ function buildConnectHoc<S, P, R, A extends Action> (
       }
 
       /**
-       * Unsubscribes from the store and delegates to the base class `onUnmount`.
+       * Prototype entry used by subclass `super.onUnmount()`. GraphRuntime and
+       * `this.onUnmount()` use `__connectEntryOnUnmount` instead.
        *
        * @returns {void | Promise<void>}
        */
       public override onUnmount (): void | Promise<void> {
-        // Subclass `super.onUnmount()` while Connected teardown is already on the stack
-        // (sync only — do not hold across async user onUnmount).
+        // Subclass `super.onUnmount()` while Connected teardown is already on the stack.
         if (this.__connectUnmountReentry) {
           return;
         }
 
-        this.__connectUnmountReentry = true;
-        try {
-          this.__connectTornDown = true;
-          this.__connectPendingUpdate = false;
-          // Cancels a pending post-mount kick-off (mapDispatch-only has no subscription to null out).
-          this.__connectMountCompleted = false;
-          this.disposeConnectSubscription();
+        return this.enterConnectOnUnmount();
+      }
 
-          const superOnUnmount = this.resolveUserLifecycleHook('onUnmount');
-          if (typeof superOnUnmount !== 'function') {
-            return;
-          }
+      /**
+       * Connect `onUnmount` body (dispose + user hook). Split from the reentry gate.
+       *
+       * @returns {void | Promise<void>}
+       */
+      private runConnectOnUnmount (): void | Promise<void> {
+        this.__connectTornDown = true;
+        this.__connectPendingUpdate = false;
+        // Cancels a pending post-mount kick-off (mapDispatch-only has no subscription to null out).
+        this.__connectMountCompleted = false;
+        this.disposeConnectSubscription();
 
-          const result = (superOnUnmount as () => void | Promise<void>).call(this);
-          if (isPromiseLike(result)) {
-            return result as Promise<void>;
-          }
-        } finally {
-          this.__connectUnmountReentry = false;
+        const superOnUnmount = this.resolveUserLifecycleHook('onUnmount');
+        if (typeof superOnUnmount !== 'function') {
+          return;
+        }
+
+        const result = (superOnUnmount as () => void | Promise<void>).call(this);
+        if (isPromiseLike(result)) {
+          return result as Promise<void>;
         }
       }
     }
