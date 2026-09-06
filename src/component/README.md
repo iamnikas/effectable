@@ -49,6 +49,7 @@ Only **`setState`** may change component state after construction. That path cal
 
 - Direct `this.state = …` after init is forbidden: it emits **`console.warn`** and does **not** change state (no write, no `onUpdate` / reconcile). Prefer `setState`.
 - Constructor init is allowed without warning: `super(props, initialState)` and/or `this.state = …` in the constructor body (canonical app pattern).
+- `setState` commits via `this.state` so a subclass class-field `state = …` (own property shadowing the accessor) still receives updates; prefer constructor init.
 - If you do **not** need reconciliation, store the value in a **ref** (`@UseRef`) instead of state.
 - `mutableState` stays opt-in as today: still goes through `setState`, mutates in-place; there is no second public writer.
 

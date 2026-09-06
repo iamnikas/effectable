@@ -86,7 +86,7 @@ implements Lifecycle {
    */
   public static readonly mutableState: boolean = false;
 
-  /** Backing store for {@link Component.state}. Written only by init, setter, or {@link Component.setState}. */
+  /** Backing store for {@link Component.state}. Written by init, the setter, or {@link Component.setState}. */
   #state: S;
 
   /**
@@ -94,6 +94,13 @@ implements Lifecycle {
    * Closed after the full `new` constructor chain finishes (microtask).
    */
   #allowDirectStateWrite: boolean;
+
+  /**
+   * When `true`, the setter is being used by {@link Component.setState} and must not warn.
+   * Assignment still goes through `this.state =` so a subclass class-field `state = …`
+   * (own data property that shadows the accessor) stays in sync with setState.
+   */
+  #setStateWriting: boolean;
 
   /** Instance inputs: filled by GraphRuntime, connect-HOC, or calling code. */
   public props: P;
@@ -109,10 +116,11 @@ implements Lifecycle {
   /**
    * Direct assignment after construction is forbidden: emits {@link console.warn} and leaves
    * `#state` unchanged (no write, no `onUpdate`, no reconcile). Prefer {@link Component.setState}.
-   * Allowed without warning during construction (`super(props, initial)` or subclass ctor body).
+   * Allowed without warning during construction (`super(props, initial)` or subclass ctor body)
+   * and while {@link Component.setState} commits via `#setStateWriting`.
    */
   public set state (value: S) {
-    if (!this.#allowDirectStateWrite) {
+    if (!this.#allowDirectStateWrite && !this.#setStateWriting) {
       console.warn(DIRECT_STATE_ASSIGNMENT_WARN);
       return;
     }
@@ -126,6 +134,7 @@ implements Lifecycle {
   constructor (props: P, initialState?: S) {
     this.props = props;
     this.#allowDirectStateWrite = true;
+    this.#setStateWriting = false;
     this.#state = (initialState ?? {}) as S;
     // Subclass constructor bodies run synchronously after `super()` and may assign `this.state`.
     // Close the gate once the full `new` constructor chain has finished.
@@ -145,7 +154,9 @@ implements Lifecycle {
    * @returns {void}
    */
   public setState (update: SetStateUpdate<S, P>): void {
-    const prev = this.#state;
+    // Read/write via `this.state` (not `#state`) so a subclass class-field `state = …`
+    // that shadows the accessor still receives setState commits.
+    const prev = this.state;
     const delta = typeof update === 'function'
       ? (update as (prev: S, props: P) => Partial<S>)(prev, this.props)
       : update;
@@ -170,7 +181,12 @@ implements Lifecycle {
 
     // Shallow-copy previous state and delta to avoid mutating the original state
     const next = { ...prev, ...delta };
-    this.#state = next as S;
+    this.#setStateWriting = true;
+    try {
+      this.state = next as S;
+    } finally {
+      this.#setStateWriting = false;
+    }
     // State is already committed: always schedule even if onUpdate throws,
     // otherwise mounted compose/children stay stale after a successful write.
     try {

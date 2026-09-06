@@ -438,6 +438,68 @@ describe('Component single writer (state)', () => {
       warnSpy.mockRestore();
     }
   });
+
+  it('setState updates this.state when subclass class-field shadows the accessor', async () => {
+    class FieldInit extends Component<{ n: number }, Record<string, never>> {
+      public updates: number[] = [];
+
+      constructor () {
+        super({});
+        // Same as `state = { n: 0 }` after super(): own data property shadows accessors.
+        Object.defineProperty(this, 'state', {
+          value: { n: 0 },
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+
+      public override onUpdate (_prev: { n: number }, next: { n: number }): void {
+        this.updates.push(next.n);
+      }
+    }
+
+    const c = new FieldInit();
+    await closeConstructorStateGate();
+    expect(c.state.n).toBe(0);
+
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      c.setState({ n: 5 });
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(c.state.n).toBe(5);
+      expect(c.updates).toEqual([5]);
+
+      c.setState((s) => ({ n: s.n + 1 }));
+      expect(c.state.n).toBe(6);
+      expect(c.updates).toEqual([5, 6]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('mutableState setState updates class-field shadowed state in place', async () => {
+    class FieldMutable extends Component<{ n: number }, Record<string, never>> {
+      public static override readonly mutableState = true;
+
+      constructor () {
+        super({});
+        Object.defineProperty(this, 'state', {
+          value: { n: 0 },
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+    }
+
+    const c = new FieldMutable();
+    await closeConstructorStateGate();
+    const before = c.state;
+    c.setState({ n: 4 });
+    expect(c.state).toBe(before);
+    expect(c.state.n).toBe(4);
+  });
 });
 
 describe('mount without compose()', () => {
