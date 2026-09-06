@@ -318,7 +318,7 @@ export function getContextFields (
  *
  * @param {object} instance - already created component instance
  * @param {ContextScope} scope - scope computed for this node (including ancestor providers)
- * @returns {boolean} `true` if any field identity changed (`!==`), `false` if no fields or no changes
+ * @returns {boolean} `true` if any field identity changed (`Object.is`), `false` if no fields or no changes
  * @throws {Error} see {@link readFromScope} — required token missing from scope
  */
 export function injectContextFields (
@@ -365,7 +365,12 @@ export function injectContextFields (
       );
     }
 
-    if (prevValue !== nextValue) {
+    // SameValue (`Object.is`), not `!==`: stable NaN must not look changed.
+    // ContextProvider rebuilds a new scope Map on every parent reconcile; GraphRuntime
+    // re-injects and treats a true return as contextChanged → onUpdate. With `!==`,
+    // NaN !== NaN is always true, so a child whose onUpdate setStates an ancestor
+    // livelocks (anti-loop / OOM). Distinct from store select / connect own-props NaN gates.
+    if (!Object.is(prevValue, nextValue)) {
       anyChanged = true;
       target[meta.propertyKey] = nextValue;
     }
