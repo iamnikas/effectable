@@ -3070,7 +3070,11 @@ export class GraphRuntime {
       }
       if (previousRef !== undefined && previousRef !== nextRef) {
         try {
-          previousRef.current = this.resolveRefCurrentValue(instance);
+          // Must go through commitRef so @UseImperativeHandle WeakMap tracking
+          // matches previousRef.current. A bare resolveRefCurrentValue restore
+          // left an untracked allowlist handle that fail-stop clearRefSafe could
+          // not identity-match — zombie API after ACTIVE→failed.
+          this.commitRef(undefined, null, previousRef, instance);
         } catch {
           // Best-effort restore before fail-stop clears previousRef.
         }
