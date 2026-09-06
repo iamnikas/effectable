@@ -143,6 +143,9 @@ describe('connect subclass-of-Connected prototype lifecycle', () => {
     const Connected = connect(store, (s: S) => ({ n: s.n }))(Base);
 
     class Ext extends Connected {
+      // Base class-field makes Connected's inherited type a property; this method is the
+      // intentional runtime shape under test (TS2425 property vs method).
+      // @ts-expect-error TS2425 — prototype override vs wrapped base class-field
       public override onMount (): void {
         calls.push(`ext:n=${String(this.props.n)}`);
       }
@@ -169,6 +172,7 @@ describe('connect subclass-of-Connected prototype lifecycle', () => {
     const Connected = connect(store, (s: S) => ({ n: s.n }))(Base);
 
     class Ext extends Connected {
+      // @ts-expect-error TS2425 — prototype override vs wrapped base class-field
       public override onUnmount (): void {
         calls.push('ext-unmount');
       }
@@ -208,6 +212,7 @@ describe('connect subclass-of-Connected prototype lifecycle', () => {
     const Connected = connect(store, (s: S) => ({ n: s.n }))(Base);
 
     class Mid extends Connected {
+      // @ts-expect-error TS2425 — prototype override vs wrapped base class-field
       public override onMount (): void {
         calls.push('mid-proto');
       }
@@ -240,6 +245,7 @@ describe('connect subclass-of-Connected prototype lifecycle', () => {
     const Connected = connect(store, (s: S) => ({ n: s.n }))(Base);
 
     class Mid extends Connected {
+      // @ts-expect-error TS2425 — prototype override vs wrapped base class-field
       public override onUnmount (): void {
         calls.push('mid-unmount-proto');
       }
