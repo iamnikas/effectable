@@ -1,5 +1,5 @@
 /**
- * Regression: after #195 deferred nested orphan teardown under Early UPDATE,
+ * Regression: after nested orphan teardown was deferred under Early UPDATE,
  * ancestor batch must destroy those orphans *before* flushing onUpdate.
  *
  * Holding orphan destroy until the ancestor batch is correct for Late PLACE

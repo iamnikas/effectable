@@ -2144,10 +2144,10 @@ export class GraphRuntime {
    * When `deferPendingBatchFlush` is true, holds all of the above for the ancestor.
    * Victims/orphans may already be cleared before a later pass; this path is idempotent.
    *
-   * Nested orphans held by #195 must die before onUpdate: otherwise Early onUpdate
-   * EventBus publishes dual-deliver to the removed child and any Late PLACE listener.
-   * Sibling-level orphans (pendingOrphanSet in full-diff) still destroy *after*
-   * onUpdate for intentional UPDATE↔DELETE handoff.
+   * Nested orphans held for Late PLACE wiring must die before onUpdate: otherwise
+   * Early onUpdate EventBus publishes dual-deliver to the removed child and any
+   * Late PLACE listener. Sibling-level orphans (pendingOrphanSet in full-diff)
+   * still destroy *after* onUpdate for intentional UPDATE↔DELETE handoff.
    *
    * @param {RuntimeFiber<unknown>[]} nextChildren - reconciled sibling fibers
    * @param {boolean} [deferPendingBatchFlush=false] - hold teardown + lifecycle for ancestor
@@ -2253,8 +2253,8 @@ export class GraphRuntime {
     // sibling may still PLACE @On* handlers. Ancestor flush drains both after peers wire.
     if (!deferPendingBatchFlush) {
       // Nested full-diff under a deferred UPDATE stashes orphans on the UPDATE fiber.
-      // Destroy them before onUpdate (pre-#195 eager nested teardown order) so Early
-      // onUpdate cannot dual-deliver EventBus to the removed child + Late PLACE.
+      // Destroy them before onUpdate (eager nested teardown order before deferral)
+      // so Early onUpdate cannot dual-deliver EventBus to the removed child + Late PLACE.
       const orphansFlush = this.flushPendingDeferredOrphansTree(nextChildren);
       if (isThenable(orphansFlush)) {
         return this.continueFlushSiblingBatchHooksAsync(
@@ -4239,12 +4239,12 @@ export class GraphRuntime {
       } else {
         // Order matches flushSiblingBatchHooks for nested teardown:
         // REPLACE victims → deferred nested orphans → onUpdate → sibling orphans.
-        // Victims/nested-orphans must die before onUpdate: after #195 deferral they
-        // survive until this ancestor drain — onUpdate-first dual-delivers EventBus to
-        // the removed instance and any Late PLACE listener / replacement.
-        // Sibling-level pendingOrphanSet stays until after onUpdate so UPDATE↔DELETE
-        // handoff still reaches orphan @On*. Pass-1 PLACE/REPLACE and nested PLACE
-        // under later UPDATEs are already wired before this block.
+        // Victims/nested-orphans must die before onUpdate: after nested teardown
+        // deferral they survive until this ancestor drain — onUpdate-first dual-
+        // delivers EventBus to the removed instance and any Late PLACE listener /
+        // replacement. Sibling-level pendingOrphanSet stays until after onUpdate so
+        // UPDATE↔DELETE handoff still reaches orphan @On*. Pass-1 PLACE/REPLACE and
+        // nested PLACE under later UPDATEs are already wired before this block.
         const victimsRes = this.flushPendingReplaceVictims(nextChildren);
         if (isThenable(victimsRes)) {
           await victimsRes;
