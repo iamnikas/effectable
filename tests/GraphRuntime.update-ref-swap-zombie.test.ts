@@ -6,7 +6,7 @@
 import { Component, GraphRuntime, h } from 'Effectable';
 import type { RefObject } from 'Effectable';
 
-class Host extends Component<{ label: string }, Record<string, never>> {
+class Host extends Component<object, { label: string }> {
   public override compose (): null {
     return null;
   }
