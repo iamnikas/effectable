@@ -68,6 +68,8 @@ const Legacy = connect(undefined, mapDispatch, { ownPropsModeMerge: true })(Cmp)
 // (runtime detects ConnectOptions via the `ownPropsModeMerge` field):
 const LegacyRoot = connect(store, mapState, { ownPropsModeMerge: true })(Cmp);
 const LegacyChild = connect(mapState, { ownPropsModeMerge: true })(Cmp);
+// Options in the mapState slot may still be followed by mapDispatch:
+const LegacyDispatch = connect(store, { ownPropsModeMerge: true }, mapDispatch)(Cmp);
 ```
 
 ## API: connect
