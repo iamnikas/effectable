@@ -299,28 +299,19 @@ function getMappedPropsRecord (mapped: unknown): Record<string, unknown> | null 
 }
 
 /**
- * Enumerable own keys of a props record, including Symbols.
+ * Converts mapDispatchToProps (function or action creators object) into a flat object for merge into props.
  *
- * `Object.keys` alone drops Symbol fields, so a mapState/own-props update that
- * only changes a Symbol-keyed value would look unchanged and silently skip
- * `setState` / mapDispatch refresh (lost writes).
+ * Function as third argument: always called as `fn(dispatch, props)`.
+ * Extra arguments are ignored by JS functions that do not use them.
  *
- * @param {Record<PropertyKey, unknown>} record - props bag
- * @returns {PropertyKey[]} enumerable own string and symbol keys
+ * @template S store state type
+ * @template P instance props type
+ * @template A action type
+ * @param {Store<S, A>} store - store with a `dispatch` method
+ * @param {MapDispatchToProps<S, P, A> | null | undefined} mapDispatch - function or action creators object; `null`/`undefined` — nothing to merge
+ * @param {P} props - current instance props (for the full `mapDispatch` form)
+ * @returns {Record<string, unknown> | null} flat object of callbacks/dispatch wrappers, or `null` if nothing to merge
  */
-function enumerableOwnPropKeys (
-  record: Record<PropertyKey, unknown>
-): PropertyKey[] {
-  const keys: PropertyKey[] = Object.keys(record);
-  const symbols = Object.getOwnPropertySymbols(record);
-  for (let i = 0; i < symbols.length; i += 1) {
-    const sym = symbols[i] as symbol;
-    if (Object.prototype.propertyIsEnumerable.call(record, sym)) {
-      keys.push(sym);
-    }
-  }
-  return keys;
-}
 
 /**
  * Shallow equality for prop records (own-props and mapState results).
@@ -335,28 +326,24 @@ function enumerableOwnPropKeys (
  * dispatches. Values are compared with `Object.is` so stable `NaN` fields do not
  * look dirty either.
  *
- * Compares enumerable own string **and** Symbol keys — Symbol-only (or
- * mixed) mapped/own props must not be treated as unchanged when their Symbol
- * values differ.
- *
- * @param {Record<PropertyKey, unknown>} a - previous record
- * @param {Record<PropertyKey, unknown>} b - next record
+ * @param {Record<string, unknown>} a - previous record
+ * @param {Record<string, unknown>} b - next record
  * @returns {boolean} true when both have the same keys and SameValue (`Object.is`) values
  */
 function shallowEqualOwnProps (
-  a: Record<PropertyKey, unknown>,
-  b: Record<PropertyKey, unknown>
+  a: Record<string, unknown>,
+  b: Record<string, unknown>
 ): boolean {
   if (a === b) {
     return true;
   }
-  const keysA = enumerableOwnPropKeys(a);
-  const keysB = enumerableOwnPropKeys(b);
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
   if (keysA.length !== keysB.length) {
     return false;
   }
   for (let i = 0; i < keysA.length; i += 1) {
-    const key = keysA[i] as PropertyKey;
+    const key = keysA[i] as string;
     if (
       !Object.prototype.hasOwnProperty.call(b, key) ||
       !Object.is(a[key], b[key])
@@ -367,20 +354,6 @@ function shallowEqualOwnProps (
   return true;
 }
 
-/**
- * Converts mapDispatchToProps (function or action creators object) into a flat object for merge into props.
- *
- * Function as third argument: always called as `fn(dispatch, props)`.
- * Extra arguments are ignored by JS functions that do not use them.
- *
- * @template S store state type
- * @template P instance props type
- * @template A action type
- * @param {Store<S, A>} store - store with a `dispatch` method
- * @param {MapDispatchToProps<S, P, A> | null | undefined} mapDispatch - function or action creators object; `null`/`undefined` — nothing to merge
- * @param {P} props - current instance props (for the full `mapDispatch` form)
- * @returns {Record<string, unknown> | null} flat object of callbacks/dispatch wrappers, or `null` if nothing to merge
- */
 function resolveMapDispatchProps<S, P, A extends Action> (
   store: Store<S, A>,
   mapDispatch: MapDispatchToProps<S, P, A> | null | undefined,
@@ -416,21 +389,17 @@ function resolveMapDispatchProps<S, P, A extends Action> (
   // Null-prototype bag so a creator named `__proto__` becomes an own property
   // instead of invoking the Object.prototype `__proto__` setter (which would
   // drop the bound action and pollute `bound`'s [[Prototype]]).
-  const bound: Record<PropertyKey, unknown> = Object.create(null);
-  // Include enumerable Symbol keys — Object.keys alone would silently drop
-  // Symbol-named action creators from the bound props bag.
-  for (const key of enumerableOwnPropKeys(creators as Record<PropertyKey, unknown>)) {
-    const ac = (creators as Record<PropertyKey, unknown>)[key];
+  const bound: Record<string, unknown> = Object.create(null);
+  for (const key of Object.keys(creators)) {
+    const ac = creators[key];
     if (typeof ac !== 'function') {
       continue;
     }
 
-    bound[key] = (...args: unknown[]) => store.dispatch(
-      (ac as (...a: unknown[]) => A)(...args)
-    );
+    bound[key] = (...args: unknown[]) => store.dispatch(ac(...args) as A);
   }
 
-  return bound as Record<string, unknown>;
+  return bound;
 }
 
 /**
