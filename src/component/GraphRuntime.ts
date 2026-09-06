@@ -4402,6 +4402,27 @@ export class GraphRuntime {
    * @returns {void | Promise<void>}
    */
   private destroyFiber (fiber: RuntimeFiber<unknown>, collectErrors: Error[] | null = null): void | Promise<void> {
+    // REPLACE victims stashed under deferred sibling-batch REPLACE are not in
+    // `fiber.children`. fail-stop / parent destroy must reclaim them — otherwise a
+    // later sibling throw before flushSiblingBatchHooks leaves the victim's
+    // EventBus (and lifecycle) alive after the runtime is FAILED.
+    const stashedVictim = fiber.constructionJournal?.pendingReplaceVictim;
+    if (stashedVictim !== undefined) {
+      fiber.constructionJournal!.pendingReplaceVictim = undefined;
+      try {
+        const victimRes = this.destroyFiber(stashedVictim, collectErrors);
+        if (isThenable(victimRes)) {
+          return victimRes.then(() => this.destroyFiber(fiber, collectErrors));
+        }
+      } catch (err: unknown) {
+        if (collectErrors !== null) {
+          collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+        } else {
+          throw err;
+        }
+      }
+    }
+
     // Orphans stashed for a deferred nested full-diff are not in `fiber.children`.
     // Clear the stash up front, but if one orphan's destroy is async the remaining
     // entries in the local list must still be drained — otherwise fail-stop after
