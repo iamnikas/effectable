@@ -830,6 +830,15 @@ function buildConnectHoc<S, P, R, A extends Action> (
 
         if (isStoreLike(this.__connectStoreFromContext)) {
           this.__connectStore = this.__connectStoreFromContext as Store<S, A>;
+          // Same liveness probe as the cached-store branch: a destroyed store may
+          // still be republished into CONNECT_STORE_CONTEXT (#106). Calling
+          // getState() during pre-compose sync would fail-stop GraphRuntime.
+          try {
+            this.__connectStore.getState();
+          } catch {
+            this.__connectStoreDestroyed = true;
+            return null;
+          }
           return this.__connectStore;
         }
 
@@ -1029,6 +1038,25 @@ function buildConnectHoc<S, P, R, A extends Action> (
         this.__connectStore = explicitStore;
         this.disposeConnectSubscription();
         const store = this.resolveConnectStore();
+
+        // Destroyed-store liveness probe before dispatch wiring / select subscribe.
+        // Root-connected (explicit store): throw so GraphRuntime.mount rejects (#87 / #112).
+        // Child-connected (context store): soft-complete so a PLACE under a destroyed
+        // context republished by #106 cannot fail-stop an already-ACTIVE tree.
+        try {
+          store.getState();
+        } catch {
+          this.__connectStoreDestroyed = true;
+          if (explicitStore !== null) {
+            throw new Error(
+              '[Effectable.connect] Store select completed before the first state emission ' +
+              '(store may have been destroyed).'
+            );
+          }
+          this.__connectMountCompleted = true;
+          return;
+        }
+
         this.refreshDispatchProps(store);
 
         // Class-field, Connected-subclass prototype override, or wrapped prototype.
