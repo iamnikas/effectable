@@ -270,14 +270,21 @@ function getMappedPropsRecord (mapped: unknown): Record<string, unknown> | null 
  */
 
 /**
- * Shallow equality for own-props records (RUNTIME_PROPS_RECEIVER).
+ * Shallow equality for prop records (own-props and mapState results).
+ *
  * Used to avoid re-invoking mapDispatch factories when parent reconcile
  * passes a new props object with the same fields — a factory that dispatches
  * as a side effect would otherwise loop with a connected parent.
  *
- * @param {Record<string, unknown>} a - previous own props
- * @param {Record<string, unknown>} b - next own props
- * @returns {boolean} true when both have the same keys and `===` values
+ * Also used when applying mapState results: selectors almost always allocate a
+ * fresh object (`(s) => ({ n: s.n })`), so reference equality alone treats every
+ * store emission as a change and can infinite-loop with an `onUpdate` that
+ * dispatches. Values are compared with `Object.is` so stable `NaN` fields do not
+ * look dirty either.
+ *
+ * @param {Record<string, unknown>} a - previous record
+ * @param {Record<string, unknown>} b - next record
+ * @returns {boolean} true when both have the same keys and SameValue (`Object.is`) values
  */
 function shallowEqualOwnProps (
   a: Record<string, unknown>,
@@ -293,7 +300,10 @@ function shallowEqualOwnProps (
   }
   for (let i = 0; i < keysA.length; i += 1) {
     const key = keysA[i] as string;
-    if (!Object.prototype.hasOwnProperty.call(b, key) || a[key] !== b[key]) {
+    if (
+      !Object.prototype.hasOwnProperty.call(b, key) ||
+      !Object.is(a[key], b[key])
+    ) {
       return false;
     }
   }
@@ -943,6 +953,18 @@ function buildConnectHoc<S, P, R, A extends Action> (
           return true;
         }
 
+        // mapState almost always returns a new object identity. Without a shallow
+        // compare, every store emission looks like a props change → setState →
+        // onUpdate. An onUpdate that dispatches then loops forever even when the
+        // mapped fields are unchanged (including stable NaN via Object.is).
+        if (
+          this.__connectStateProps !== null &&
+          shallowEqualOwnProps(this.__connectStateProps, mappedProps)
+        ) {
+          this.__connectPrevMapped = mapped;
+          return false;
+        }
+
         this.__connectPrevMapped = mapped;
         this.__connectStateProps = mappedProps;
         this.rebuildConnectProps();
@@ -1149,7 +1171,11 @@ function buildConnectHoc<S, P, R, A extends Action> (
         // disposed handle or overwrite a newer remount's subscription.
         const subscription = store.select(selector).subscribe({
           next: (mapped: R) => {
-            this.applyMappedStateProps(mapped);
+            // Gate delivery on actual mapped-props change. mapState usually
+            // allocates a new object; applyMappedStateProps shallow-compares
+            // and returns false when fields are unchanged — without that gate
+            // every store emit would setState → onUpdate → possible dispatch loop.
+            const mappedChanged = this.applyMappedStateProps(mapped);
 
             if (this.__connectFirstPass) {
               this.__connectFirstPass = false;
@@ -1157,6 +1183,10 @@ function buildConnectHoc<S, P, R, A extends Action> (
             }
 
             if (this.__connectTornDown) {
+              return;
+            }
+
+            if (!mappedChanged) {
               return;
             }
 
