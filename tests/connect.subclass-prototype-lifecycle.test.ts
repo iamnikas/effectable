@@ -89,4 +89,44 @@ describe('connect subclass-of-Connected prototype lifecycle', () => {
 
     await rt.unmount();
   });
+
+  it('subclass this.onMount() remount during user hook must resubscribe', () => {
+    const store = makeStore();
+    const updates: number[] = [];
+    let nested = false;
+    let selectorRuns = 0;
+
+    class Svc extends Component<Record<string, never>, { n?: number }> {
+      public override onUpdate (): void {
+        updates.push(this.props.n as number);
+      }
+    }
+
+    const Connected = connect(store, (s: S) => {
+      selectorRuns += 1;
+      return { n: s.n };
+    })(Svc);
+
+    class Ext extends Connected {
+      public override onMount (): void {
+        // super.onMount must stay a no-op; this.onMount must still remount.
+        super.onMount?.();
+        if (!nested) {
+          nested = true;
+          void this.onUnmount?.();
+          void this.onMount?.();
+        }
+      }
+    }
+
+    const inst = new Ext({});
+    inst.onMount();
+
+    const before = selectorRuns;
+    store.dispatch({ type: 'INC' });
+
+    expect(updates).toEqual([1]);
+    expect(selectorRuns - before).toBe(1);
+    void inst.onUnmount?.();
+  });
 });
