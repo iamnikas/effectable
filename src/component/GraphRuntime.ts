@@ -511,8 +511,8 @@ export class GraphRuntime {
     }
 
     // 2. Destroy mounted children in reverse order BEFORE parent onUnmount / bus / ref.
-    // Documented teardown contract is children → parent; #69 moved onUnmount after
-    // children but left bus dispose + ref clear ahead of child destroy — child
+    // Documented teardown contract is children → parent; onUnmount was already after
+    // children, but bus dispose + ref clear still ran ahead of child destroy — child
     // onUnmount could observe a nulled parent ref / dead parent bus subscriptions.
     // Pass cleanupErrors so nested destroy is best-effort: a throwing
     // ref-clear/disposer on one grandchild must not skip remaining siblings.
