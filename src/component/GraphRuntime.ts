@@ -151,6 +151,13 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
    */
   effectableRuntimeBusDisposer?: () => void;
   /**
+   * Exclusive Command/Query slots for this fiber were already freed by a pre-PLACE
+   * release. A later orphan pass must not call `unregister` again — that would drop a
+   * same-batch PLACE owner that already re-registered the type (#165 generation
+   * disposers only protect `register()` teardown, not blind `unregister`).
+   */
+  exclusiveRuntimeBusHandlersReleased?: boolean;
+  /**
    * `setState` during `runStartup`/`onMount` happened before the live
    * {@link SCHEDULE_UPDATE_HOOK} was injected: after startup, {@link scheduleUpdate} must run.
    */
@@ -431,10 +438,14 @@ export class GraphRuntime {
         );
       }
     }
+    if (fiber.exclusiveRuntimeBusHandlersReleased === true) {
+      return;
+    }
     const instance = fiber.instance;
     if (instance !== null) {
       releaseExclusiveRuntimeBusHandlers(instance, buses);
     }
+    fiber.exclusiveRuntimeBusHandlersReleased = true;
   }
 
   /**
@@ -493,6 +504,171 @@ export class GraphRuntime {
     }
 
     return orphans;
+  }
+
+  /**
+   * Applies `props` to an instance the same way UPDATE does (props receiver or assign).
+   *
+   * @template P
+   * @param {Component<unknown, P>} instance - target instance
+   * @param {P} props - props to apply
+   * @returns {void}
+   */
+  private applyInstanceProps<P> (
+    instance: Component<unknown, P>,
+    props: P,
+  ): void {
+    const propsReceiver = (
+      instance as Component<unknown, P> & RuntimePropsReceiver<P>
+    )[RUNTIME_PROPS_RECEIVER];
+
+    if (typeof propsReceiver === 'function') {
+      propsReceiver.call(
+        instance as Component<unknown, P> & RuntimePropsReceiver<P>,
+        props,
+      );
+    } else {
+      instance.props = props;
+    }
+  }
+
+  /**
+   * Before PLACE in a full-diff sibling batch, release exclusive Command/Query slots that
+   * deferred UPDATEs will free only later (pass 2). A surviving keyed wrapper can keep a
+   * nested `@OnCommand`/`@OnQuery` live across pass-1 PLACE of a sibling that registers
+   * the same type — fail-stop. Walk matched UPDATE trees: temporarily apply next props,
+   * compose next children, release unpaired / REPLACE victims' exclusive subtrees, recurse
+   * into nested UPDATEs. EventBus stays intact (#158).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - deferred UPDATE fiber
+   * @param {VirtualServiceNode<unknown>} nextVnode - next vnode for that fiber
+   * @param {NonNullable<GraphRuntime['effectableRuntimeBuses']>} buses - runtime buses
+   * @returns {void}
+   */
+  private releaseExclusiveUnderDeferredUpdate (
+    fiber: RuntimeFiber<unknown>,
+    nextVnode: VirtualServiceNode<unknown>,
+    buses: NonNullable<GraphRuntime['effectableRuntimeBuses']>,
+  ): void {
+    const instance = fiber.instance;
+    if (instance === null) {
+      return;
+    }
+
+    const prevProps = instance.props;
+    this.applyInstanceProps(instance, nextVnode.props);
+
+    try {
+      const nextChildVnodes = this.getChildVnodes(
+        instance as Component<unknown, unknown>,
+        nextVnode.children as VirtualServiceNode[],
+      );
+      const currentChildren = fiber.children as RuntimeFiber<unknown>[];
+
+      let hasKeyedCurrent = false;
+      for (const child of currentChildren) {
+        if (child.vnode.key !== undefined) {
+          hasKeyedCurrent = true;
+          break;
+        }
+      }
+
+      const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
+      let unkeyedIdx = 0;
+
+      if (hasKeyedCurrent) {
+        const keyedCurrentMap = new Map<string | number, RuntimeFiber<unknown>>();
+        for (const child of currentChildren) {
+          const key = child.vnode.key;
+          if (key !== undefined) {
+            keyedCurrentMap.set(key, child);
+          } else {
+            unkeyedCurrent.push(child);
+          }
+        }
+
+        for (const nextChild of nextChildVnodes) {
+          const nextKey = nextChild.key;
+          if (nextKey !== undefined && keyedCurrentMap.has(nextKey)) {
+            const currentChild = keyedCurrentMap.get(nextKey);
+            keyedCurrentMap.delete(nextKey);
+            if (currentChild !== undefined) {
+              this.releaseExclusiveForMatchedDeferredChild(
+                currentChild,
+                nextChild as VirtualServiceNode<unknown>,
+                buses,
+              );
+            }
+          } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
+            const currentChild = unkeyedCurrent[unkeyedIdx];
+            unkeyedIdx += 1;
+            if (currentChild !== undefined) {
+              this.releaseExclusiveForMatchedDeferredChild(
+                currentChild,
+                nextChild as VirtualServiceNode<unknown>,
+                buses,
+              );
+            }
+          }
+        }
+
+        for (const [, orphan] of keyedCurrentMap) {
+          this.releaseExclusiveRuntimeBusHandlersSubtree(orphan, buses);
+        }
+      } else {
+        for (const child of currentChildren) {
+          unkeyedCurrent.push(child);
+        }
+
+        const paired = Math.min(nextChildVnodes.length, unkeyedCurrent.length);
+        for (let i = 0; i < paired; i += 1) {
+          const currentChild = unkeyedCurrent[i];
+          const nextChild = nextChildVnodes[i];
+          if (currentChild !== undefined && nextChild !== undefined) {
+            this.releaseExclusiveForMatchedDeferredChild(
+              currentChild,
+              nextChild as VirtualServiceNode<unknown>,
+              buses,
+            );
+          }
+        }
+        unkeyedIdx = paired;
+      }
+
+      for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
+        const orphan = unkeyedCurrent[i];
+        if (orphan !== undefined) {
+          this.releaseExclusiveRuntimeBusHandlersSubtree(orphan, buses);
+        }
+      }
+    } finally {
+      this.applyInstanceProps(instance, prevProps);
+    }
+  }
+
+  /**
+   * Same-type+key → recurse deferred UPDATE exclusive release; otherwise the child will
+   * REPLACE and its exclusive subtree must free before parent-level PLACE.
+   *
+   * @param {RuntimeFiber<unknown>} currentChild - matched current child
+   * @param {VirtualServiceNode<unknown>} nextChild - next child vnode
+   * @param {NonNullable<GraphRuntime['effectableRuntimeBuses']>} buses - runtime buses
+   * @returns {void}
+   */
+  private releaseExclusiveForMatchedDeferredChild (
+    currentChild: RuntimeFiber<unknown>,
+    nextChild: VirtualServiceNode<unknown>,
+    buses: NonNullable<GraphRuntime['effectableRuntimeBuses']>,
+  ): void {
+    const sameType = currentChild.vnode.type === nextChild.type;
+    const sameKey = (currentChild.vnode.key ?? null) === (nextChild.key ?? null);
+
+    if (sameType && sameKey) {
+      this.releaseExclusiveUnderDeferredUpdate(currentChild, nextChild, buses);
+      return;
+    }
+
+    this.releaseExclusiveRuntimeBusHandlersSubtree(currentChild, buses);
   }
 
   /**
@@ -3011,6 +3187,89 @@ export class GraphRuntime {
         } catch {
           // Best-effort: a throwing unregister must not skip remaining orphans or block PLACE.
           // destroyFiber still runs the full bus disposer later.
+        }
+      }
+
+      // Deferred same-type UPDATEs keep their trees until pass 2. Nested exclusive
+      // handlers under those survivors still block same-batch PLACE (#170 orphan-only
+      // hole). Preview each UPDATE's next children and release unpaired / REPLACE
+      // exclusive subtrees now; EventBus remains for #158 handoff.
+      const unkeyedForPreview: RuntimeFiber<unknown>[] = [];
+      let unkeyedPreviewIdx = 0;
+      if (hasKeyedCurrent) {
+        const keyedPreviewMap = new Map<string | number, RuntimeFiber<unknown>>();
+        for (const child of currentChildren) {
+          const key = child.vnode.key;
+          if (key !== undefined) {
+            keyedPreviewMap.set(key, child);
+          } else {
+            unkeyedForPreview.push(child);
+          }
+        }
+        for (const nextVnode of nextVnodes) {
+          const nextKey = nextVnode.key;
+          if (nextKey !== undefined && keyedPreviewMap.has(nextKey)) {
+            const currentFiber = keyedPreviewMap.get(nextKey);
+            keyedPreviewMap.delete(nextKey);
+            if (
+              currentFiber !== undefined &&
+              currentFiber.vnode.type === nextVnode.type &&
+              (currentFiber.vnode.key ?? null) === (nextVnode.key ?? null)
+            ) {
+              try {
+                this.releaseExclusiveUnderDeferredUpdate(
+                  currentFiber,
+                  nextVnode as VirtualServiceNode<unknown>,
+                  buses,
+                );
+              } catch {
+                // Best-effort — real UPDATE still runs in pass 2.
+              }
+            }
+          } else if (nextKey === undefined && unkeyedPreviewIdx < unkeyedForPreview.length) {
+            const currentFiber = unkeyedForPreview[unkeyedPreviewIdx];
+            unkeyedPreviewIdx += 1;
+            if (
+              currentFiber !== undefined &&
+              currentFiber.vnode.type === nextVnode.type &&
+              (currentFiber.vnode.key ?? null) === (nextVnode.key ?? null)
+            ) {
+              try {
+                this.releaseExclusiveUnderDeferredUpdate(
+                  currentFiber,
+                  nextVnode as VirtualServiceNode<unknown>,
+                  buses,
+                );
+              } catch {
+                // Best-effort — real UPDATE still runs in pass 2.
+              }
+            }
+          }
+        }
+      } else {
+        for (const child of currentChildren) {
+          unkeyedForPreview.push(child);
+        }
+        const paired = Math.min(nextVnodes.length, unkeyedForPreview.length);
+        for (let i = 0; i < paired; i += 1) {
+          const currentFiber = unkeyedForPreview[i];
+          const nextVnode = nextVnodes[i];
+          if (
+            currentFiber !== undefined &&
+            nextVnode !== undefined &&
+            currentFiber.vnode.type === nextVnode.type &&
+            (currentFiber.vnode.key ?? null) === (nextVnode.key ?? null)
+          ) {
+            try {
+              this.releaseExclusiveUnderDeferredUpdate(
+                currentFiber,
+                nextVnode as VirtualServiceNode<unknown>,
+                buses,
+              );
+            } catch {
+              // Best-effort — real UPDATE still runs in pass 2.
+            }
+          }
         }
       }
     }
