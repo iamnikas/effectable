@@ -70,6 +70,10 @@ export function createStore<S, A extends Action> (
   // outermost notify loop always finishes on the latest committed state.
   let isPublishing = false;
   let publishAgain = false;
+  // destroy() during state$.next otherwise calls complete() mid-delivery and
+  // drops not-yet-notified observers for that emission (including connect select
+  // subscribers whose onUpdate triggered destroy). Defer complete until publish ends.
+  let pendingDestroyComplete = false;
 
   /**
    * Public state stream: replay committed `currentState` on subscribe, then
@@ -108,6 +112,10 @@ export function createStore<S, A extends Action> (
       } while (publishAgain);
     } finally {
       isPublishing = false;
+      if (pendingDestroyComplete) {
+        pendingDestroyComplete = false;
+        notifications$.complete();
+      }
     }
   }
 
@@ -237,7 +245,15 @@ export function createStore<S, A extends Action> (
    * store.destroy();
    */
   const destroy = (): void => {
+    if (isDestroyed) {
+      return;
+    }
     isDestroyed = true;
+    // If a subscriber destroys mid-notify, finish delivering this emission first.
+    if (isPublishing) {
+      pendingDestroyComplete = true;
+      return;
+    }
     notifications$.complete();
   };
 
