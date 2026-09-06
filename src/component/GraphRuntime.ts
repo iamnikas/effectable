@@ -156,6 +156,12 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
    * Used for transactional rollback on failure.
    */
   constructionJournal?: FiberConstructionJournal;
+  /**
+   * When set, `onUpdate(prevProps, props)` was deferred until the sibling-batch
+   * flush so later PLACE `@On*` handlers are subscribed before this UPDATE publishes.
+   * Cleared by {@link GraphRuntime.flushDeferredOnUpdate}.
+   */
+  deferredOnUpdate?: { prevProps: unknown };
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,6 +1438,83 @@ export class GraphRuntime {
   // ---------------------------------------------------------------------------
 
   /**
+   * Runs a deferred {@link Component.onUpdate} stashed on an UPDATE fiber during
+   * a sibling reconcile batch. No-op when nothing was deferred.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber that may hold deferredOnUpdate
+   * @returns {void | Promise<void>}
+   */
+
+  /**
+   * Flushes deferred onUpdate hooks for a sibling list in compose order.
+   * Used by the stable-children fast path (no PLACE flush loop there).
+   *
+   * @param {RuntimeFiber<unknown>[]} siblings - reconciled sibling fibers
+   * @returns {RuntimeFiber<unknown>[] | Promise<RuntimeFiber<unknown>[]>}
+   */
+  private flushDeferredOnUpdatesForSiblings (
+    siblings: RuntimeFiber<unknown>[],
+  ): RuntimeFiber<unknown>[] | Promise<RuntimeFiber<unknown>[]> {
+    for (let i = 0; i < siblings.length; i++) {
+      const flush = this.flushDeferredOnUpdate(siblings[i] as RuntimeFiber<unknown>);
+      if (isThenable(flush)) {
+        return this.continueFlushDeferredOnUpdatesForSiblings(siblings, i, flush);
+      }
+    }
+    return siblings;
+  }
+
+  /**
+   * Async continuation of {@link flushDeferredOnUpdatesForSiblings}.
+   *
+   * @param {RuntimeFiber<unknown>[]} siblings - sibling fibers
+   * @param {number} pendingIdx - index whose flush returned a Promise
+   * @param {PromiseLike<void>} pending - pending flush
+   * @returns {Promise<RuntimeFiber<unknown>[]>}
+   */
+  private async continueFlushDeferredOnUpdatesForSiblings (
+    siblings: RuntimeFiber<unknown>[],
+    pendingIdx: number,
+    pending: PromiseLike<void>,
+  ): Promise<RuntimeFiber<unknown>[]> {
+    await pending;
+    for (let i = pendingIdx + 1; i < siblings.length; i++) {
+      const flush = this.flushDeferredOnUpdate(siblings[i] as RuntimeFiber<unknown>);
+      if (isThenable(flush)) {
+        await flush;
+      }
+    }
+    return siblings;
+  }
+
+  private flushDeferredOnUpdate (
+    fiber: RuntimeFiber<unknown>,
+  ): void | Promise<void> {
+    const pending = fiber.deferredOnUpdate;
+    if (pending === undefined) {
+      return;
+    }
+    fiber.deferredOnUpdate = undefined;
+
+    const instance = fiber.instance;
+    if (instance === null || !fiber.engine.canUpdate()) {
+      return;
+    }
+
+    try {
+      instance.onUpdate(pending.prevProps, instance.props);
+    } catch (error: unknown) {
+      const cleanupResult = this.runFiberFailedCleanup(fiber, error);
+      if (isThenable(cleanupResult)) {
+        return cleanupResult.then(() => {
+          throw error;
+        });
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Runs deferred {@link LifecycleEngine.runStartup} for a fiber subtree in
    * children→parent order (siblings in compose order).
    *
@@ -2032,7 +2115,7 @@ export class GraphRuntime {
     const sameKey = (current.vnode.key ?? null) === (nextVnode.key ?? null);
 
     if (sameType && sameKey) {
-      return this.updateFiber(current, nextVnode, parentFiber, parentScope);
+      return this.updateFiber(current, nextVnode, parentFiber, parentScope, deferLifecycle);
     }
 
     // Type or key changed — destroy the old node, create a new one.
@@ -2052,12 +2135,15 @@ export class GraphRuntime {
 
   /**
    * Updates an existing fiber: applies new props to the instance,
-   * calls onUpdate, recursively diffs children.
+   * recursively diffs children, then calls onUpdate (or defers it when
+   * {@link deferLifecycle} is set for a sibling PLACE/REPLACE batch).
    *
    * @param {RuntimeFiber<P>} current - current fiber
    * @param {VirtualServiceNode<P>} nextVnode - new virtual node
    * @param {RuntimeFiber | null} parentFiber - parent fiber
    * @param {ContextScope} parentScope - parent scope
+   * @param {boolean} [deferLifecycle=false] - when true, defer onUpdate until
+   *   sibling-batch flush so later PLACE `@On*` handlers are already wired
    * @returns {Promise<RuntimeFiber<P>>}
    */
   private updateFiber<P>(
@@ -2065,6 +2151,7 @@ export class GraphRuntime {
     nextVnode: VirtualServiceNode<P>,
     parentFiber: RuntimeFiber<unknown> | null,
     parentScope: ContextScope,
+    deferLifecycle: boolean = false,
   ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
     const instance = current.instance;
 
@@ -2105,21 +2192,11 @@ export class GraphRuntime {
     // Build scope for child nodes (ContextProvider may have updated values)
     const childScope = this.buildChildScope(instance, parentScope);
 
-    // Call onUpdate if props or context changed (React 16.5 class-component style: one hook)
+    // onUpdate runs after child reconcile (and possibly after sibling-batch flush).
+    // Publishing here before PLACE children/siblings wire @On* dropped update-time events.
     const propsChanged = prevProps !== instance.props;
-    if ((propsChanged || contextChanged) && current.engine.canUpdate()) {
-      try {
-        instance.onUpdate(prevProps, instance.props);
-      } catch (error: unknown) {
-        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
-        if (isThenable(cleanupResult)) {
-          return cleanupResult.then(() => {
-            throw error;
-          });
-        }
-        throw error;
-      }
-    }
+    const shouldCallOnUpdate =
+      (propsChanged || contextChanged) && current.engine.canUpdate();
 
     // Reconcile child nodes (sync fast-path if all children are sync).
     // Ref commit is deferred to applyFiberUpdate so a compose()/child-reconcile
@@ -2145,46 +2222,58 @@ export class GraphRuntime {
       childScope,
     );
 
-    if (isThenable(childrenRes)) {
-      return childrenRes.then((nextChildren) => {
-        try {
-          this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
-        } catch (error: unknown) {
-          // Children already PLACE/UPDATE/DELETE'd. A throwing commitRef leaves
-          // PLACE/REPLACE fibers unreachable from current.children — failStop cannot
-          // reclaim them. Tear them down before rethrowing (HOLE 3 sibling).
-          const orphanRes = this.destroyOrphanedPlacedChildren(
-            current.children as RuntimeFiber<unknown>[],
-            nextChildren,
-            error,
-          );
-          if (isThenable(orphanRes)) {
-            return orphanRes.then(() => {
-              throw error;
-            });
-          }
-          throw error;
+    const finishUpdate = (
+      nextChildren: RuntimeFiber<unknown>[],
+    ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
+      try {
+        this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, nextChildren);
+      } catch (error: unknown) {
+        // Children already PLACE/UPDATE/DELETE'd. A throwing commitRef leaves
+        // PLACE/REPLACE fibers unreachable from current.children — failStop cannot
+        // reclaim them. Tear them down before rethrowing (HOLE 3 sibling).
+        const orphanRes = this.destroyOrphanedPlacedChildren(
+          current.children as RuntimeFiber<unknown>[],
+          nextChildren,
+          error,
+        );
+        if (isThenable(orphanRes)) {
+          return orphanRes.then(() => {
+            throw error;
+          });
         }
-        return current;
-      });
+        throw error;
+      }
+
+      if (shouldCallOnUpdate) {
+        if (deferLifecycle) {
+          // Sibling batch: later PLACE peers may still be unwired — flush after wiring.
+          (current as RuntimeFiber<unknown>).deferredOnUpdate = { prevProps };
+        } else {
+          try {
+            instance.onUpdate(prevProps, instance.props);
+          } catch (error: unknown) {
+            const cleanupResult = this.runFiberFailedCleanup(
+              current as RuntimeFiber<unknown>,
+              error,
+            );
+            if (isThenable(cleanupResult)) {
+              return cleanupResult.then(() => {
+                throw error;
+              });
+            }
+            throw error;
+          }
+        }
+      }
+
+      return current;
+    };
+
+    if (isThenable(childrenRes)) {
+      return childrenRes.then((nextChildren) => finishUpdate(nextChildren));
     }
 
-    try {
-      this.applyFiberUpdate(current, nextVnode, parentFiber, parentScope, childrenRes);
-    } catch (error: unknown) {
-      const orphanRes = this.destroyOrphanedPlacedChildren(
-        current.children as RuntimeFiber<unknown>[],
-        childrenRes,
-        error,
-      );
-      if (isThenable(orphanRes)) {
-        return orphanRes.then(() => {
-          throw error;
-        });
-      }
-      throw error;
-    }
-    return current;
+    return finishUpdate(childrenRes);
   }
 
   /**
@@ -2452,7 +2541,9 @@ export class GraphRuntime {
         stableResult.push(reconciled);
       }
 
-      return stableResult;
+      // UPDATE onUpdates may have been deferred (deferLifecycle=true on stable path).
+      // No new PLACE siblings here, but deferred hooks must still run.
+      return this.flushDeferredOnUpdatesForSiblings(stableResult);
     }
 
     // === FULL DIFF PATH — always async (complex logic; sync path not optimized here) ===
@@ -2494,7 +2585,8 @@ export class GraphRuntime {
       resultSoFar.push(isThenable(reconciled) ? await reconciled : (reconciled as RuntimeFiber<unknown>));
     }
 
-    return resultSoFar;
+    const flushed = this.flushDeferredOnUpdatesForSiblings(resultSoFar);
+    return isThenable(flushed) ? await flushed : flushed;
   }
 
   /**
@@ -2696,8 +2788,13 @@ export class GraphRuntime {
         }
       }
 
-      // Flush PLACE/REPLACE startups in compose order after every new sibling is wired.
+      // Flush deferred onUpdates then PLACE/REPLACE startups in compose order
+      // after every new sibling is wired (@On* subscribed).
       for (const child of nextChildren) {
+        const onUpdateFlush = this.flushDeferredOnUpdate(child);
+        if (isThenable(onUpdateFlush)) {
+          await onUpdateFlush;
+        }
         if (child.constructionJournal?.lifecycleDeferred === true) {
           const flush = this.flushDeferredLifecycleTree(child);
           if (isThenable(flush)) {
