@@ -1447,6 +1447,27 @@ export class GraphRuntime {
       throw error;
     }
 
+    // Wire parent @On*/@Use*Bus BEFORE children materialize. Children run onMount during
+    // their materialize; a child publish/execute/ask targeting this parent must already see
+    // registered handlers (mirror of teardown: parent bus outlives children — see #80).
+    try {
+      this.attachEffectableRuntimeBusWiring(instance, fiber);
+      if (fiber.effectableRuntimeBusDisposer !== undefined) {
+        fiber.constructionJournal!.busWiringAttached = true;
+      }
+    } catch (err) {
+      const rollbackRes = this.rollbackFailedMaterialization(
+        fiber,
+        err instanceof Error ? err : new Error(String(err)),
+      );
+      if (isThenable(rollbackRes)) {
+        return rollbackRes.then(() => {
+          throw err;
+        }) as Promise<RuntimeFiber<P>>;
+      }
+      throw err;
+    }
+
     for (let i = 0; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
       let childRes: RuntimeFiber<unknown> | Promise<RuntimeFiber<unknown>>;
@@ -1499,24 +1520,6 @@ export class GraphRuntime {
         }
         throw error;
       }
-    }
-
-    try {
-      this.attachEffectableRuntimeBusWiring(instance, fiber);
-      if (fiber.effectableRuntimeBusDisposer !== undefined) {
-        fiber.constructionJournal!.busWiringAttached = true;
-      }
-    } catch (err) {
-      const rollbackRes = this.rollbackFailedMaterialization(
-        fiber,
-        err instanceof Error ? err : new Error(String(err)),
-      );
-      if (isThenable(rollbackRes)) {
-        return rollbackRes.then(() => {
-          throw err;
-        }) as Promise<RuntimeFiber<P>>;
-      }
-      throw err;
     }
 
     // Run lifecycle after all children are materialized.
@@ -1602,6 +1605,8 @@ export class GraphRuntime {
 
     fiber.children = journal.mountedChildren as Fiber[];
 
+    // Parent bus was wired in materialize before children (including before this async tail).
+
     if (vnode.ref !== undefined) {
       try {
         this.commitRef(undefined, null, vnode.ref, instance);
@@ -1615,22 +1620,6 @@ export class GraphRuntime {
         }
         throw error;
       }
-    }
-
-    try {
-      this.attachEffectableRuntimeBusWiring(instance, fiber);
-      if (fiber.effectableRuntimeBusDisposer !== undefined) {
-        journal.busWiringAttached = true;
-      }
-    } catch (err) {
-      const rollbackRes = this.rollbackFailedMaterialization(
-        fiber,
-        err instanceof Error ? err : new Error(String(err)),
-      );
-      if (isThenable(rollbackRes)) {
-        await rollbackRes;
-      }
-      throw err;
     }
 
     // Pre-mount hook already injected at the start of materialize (before children).
