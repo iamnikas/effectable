@@ -669,6 +669,15 @@ function buildConnectHoc<S, P, R, A extends Action> (
 
         if (isStoreLike(this.__connectStoreFromContext)) {
           this.__connectStore = this.__connectStoreFromContext as Store<S, A>;
+          try {
+            this.__connectStore.getState();
+          } catch {
+            this.__connectStoreDestroyed = true;
+            throw new Error(
+              '[Effectable.connect] Store select completed before the first state emission ' +
+              '(store may have been destroyed).'
+            );
+          }
           return this.__connectStore;
         }
 
@@ -706,6 +715,16 @@ function buildConnectHoc<S, P, R, A extends Action> (
 
         if (isStoreLike(this.__connectStoreFromContext)) {
           this.__connectStore = this.__connectStoreFromContext as Store<S, A>;
+          // Same liveness probe as the cached-store path. A destroyed ancestor still
+          // republishes the store into context for identity (#106); adopting it without
+          // getState() lets syncConnectPropsBeforeCompose throw and fail-stop GraphRuntime
+          // when a new context child is PLACE'd after destroy.
+          try {
+            this.__connectStore.getState();
+          } catch {
+            this.__connectStoreDestroyed = true;
+            return null;
+          }
           return this.__connectStore;
         }
 
@@ -892,7 +911,19 @@ function buildConnectHoc<S, P, R, A extends Action> (
         // different provider must re-resolve; reset to the explicit store (null for children).
         this.__connectStore = explicitStore;
         this.disposeConnectSubscription();
-        const store = this.resolveConnectStore();
+        let store: Store<S, A>;
+        try {
+          store = this.resolveConnectStore();
+        } catch (error: unknown) {
+          // Context child under a destroyed ancestor store: soft-complete so a later
+          // PLACE after destroy does not fail-stop the parent tree (#106). Explicit-store
+          // mounts still throw (#87/#112).
+          if (explicitStore === null && this.__connectStoreDestroyed) {
+            this.__connectMountCompleted = true;
+            return;
+          }
+          throw error;
+        }
         this.refreshDispatchProps(store);
 
         // Class-field, Connected-subclass prototype override, or wrapped prototype.
@@ -1016,6 +1047,15 @@ function buildConnectHoc<S, P, R, A extends Action> (
         }
 
         if (syncSubscribeError !== null) {
+          // Explicit-store mounts must fail (#87/#112). Context-only children under a
+          // destroyed ancestor store (#106 kept the parent ACTIVE) must not throw:
+          // GraphRuntime fail-stops the entire tree on nested onMount failure.
+          // Only soft-complete when complete() marked the store destroyed — other
+          // syncSubscribeError causes (mapper throw, remount races) still fail mount.
+          if (explicitStore === null && this.__connectStoreDestroyed) {
+            this.__connectMountCompleted = true;
+            return;
+          }
           throw syncSubscribeError;
         }
 
@@ -1049,6 +1089,10 @@ function buildConnectHoc<S, P, R, A extends Action> (
             // Suppress orphan rejection — caller receives the syncSubscribeError throw instead.
             void Promise.resolve(mountResult as Promise<void>).then(() => undefined, () => undefined);
           }
+          if (explicitStore === null && this.__connectStoreDestroyed) {
+            this.__connectMountCompleted = true;
+            return;
+          }
           throw syncSubscribeError;
         }
 
@@ -1064,6 +1108,10 @@ function buildConnectHoc<S, P, R, A extends Action> (
           if (syncSubscribeError !== null) {
             this.disposeConnectSubscription();
             this.__connectPendingUpdate = false;
+            if (explicitStore === null && this.__connectStoreDestroyed) {
+              this.__connectMountCompleted = true;
+              return;
+            }
             throw syncSubscribeError;
           }
           this.completeConnectMount();
