@@ -246,9 +246,9 @@ describe('GraphRuntime: setState inside onMount', () => {
       }
 
       public override onMount (): void {
-        // Replica of the production hack: direct state update in mount...
-        this.state = { ...this.state, show: true };
-        // ...and an empty setState on the next tick, when the update hook is already injected.
+        // Direct this.state = after construction warns and does not apply — use setState.
+        this.setState({ show: true });
+        // Control: empty setState on the next tick, when the update hook is already injected.
         setTimeout(() => {
           this.setState({});
         }, 0);
@@ -386,8 +386,9 @@ describe('connect + GraphRuntime: kick-off after mount with pre-populated store 
       }
 
       public override onMount (): void {
-        // Direct state mutation WITHOUT setState. The consumer does not call setState —
-        // the library must deliver post-mount kick-off.
+        // Direct this.state = without setState (legacy consumer pattern). Gate may still be
+        // open if onMount runs in the same turn as `new`; post-gate assigns warn and no-op.
+        // Consumer does not call setState — library must deliver post-mount kick-off.
         this.state = { ...this.state, projectId: 'project-1' };
       }
 

@@ -41,7 +41,16 @@ Explicit Resource Management (ECMAScript) contract: `[Symbol.dispose]()`. Used b
 
 - **Type parameters:** `S` — state type, `P` — props type (defaults to `unknown`).
 - **Constructor:** `constructor(props: P, initialState?: S)`. If `initialState` is omitted, state is initialized as `{}`.
-- **Fields:** `state: S`, `props: P` — public, available in subclasses and externally.
+- **Fields:** `state: S` (public getter; assignment after construction warns and is ignored), `props: P` — available in subclasses and externally.
+
+### Single writer: `setState` only
+
+Only **`setState`** may change component state after construction. That path calls `onUpdate` and schedules reconcile.
+
+- Direct `this.state = …` after init is forbidden: it emits **`console.warn`** and does **not** change state (no write, no `onUpdate` / reconcile). Prefer `setState`.
+- Constructor init is allowed without warning: `super(props, initialState)` and/or `this.state = …` in the constructor body (canonical app pattern).
+- If you do **not** need reconciliation, store the value in a **ref** (`@UseRef`) instead of state.
+- `mutableState` stays opt-in as today: still goes through `setState`, mutates in-place; there is no second public writer.
 
 ### setState(update)
 
