@@ -442,6 +442,40 @@ describe('createStore', () => {
       subSelect.unsubscribe();
       store.destroy();
     });
+
+    it('after nested subscriber dispatch, new state$/select subscribers replay getState() (not a stale buffer)', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      let midGetState: number | undefined;
+      let midStateReplay: number | undefined;
+      let midSelectReplay: number | undefined;
+
+      const subA = store.state$.subscribe((state) => {
+        if (state.count === 1) {
+          store.dispatch({ type: 'SET', payload: 99 });
+          midGetState = store.getState().count;
+          store.state$.subscribe((s) => {
+            midStateReplay = s.count;
+          }).unsubscribe();
+          store.select((s) => s.count).subscribe((n) => {
+            midSelectReplay = n;
+          }).unsubscribe();
+        }
+      });
+
+      store.dispatch({ type: 'INC' });
+
+      expect(midGetState).toBe(99);
+      expect(midStateReplay).toBe(99);
+      expect(midSelectReplay).toBe(99);
+      expect(store.getState().count).toBe(99);
+
+      subA.unsubscribe();
+      store.destroy();
+    });
   });
 
   describe('enhancer (B07)', () => {
