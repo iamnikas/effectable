@@ -2139,10 +2139,15 @@ export class GraphRuntime {
   }
 
   /**
-   * Flushes REPLACE victims (including nested under UPDATE), then pending onUpdates,
-   * then deferred nested orphans, then deferred startups for a sibling batch.
+   * Flushes REPLACE victims (including nested under UPDATE), then deferred nested
+   * orphans, then pending onUpdates, then deferred startups for a sibling batch.
    * When `deferPendingBatchFlush` is true, holds all of the above for the ancestor.
-   * Victims may already be cleared before orphan DELETE; this path remains idempotent.
+   * Victims/orphans may already be cleared before a later pass; this path is idempotent.
+   *
+   * Nested orphans held by #195 must die before onUpdate: otherwise Early onUpdate
+   * EventBus publishes dual-deliver to the removed child and any Late PLACE listener.
+   * Sibling-level orphans (pendingOrphanSet in full-diff) still destroy *after*
+   * onUpdate for intentional UPDATE↔DELETE handoff.
    *
    * @param {RuntimeFiber<unknown>[]} nextChildren - reconciled sibling fibers
    * @param {boolean} [deferPendingBatchFlush=false] - hold teardown + lifecycle for ancestor
@@ -2154,7 +2159,7 @@ export class GraphRuntime {
   ): void | Promise<void> {
     // When this UPDATE is already deferred for a sibling batch, hold REPLACE-victim
     // destroy too — nested victim onUnmount must wait until later sibling PLACE wires.
-    // Ancestor flush drains victims (tree walk), onUpdate, deferred orphans, lifecycle.
+    // Ancestor flush drains victims → deferred orphans → onUpdate → lifecycle.
     if (deferPendingBatchFlush) {
       return;
     }
@@ -2247,6 +2252,16 @@ export class GraphRuntime {
     // reconcile must not flush descendant onUpdate *or* deferred onMount yet — a later
     // sibling may still PLACE @On* handlers. Ancestor flush drains both after peers wire.
     if (!deferPendingBatchFlush) {
+      // Nested full-diff under a deferred UPDATE stashes orphans on the UPDATE fiber.
+      // Destroy them before onUpdate (pre-#195 eager nested teardown order) so Early
+      // onUpdate cannot dual-deliver EventBus to the removed child + Late PLACE.
+      const orphansFlush = this.flushPendingDeferredOrphansTree(nextChildren);
+      if (isThenable(orphansFlush)) {
+        return this.continueFlushSiblingBatchHooksAsync(
+          nextChildren, -1, orphansFlush, 'orphans', deferPendingBatchFlush,
+        );
+      }
+
       for (let i = 0; i < nextChildren.length; i++) {
         const onUpdateFlush = this.flushPendingOnUpdateTree(nextChildren[i] as RuntimeFiber<unknown>);
         if (isThenable(onUpdateFlush)) {
@@ -2254,15 +2269,6 @@ export class GraphRuntime {
             nextChildren, i, onUpdateFlush, 'onUpdate', deferPendingBatchFlush,
           );
         }
-      }
-
-      // Nested full-diff under a deferred UPDATE stashes orphans on the UPDATE fiber;
-      // destroy them after onUpdate (same order as eager full-diff) and before onMount.
-      const orphansFlush = this.flushPendingDeferredOrphansTree(nextChildren);
-      if (isThenable(orphansFlush)) {
-        return this.continueFlushSiblingBatchHooksAsync(
-          nextChildren, -1, orphansFlush, 'orphans', deferPendingBatchFlush,
-        );
       }
 
       // Always walk each sibling subtree: nested PLACE under an UPDATE sibling keeps
@@ -2286,14 +2292,14 @@ export class GraphRuntime {
    * @param {RuntimeFiber<unknown>[]} nextChildren - sibling fibers
    * @param {number} pendingIdx - index being awaited
    * @param {PromiseLike<void>} pending - pending flush
-   * @param {'onUpdate' | 'lifecycle'} phase - which loop to resume
+   * @param {'orphans' | 'onUpdate' | 'lifecycle'} phase - which loop to resume
    * @returns {Promise<void>}
    */
   private async continueFlushSiblingBatchHooksAsync (
     nextChildren: RuntimeFiber<unknown>[],
     pendingIdx: number,
     pending: PromiseLike<void>,
-    phase: 'onUpdate' | 'orphans' | 'lifecycle',
+    phase: 'orphans' | 'onUpdate' | 'lifecycle',
     deferPendingBatchFlush: boolean = false,
   ): Promise<void> {
     await pending;
@@ -2302,20 +2308,22 @@ export class GraphRuntime {
       return;
     }
 
-    if (phase === 'onUpdate') {
+    if (phase === 'orphans') {
+      for (let i = 0; i < nextChildren.length; i++) {
+        const onUpdateFlush = this.flushPendingOnUpdateTree(nextChildren[i] as RuntimeFiber<unknown>);
+        if (isThenable(onUpdateFlush)) {
+          await onUpdateFlush;
+        }
+      }
+      phase = 'lifecycle';
+      pendingIdx = -1;
+    } else if (phase === 'onUpdate') {
       for (let i = pendingIdx + 1; i < nextChildren.length; i++) {
         const onUpdateFlush = this.flushPendingOnUpdateTree(nextChildren[i] as RuntimeFiber<unknown>);
         if (isThenable(onUpdateFlush)) {
           await onUpdateFlush;
         }
       }
-      const orphansFlush = this.flushPendingDeferredOrphansTree(nextChildren);
-      if (isThenable(orphansFlush)) {
-        await orphansFlush;
-      }
-      phase = 'lifecycle';
-      pendingIdx = -1;
-    } else if (phase === 'orphans') {
       phase = 'lifecycle';
       pendingIdx = -1;
     }
@@ -4229,16 +4237,22 @@ export class GraphRuntime {
           }
         }
       } else {
-        // Order matches flushSiblingBatchHooks: REPLACE victims → onUpdate → orphans.
-        // Victims must die before onUpdate: after nested teardown deferral, nested
-        // REPLACE victims under Early survive until this ancestor drain — flushing
-        // onUpdate first dual-delivers EventBus publishes to victim + replacement.
-        // Orphans stay until after onUpdate so orphan @On* still receive handoff.
-        // Sibling PLACE/REPLACE from pass 1 and nested PLACE under later UPDATEs are
-        // already wired before this block.
+        // Order matches flushSiblingBatchHooks for nested teardown:
+        // REPLACE victims → deferred nested orphans → onUpdate → sibling orphans.
+        // Victims/nested-orphans must die before onUpdate: after #195 deferral they
+        // survive until this ancestor drain — onUpdate-first dual-delivers EventBus to
+        // the removed instance and any Late PLACE listener / replacement.
+        // Sibling-level pendingOrphanSet stays until after onUpdate so UPDATE↔DELETE
+        // handoff still reaches orphan @On*. Pass-1 PLACE/REPLACE and nested PLACE
+        // under later UPDATEs are already wired before this block.
         const victimsRes = this.flushPendingReplaceVictims(nextChildren);
         if (isThenable(victimsRes)) {
           await victimsRes;
+        }
+
+        const deferredOrphansRes = this.flushPendingDeferredOrphansTree(nextChildren);
+        if (isThenable(deferredOrphansRes)) {
+          await deferredOrphansRes;
         }
 
         for (let i = 0; i < nextChildren.length; i++) {
@@ -4250,11 +4264,11 @@ export class GraphRuntime {
           }
         }
 
-        // Destroy orphans after onUpdate flush in original compose order (not keyed-then-
-        // unkeyed). Keyed-first teardown inverted compose order when an unkeyed sibling
-        // preceded a keyed one, so an earlier unkeyed onUnmount publish could miss a later
-        // keyed @On* listener. PLACE peers are already wired, so onUnmount publishes
-        // still reach same-batch PLACE @On*.
+        // Destroy sibling orphans after onUpdate flush in original compose order (not
+        // keyed-then-unkeyed). Keyed-first teardown inverted compose order when an
+        // unkeyed sibling preceded a keyed one, so an earlier unkeyed onUnmount publish
+        // could miss a later keyed @On* listener. PLACE peers are already wired, so
+        // onUnmount publishes still reach same-batch PLACE @On*.
         for (const child of currentChildren) {
           if (!pendingOrphanSet.has(child)) {
             continue;
