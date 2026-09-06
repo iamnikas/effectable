@@ -400,6 +400,26 @@ export class GraphRuntime {
   }
 
   /**
+   * Disposes runtime-bus wiring for `fiber` and every mounted descendant.
+   * Needed when a victim/orphan subtree must free exclusive Command/Query
+   * registrations before a replacement PLACE/REPLACE wires the same types —
+   * root-only dispose leaves nested `@OnCommand` / `@OnQuery` live.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - subtree root
+   * @returns {void}
+   */
+  private disposeEffectableRuntimeBusWiringSubtree (fiber: RuntimeFiber<unknown>): void {
+    const children = fiber.children;
+    for (let i = 0; i < children.length; i += 1) {
+      const child = children[i];
+      if (child !== undefined) {
+        this.disposeEffectableRuntimeBusWiringSubtree(child as RuntimeFiber<unknown>);
+      }
+    }
+    this.disposeEffectableRuntimeBusWiring(fiber);
+  }
+
+  /**
    * Fibers that will be unpaired after the next-child match (full-diff orphans).
    * Pure: mirrors keyed/unkeyed matching without materializing or destroying.
    *
@@ -2208,6 +2228,17 @@ export class GraphRuntime {
     parentFiber: RuntimeFiber<unknown> | null,
     parentScope: ContextScope,
   ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    // Free exclusive Command/Query registrations on the victim subtree before
+    // the replacement wires the same types. EventBus is multi-subscriber, but
+    // early dispose is still safe — victim onUnmount publishes after the
+    // replacement is wired, so @OnEvent handoffs keep working (publisher need
+    // not stay subscribed). destroyFiber will dispose again (no-op once cleared).
+    try {
+      this.disposeEffectableRuntimeBusWiringSubtree(current as RuntimeFiber<unknown>);
+    } catch {
+      // Best-effort: a throwing disposer must not block root REPLACE handoff.
+    }
+
     const afterMaterialize = (
       nextFiber: RuntimeFiber<P>,
     ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
