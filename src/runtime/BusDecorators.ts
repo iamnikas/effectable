@@ -220,6 +220,52 @@ export function instanceUsesRuntimeBusDecorators (instance: object): boolean {
 }
 
 /**
+ * Unregisters only exclusive `@OnCommand` / `@OnQuery` handlers for an instance.
+ *
+ * Used when an orphan must release exclusive bus slots before a same-batch PLACE
+ * registers the same types, while leaving `@OnEvent` subscriptions intact so a
+ * deferred sibling UPDATE can still publish into the orphan before destroy.
+ *
+ * The instance's full {@link wireRuntimeBuses} disposer remains valid: later
+ * unregister teardown is idempotent once types are cleared.
+ *
+ * @template TCommand
+ * @template TQuery
+ * @template TEvent
+ * @param {object} instance - wired component instance
+ * @param {RuntimeBusesBundle<TCommand, TQuery, TEvent>} buses - runtime bus bundle
+ * @returns {void}
+ */
+export function releaseExclusiveRuntimeBusHandlers<
+  TCommand extends RuntimeCommand,
+  TQuery extends RuntimeQuery,
+  TEvent extends RuntimeEvent,
+> (
+  instance: object,
+  buses: RuntimeBusesBundle<TCommand, TQuery, TEvent>,
+): void {
+  const leafCtor = instance.constructor as Function;
+  const commandTypes = new Set<string>();
+  const queryTypes = new Set<string>();
+
+  for (const ctor of getConstructorChainLeafFirst(leafCtor)) {
+    for (const { type } of getHandlerEntries(ctor, ON_COMMAND_ENTRIES)) {
+      commandTypes.add(type);
+    }
+    for (const { type } of getHandlerEntries(ctor, ON_QUERY_ENTRIES)) {
+      queryTypes.add(type);
+    }
+  }
+
+  for (const type of commandTypes) {
+    buses.commandBus.unregister(type as TCommand['type']);
+  }
+  for (const type of queryTypes) {
+    buses.queryBus.unregister(type as TQuery['type']);
+  }
+}
+
+/**
  * Calls {@link wireRuntimeBuses} only if the constructor chain has relevant decorators.
  *
  * @template TCommand

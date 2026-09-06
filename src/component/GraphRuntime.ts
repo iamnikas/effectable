@@ -61,7 +61,10 @@ import type {
   RuntimeQuery,
 } from '../runtime/types';
 import type { RuntimeBusesBundle } from '../runtime/BusDecorators';
-import { wireRuntimeBusesIfDecorated } from '../runtime/BusDecorators';
+import {
+  releaseExclusiveRuntimeBusHandlers,
+  wireRuntimeBusesIfDecorated,
+} from '../runtime/BusDecorators';
 import { GRAPH_RUNTIME_MAX_DIRTY_FLUSH_PASSES } from './graphRuntime.constants';
 
 /**
@@ -2716,17 +2719,25 @@ export class GraphRuntime {
     const nextChildren: RuntimeFiber<unknown>[] = [];
     let unkeyedIdx = 0;
 
-    // Unregister orphan buses BEFORE any PLACE materialize. CommandBus/QueryBus allow
-    // only one handler per type: PLACE `@OnCommand`/`@OnQuery` for a type still owned by
-    // a not-yet-destroyed orphan throws and fail-stops. EventBus is multi-subscriber, but
-    // disposing early is still safe — orphan `onUnmount` publishes after PLACE wires, so
-    // `@OnEvent` handoffs keep working (publisher need not stay subscribed).
-    for (const orphan of this.collectFullDiffOrphans(currentChildren, nextVnodes, hasKeyedCurrent)) {
-      try {
-        this.disposeEffectableRuntimeBusWiring(orphan);
-      } catch {
-        // Best-effort: a throwing disposer must not skip remaining orphans or block PLACE.
-        // destroyFiber will attempt dispose again (no-op once cleared).
+    // Release orphan exclusive Command/Query slots BEFORE any PLACE materialize.
+    // Those buses allow only one handler per type: PLACE `@OnCommand`/`@OnQuery` for a
+    // type still owned by a not-yet-destroyed orphan throws and fail-stops.
+    // Keep `@OnEvent` subscriptions until destroy — deferred sibling UPDATE may still
+    // publish into the orphan before onUnmount (#158). EventBus is multi-subscriber, and
+    // orphan `onUnmount` publishes after PLACE wires without needing the orphan subscribed.
+    if (this.effectableRuntimeBuses !== null) {
+      const buses = this.effectableRuntimeBuses;
+      for (const orphan of this.collectFullDiffOrphans(currentChildren, nextVnodes, hasKeyedCurrent)) {
+        const instance = orphan.instance;
+        if (instance === null) {
+          continue;
+        }
+        try {
+          releaseExclusiveRuntimeBusHandlers(instance, buses);
+        } catch {
+          // Best-effort: a throwing unregister must not skip remaining orphans or block PLACE.
+          // destroyFiber still runs the full bus disposer later.
+        }
       }
     }
 
