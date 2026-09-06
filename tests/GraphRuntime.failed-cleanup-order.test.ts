@@ -147,7 +147,6 @@ describe('GraphRuntime failed-cleanup order', () => {
 
   it('parent onMount fail: parent ref stays set until after child onUnmount', async () => {
     const calls: string[] = [];
-    const parentRef: RefObject<Component> = { current: null };
 
     class Child extends Component {
       public override onMount (): void {
@@ -156,7 +155,7 @@ describe('GraphRuntime failed-cleanup order', () => {
 
       public override onUnmount (): void {
         calls.push('child:onUnmount');
-        // Residual #69 hole: rollback cleared parent ref before destroying children.
+        // Rollback must not clear parent ref before destroying children.
         calls.push(parentRef.current === null ? 'parentRef:null' : 'parentRef:alive');
       }
     }
@@ -175,6 +174,8 @@ describe('GraphRuntime failed-cleanup order', () => {
         return [h(Child, {})];
       }
     }
+
+    const parentRef: RefObject<Parent> = { current: null };
 
     await expect(GraphRuntime.mount(h(Parent, {}, parentRef))).rejects.toThrow('parent boom');
     expect(calls).toEqual([
