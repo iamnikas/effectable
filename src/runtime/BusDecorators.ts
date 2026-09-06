@@ -30,6 +30,15 @@ const ON_COMMAND_ENTRIES = 'effectable:runtime:OnCommand:entries';
 const ON_QUERY_ENTRIES = 'effectable:runtime:OnQuery:entries';
 const ON_EVENT_ENTRIES = 'effectable:runtime:OnEvent:entries';
 
+/**
+ * Generation-scoped Command/Query disposers from the latest {@link wireRuntimeBuses}
+ * call for an instance. {@link releaseExclusiveRuntimeBusHandlers} must invoke these
+ * instead of type-wide `unregister`: a nested UPDATE's child reconcile can release
+ * the same orphan again *after* a sibling PLACE already re-registered that type —
+ * type-wide unregister would wipe the new owner (fail-stop avoided, silent no-op handler).
+ */
+const exclusiveBusDisposersByInstance = new WeakMap<object, Array<() => void>>();
+
 function appendPropKey (ctor: Function, metaKey: string, propertyKey: string | symbol): void {
   const key = String(propertyKey);
   const current = Reflect.getOwnMetadata(metaKey, ctor) as string[] | undefined;
@@ -226,14 +235,16 @@ export function instanceUsesRuntimeBusDecorators (instance: object): boolean {
  * registers the same types, while leaving `@OnEvent` subscriptions intact so a
  * deferred sibling UPDATE can still publish into the orphan before destroy.
  *
- * The instance's full {@link wireRuntimeBuses} disposer remains valid: later
- * unregister teardown is idempotent once types are cleared.
+ * Uses generation-scoped disposers from {@link wireRuntimeBuses} (not type-wide
+ * `unregister`) so a second release after a sibling PLACE re-registered the same
+ * type cannot delete the new owner. Full {@link wireRuntimeBuses} dispose remains
+ * valid and idempotent for the exclusive slots.
  *
  * @template TCommand
  * @template TQuery
  * @template TEvent
  * @param {object} instance - wired component instance
- * @param {RuntimeBusesBundle<TCommand, TQuery, TEvent>} buses - runtime bus bundle
+ * @param {RuntimeBusesBundle<TCommand, TQuery, TEvent>} _buses - runtime bus bundle (unused; kept for call-site stability)
  * @returns {void}
  */
 export function releaseExclusiveRuntimeBusHandlers<
@@ -242,26 +253,18 @@ export function releaseExclusiveRuntimeBusHandlers<
   TEvent extends RuntimeEvent,
 > (
   instance: object,
-  buses: RuntimeBusesBundle<TCommand, TQuery, TEvent>,
+  _buses: RuntimeBusesBundle<TCommand, TQuery, TEvent>,
 ): void {
-  const leafCtor = instance.constructor as Function;
-  const commandTypes = new Set<string>();
-  const queryTypes = new Set<string>();
-
-  for (const ctor of getConstructorChainLeafFirst(leafCtor)) {
-    for (const { type } of getHandlerEntries(ctor, ON_COMMAND_ENTRIES)) {
-      commandTypes.add(type);
-    }
-    for (const { type } of getHandlerEntries(ctor, ON_QUERY_ENTRIES)) {
-      queryTypes.add(type);
-    }
+  const exclusiveDisposers = exclusiveBusDisposersByInstance.get(instance);
+  if (typeof exclusiveDisposers === 'undefined') {
+    return;
   }
-
-  for (const type of commandTypes) {
-    buses.commandBus.unregister(type as TCommand['type']);
-  }
-  for (const type of queryTypes) {
-    buses.queryBus.unregister(type as TQuery['type']);
+  exclusiveBusDisposersByInstance.delete(instance);
+  for (let i = exclusiveDisposers.length - 1; i >= 0; i -= 1) {
+    const dispose = exclusiveDisposers[i];
+    if (typeof dispose === 'function') {
+      dispose();
+    }
   }
 }
 
@@ -383,6 +386,7 @@ export function wireRuntimeBuses<
     }
 
     const record = instance as Record<string, unknown>;
+    const exclusiveDisposers: Array<() => void> = [];
 
     for (const [type, method] of mergedCommand) {
       const raw = record[method];
@@ -392,7 +396,9 @@ export function wireRuntimeBuses<
       const handler: CommandHandler<TCommand, unknown> = (command) => {
         return raw.call(instance, command) as ReturnType<CommandHandler<TCommand, unknown>>;
       };
-      disposers.push(buses.commandBus.register(type as TCommand['type'], handler));
+      const disposeCommand = buses.commandBus.register(type as TCommand['type'], handler);
+      disposers.push(disposeCommand);
+      exclusiveDisposers.push(disposeCommand);
     }
 
     for (const [type, method] of mergedQuery) {
@@ -403,7 +409,9 @@ export function wireRuntimeBuses<
       const handler: QueryHandler<TQuery, unknown> = (query) => {
         return raw.call(instance, query) as ReturnType<QueryHandler<TQuery, unknown>>;
       };
-      disposers.push(buses.queryBus.register(type as TQuery['type'], handler));
+      const disposeQuery = buses.queryBus.register(type as TQuery['type'], handler);
+      disposers.push(disposeQuery);
+      exclusiveDisposers.push(disposeQuery);
     }
 
     for (const [type, methods] of mergedEvent) {
@@ -418,7 +426,12 @@ export function wireRuntimeBuses<
         disposers.push(buses.eventBus.subscribe(type as TEvent['type'], handler));
       }
     }
+
+    if (exclusiveDisposers.length > 0) {
+      exclusiveBusDisposersByInstance.set(instance, exclusiveDisposers);
+    }
   } catch (wiringError) {
+    exclusiveBusDisposersByInstance.delete(instance);
     const { cleanupErrors } = unwindDisposers(disposers);
     const primary = wiringError instanceof Error ? wiringError : new Error(String(wiringError));
     if (cleanupErrors.length > 0) {
@@ -433,6 +446,7 @@ export function wireRuntimeBuses<
       return;
     }
     disposed = true;
+    exclusiveBusDisposersByInstance.delete(instance);
 
     const { cleanupErrors } = unwindDisposers(disposers);
     if (cleanupErrors.length > 0) {
