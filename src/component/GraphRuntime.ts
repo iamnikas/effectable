@@ -3712,7 +3712,8 @@ export class GraphRuntime {
     // destroy before pass 2 so PLACE could wire first, but that also ran sibling
     // onUnmount before UPDATE onUpdate — silent handoff loss / stale props on the
     // surviving listener. Collect orphans here; release the keyed Map before pass 2.
-    const pendingOrphans: RuntimeFiber<unknown>[] = [];
+    /** Unmatched current children to destroy; iteration uses compose order below. */
+    const pendingOrphanSet = new Set<RuntimeFiber<unknown>>();
 
     /**
      * Same type+key → schedule UPDATE for pass 2; otherwise REPLACE with deferred startup.
@@ -3802,9 +3803,9 @@ export class GraphRuntime {
             }
           }
 
-          // Queue unpaired keyed orphans — destroy after pass-2 UPDATEs (see pendingOrphans).
+          // Queue unpaired keyed orphans — destroy after pass-2 UPDATEs (see pendingOrphanSet).
           for (const [, orphan] of keyedCurrentMap) {
-            pendingOrphans.push(orphan);
+            pendingOrphanSet.add(orphan);
           }
         } finally {
           this.reconcileDepth--;
@@ -3840,7 +3841,7 @@ export class GraphRuntime {
         const orphan = unkeyedCurrent[i];
 
         if (orphan !== undefined) {
-          pendingOrphans.push(orphan);
+          pendingOrphanSet.add(orphan);
         }
       }
 
@@ -3867,10 +3868,16 @@ export class GraphRuntime {
         await victimsRes;
       }
 
-      // Destroy orphans after UPDATEs (best-effort finalize errors). PLACE peers are
-      // already wired, so onUnmount publishes still reach same-batch PLACE @On*.
-      for (const orphan of pendingOrphans) {
-        const d = this.destroyFiber(orphan, []);
+      // Destroy orphans after UPDATEs in original compose order (not keyed-then-unkeyed).
+      // Keyed-first teardown inverted compose order when an unkeyed sibling preceded a
+      // keyed one, so an earlier unkeyed onUnmount publish could miss a later keyed @On*
+      // listener (#174). PLACE peers are already wired, so onUnmount publishes still reach
+      // same-batch PLACE @On*.
+      for (const child of currentChildren) {
+        if (!pendingOrphanSet.has(child)) {
+          continue;
+        }
+        const d = this.destroyFiber(child, []);
         if (isThenable(d)) {
           await d;
         }
