@@ -12,6 +12,8 @@
  * - Remount clears stale mapped state props and re-resolves the context store when needed.
  * - Class-field `onMount` / `onUnmount` (own instance properties) still go through connect wiring
  *   and do not shadow store subscribe / unsubscribe.
+ * - Subclass-of-Connected prototype `override onMount` / `onUnmount` still run after wiring
+ *   (own Connected hooks shadow Ext.prototype for GraphRuntime entry; connect re-resolves them).
  * - `mapStateToProps` subscribe failures fail the mount; mapDispatch-only hosts still get the
  *   post-mount kick-off after a successful mount.
  *
@@ -85,6 +87,58 @@ function isStoreLike (value: unknown): boolean {
     typeof record['select'] === 'function' &&
     typeof record['destroy'] === 'function'
   );
+}
+
+/**
+ * Resolves the user `onMount` / `onUnmount` connect should invoke after its own wiring.
+ *
+ * Order:
+ * 1. Own class-field hook captured in the Connected constructor (`ownCaptured`)
+ * 2. Nearest prototype-own hook on the instance chain below `connectedProto`
+ *    (so `class Ext extends Connected { override onMount() {…} }` is found)
+ * 3. Hook on the wrapped constructor prototype (`wrappedProto`)
+ *
+ * Connected installs own lifecycle properties that shadow subclass prototype methods for
+ * GraphRuntime entry; without (2), those overrides are skipped while store wiring still runs.
+ *
+ * @param {object} instance - connected instance
+ * @param {'onMount' | 'onUnmount'} hookName - lifecycle hook name
+ * @param {(() => void | Promise<void>) | null} ownCaptured - class-field hook captured at construct time
+ * @param {object} connectedProto - `Connected.prototype` (skipped while walking)
+ * @param {object} wrappedProto - wrapped component `Constructor.prototype`
+ * @returns {(() => void | Promise<void>) | null} user hook, or null if none
+ */
+function resolveUserConnectLifecycleHook (
+  instance: object,
+  hookName: 'onMount' | 'onUnmount',
+  ownCaptured: (() => void | Promise<void>) | null,
+  connectedProto: object,
+  wrappedProto: object
+): (() => void | Promise<void>) | null {
+  if (ownCaptured !== null) {
+    return ownCaptured;
+  }
+
+  let proto: object | null = Object.getPrototypeOf(instance) as object | null;
+  while (proto !== null && proto !== Object.prototype) {
+    if (
+      proto !== connectedProto &&
+      Object.prototype.hasOwnProperty.call(proto, hookName)
+    ) {
+      const hook = (proto as Record<string, unknown>)[hookName];
+      if (typeof hook === 'function') {
+        return hook as () => void | Promise<void>;
+      }
+    }
+    proto = Object.getPrototypeOf(proto) as object | null;
+  }
+
+  const wrappedHook = (wrappedProto as Record<string, unknown>)[hookName];
+  if (typeof wrappedHook === 'function') {
+    return wrappedHook as () => void | Promise<void>;
+  }
+
+  return null;
 }
 
 /**
@@ -279,6 +333,17 @@ function buildConnectHoc<S, P, R, A extends Action> (
        */
       private __connectOwnOnMount: (() => void | Promise<void>) | null = null;
       private __connectOwnOnUnmount: (() => void | Promise<void>) | null = null;
+      /**
+       * True while Connected `onMount` wiring is on the stack. Makes subclass
+       * `super.onMount()` a safe no-op (avoids re-entrant subscribe). Separate from
+       * unmount reentry so async onMount cannot block onUnmount teardown.
+       */
+      private __connectMountReentry = false;
+      /**
+       * True while Connected `onUnmount` teardown is on the stack. Makes subclass
+       * `super.onUnmount()` a safe no-op (avoids double dispose).
+       */
+      private __connectUnmountReentry = false;
 
       constructor (props: P) {
         super(props);
@@ -326,6 +391,25 @@ function buildConnectHoc<S, P, R, A extends Action> (
         }
         self.onMount = protoMount;
         self.onUnmount = protoUnmount;
+      }
+
+      /**
+       * User lifecycle hook for this instance: class field, Connected-subclass prototype
+       * override, or wrapped constructor prototype.
+       *
+       * @param {'onMount' | 'onUnmount'} hookName
+       * @returns {(() => void | Promise<void>) | null}
+       */
+      private resolveUserLifecycleHook (
+        hookName: 'onMount' | 'onUnmount'
+      ): (() => void | Promise<void>) | null {
+        return resolveUserConnectLifecycleHook(
+          this,
+          hookName,
+          hookName === 'onMount' ? this.__connectOwnOnMount : this.__connectOwnOnUnmount,
+          Connected.prototype,
+          Constructor.prototype as object
+        );
       }
 
       /**
@@ -656,6 +740,26 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * @returns {void | Promise<void>} synchronously or a Promise if the superclass `onMount` is async
        */
       public override onMount (): void | Promise<void> {
+        // Subclass `super.onMount()` while Connected wiring is already on the stack
+        // (sync only — do not hold across async user onMount, or remount is blocked).
+        if (this.__connectMountReentry) {
+          return;
+        }
+
+        this.__connectMountReentry = true;
+        try {
+          return this.runConnectOnMount();
+        } finally {
+          this.__connectMountReentry = false;
+        }
+      }
+
+      /**
+       * Connect `onMount` body (store wiring + user hook). Split from the reentry gate.
+       *
+       * @returns {void | Promise<void>}
+       */
+      private runConnectOnMount (): void | Promise<void> {
         // Remount on the same instance must restart the first-pass / kick-off state machine.
         // PR #59 reset only `__connectTornDown`; leaving `__connectFirstPass` false skipped
         // user `onMount` and froze store→props delivery (`__connectMountCompleted` never set).
@@ -680,9 +784,8 @@ function buildConnectHoc<S, P, R, A extends Action> (
         const store = this.resolveConnectStore();
         this.refreshDispatchProps(store);
 
-        // Prefer class-field hooks captured in the constructor; else prototype methods.
-        const superOnMount = this.__connectOwnOnMount
-          ?? (Constructor.prototype as Record<string, unknown>)['onMount'];
+        // Class-field, Connected-subclass prototype override, or wrapped prototype.
+        const superOnMount = this.resolveUserLifecycleHook('onMount');
         const hasSuperOnMount = typeof superOnMount === 'function';
 
         if (mapStateToProps == null) {
@@ -869,21 +972,31 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * @returns {void | Promise<void>}
        */
       public override onUnmount (): void | Promise<void> {
-        this.__connectTornDown = true;
-        this.__connectPendingUpdate = false;
-        // Cancels a pending post-mount kick-off (mapDispatch-only has no subscription to null out).
-        this.__connectMountCompleted = false;
-        this.disposeConnectSubscription();
-
-        const superOnUnmount = this.__connectOwnOnUnmount
-          ?? (Constructor.prototype as Record<string, unknown>)['onUnmount'];
-        if (typeof superOnUnmount !== 'function') {
+        // Subclass `super.onUnmount()` while Connected teardown is already on the stack
+        // (sync only — do not hold across async user onUnmount).
+        if (this.__connectUnmountReentry) {
           return;
         }
 
-        const result = (superOnUnmount as () => void | Promise<void>).call(this);
-        if (isPromiseLike(result)) {
-          return result as Promise<void>;
+        this.__connectUnmountReentry = true;
+        try {
+          this.__connectTornDown = true;
+          this.__connectPendingUpdate = false;
+          // Cancels a pending post-mount kick-off (mapDispatch-only has no subscription to null out).
+          this.__connectMountCompleted = false;
+          this.disposeConnectSubscription();
+
+          const superOnUnmount = this.resolveUserLifecycleHook('onUnmount');
+          if (typeof superOnUnmount !== 'function') {
+            return;
+          }
+
+          const result = (superOnUnmount as () => void | Promise<void>).call(this);
+          if (isPromiseLike(result)) {
+            return result as Promise<void>;
+          }
+        } finally {
+          this.__connectUnmountReentry = false;
         }
       }
     }
