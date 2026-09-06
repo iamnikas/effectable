@@ -87,9 +87,12 @@ const ConnectedFeedsWithCreators = connect(undefined, {
 
 1. `new ConnectedCtor(props)`.
 2. **`applyToScope` (before first `compose()`):** GraphRuntime publishes the store into the subtree
-   and the HOC **synchronously** applies dispatch + current `mapStateToProps` into `this.props`.
-   In strict mode this also strips parent own-props so the first `compose()` cannot branch on
-   leaked secrets / unmapped fields (and cannot PLACE the wrong child for one generation).
+   and the HOC **synchronously** applies dispatch + current `mapStateToProps` into `this.props`
+   **only while mount has not completed yet**. In strict mode this strips parent own-props so the
+   first `compose()` cannot branch on leaked secrets / unmapped fields (and cannot PLACE the wrong
+   child for one generation). After mount, `applyToScope` only republishes the store — re-running
+   mappers on every dirty reconcile would re-enter `mapDispatch` factories that dispatch as a side
+   effect and fail-stop the runtime.
 3. HOC `onMount()`: merge dispatch → subscribe to state if needed → `super.onMount`.
 4. **Post-mount kick-off:** if `mapStateToProps` **or** `mapDispatchToProps` is set, after mount completes
    the HOC schedules **one** deferred `setState({})` via `queueMicrotask`. This yields exactly one
