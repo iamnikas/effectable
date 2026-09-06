@@ -152,6 +152,12 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
    */
   pendingScheduleUpdate?: boolean;
   /**
+   * When set, {@link GraphRuntime.updateFiber} skipped `onUpdate` because this fiber is in a
+   * sibling reconcile batch that still has un-wired PLACE/REPLACE peers. Cleared when
+   * {@link GraphRuntime.flushPendingOnUpdate} runs after every sibling bus is subscribed.
+   */
+  pendingOnUpdate?: { prevProps: unknown };
+  /**
    * Construction journal: records acquired resources during materialization.
    * Used for transactional rollback on failure.
    */
@@ -1483,6 +1489,31 @@ export class GraphRuntime {
   }
 
   /**
+   * Runs a deferred {@link Component.onUpdate} stashed by {@link updateFiber} during a
+   * sibling reconcile batch. Clears {@link RuntimeFiber.pendingOnUpdate}.
+   *
+   * Must run only after every PLACE/REPLACE peer in the batch has wired `@On*` handlers,
+   * and before flushing deferred onMount for those peers.
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber that may have a pending onUpdate
+   * @returns {void}
+   */
+  private flushPendingOnUpdate (fiber: RuntimeFiber<unknown>): void {
+    const pending = fiber.pendingOnUpdate;
+    if (pending === undefined) {
+      return;
+    }
+    delete fiber.pendingOnUpdate;
+
+    const instance = fiber.instance;
+    if (instance === null || !fiber.engine.canUpdate()) {
+      return;
+    }
+
+    instance.onUpdate(pending.prevProps, instance.props);
+  }
+
+  /**
    * Runs startup + update-hook injection when {@link FiberConstructionJournal.lifecycleDeferred}
    * is set; no-op otherwise.
    *
@@ -2029,7 +2060,9 @@ export class GraphRuntime {
     const sameKey = (current.vnode.key ?? null) === (nextVnode.key ?? null);
 
     if (sameType && sameKey) {
-      return this.updateFiber(current, nextVnode, parentFiber, parentScope);
+      // Pass deferLifecycle so UPDATE onUpdate can wait until later PLACE/REPLACE
+      // siblings in the same reconcileChildren batch have wired @On* handlers.
+      return this.updateFiber(current, nextVnode, parentFiber, parentScope, deferLifecycle);
     }
 
     // Type or key changed — destroy the old node, create a new one.
@@ -2055,6 +2088,8 @@ export class GraphRuntime {
    * @param {VirtualServiceNode<P>} nextVnode - new virtual node
    * @param {RuntimeFiber | null} parentFiber - parent fiber
    * @param {ContextScope} parentScope - parent scope
+   * @param {boolean} [deferLifecycle=false] - when true (sibling reconcile batch), defer
+   *   `onUpdate` until PLACE/REPLACE peers have wired buses — see {@link flushPendingOnUpdate}
    * @returns {Promise<RuntimeFiber<P>>}
    */
   private updateFiber<P>(
@@ -2062,6 +2097,7 @@ export class GraphRuntime {
     nextVnode: VirtualServiceNode<P>,
     parentFiber: RuntimeFiber<unknown> | null,
     parentScope: ContextScope,
+    deferLifecycle: boolean = false,
   ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
     const instance = current.instance;
 
@@ -2102,19 +2138,25 @@ export class GraphRuntime {
     // Build scope for child nodes (ContextProvider may have updated values)
     const childScope = this.buildChildScope(instance, parentScope);
 
-    // Call onUpdate if props or context changed (React 16.5 class-component style: one hook)
+    // Call onUpdate if props or context changed (React 16.5 class-component style: one hook).
+    // In a sibling reconcile batch (deferLifecycle), postpone onUpdate until later PLACE/
+    // REPLACE siblings have subscribed @On* handlers — otherwise a publish here is dropped.
     const propsChanged = prevProps !== instance.props;
     if ((propsChanged || contextChanged) && current.engine.canUpdate()) {
-      try {
-        instance.onUpdate(prevProps, instance.props);
-      } catch (error: unknown) {
-        const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
-        if (isThenable(cleanupResult)) {
-          return cleanupResult.then(() => {
-            throw error;
-          });
+      if (deferLifecycle) {
+        current.pendingOnUpdate = { prevProps };
+      } else {
+        try {
+          instance.onUpdate(prevProps, instance.props);
+        } catch (error: unknown) {
+          const cleanupResult = this.runFiberFailedCleanup(current as RuntimeFiber<unknown>, error);
+          if (isThenable(cleanupResult)) {
+            return cleanupResult.then(() => {
+              throw error;
+            });
+          }
+          throw error;
         }
-        throw error;
       }
     }
 
@@ -2431,12 +2473,14 @@ export class GraphRuntime {
       const stableResult: RuntimeFiber<unknown>[] = [];
 
       for (let i = 0; i < n; i++) {
+        // Stable batches are UPDATE-only (same type+key per slot) — no PLACE/REPLACE
+        // peers to wire first. Pass deferLifecycle=false so onUpdate runs inline.
         const reconciled = this.reconcileFiber(
           currentChildren[i] as RuntimeFiber<unknown>,
           nextVnodes[i] as VirtualServiceNode<unknown>,
           parentFiber,
           childScope,
-          true,
+          false,
         );
 
         if (isThenable(reconciled)) {
@@ -2480,12 +2524,13 @@ export class GraphRuntime {
     resultSoFar.push(await pending);
 
     for (let i = pendingIdx + 1; i < nextVnodes.length; i++) {
+      // Stable async continuation: UPDATE-only — do not defer onUpdate (see sync path).
       const reconciled = this.reconcileFiber(
         currentChildren[i] as RuntimeFiber<unknown>,
         nextVnodes[i] as VirtualServiceNode<unknown>,
         parentFiber,
         childScope,
-        true,
+        false,
       );
       resultSoFar.push(isThenable(reconciled) ? await reconciled : (reconciled as RuntimeFiber<unknown>));
     }
@@ -2692,8 +2737,11 @@ export class GraphRuntime {
         }
       }
 
-      // Flush PLACE/REPLACE startups in compose order after every new sibling is wired.
+      // After every sibling bus is wired: run deferred UPDATE onUpdate hooks, then
+      // PLACE/REPLACE startups, in compose order. onUpdate-before-PLACE-wire used to
+      // drop publishes aimed at newly placed @On* listeners in the same batch.
       for (const child of nextChildren) {
+        this.flushPendingOnUpdate(child);
         if (child.constructionJournal?.lifecycleDeferred === true) {
           const flush = this.flushDeferredLifecycleTree(child);
           if (isThenable(flush)) {
@@ -2815,6 +2863,9 @@ export class GraphRuntime {
    * @returns {void | Promise<void>}
    */
   private destroyFiber (fiber: RuntimeFiber<unknown>, collectErrors: Error[] | null = null): void | Promise<void> {
+    // Drop any deferred onUpdate so a torn-down fiber cannot flush later.
+    delete fiber.pendingOnUpdate;
+
     const children = fiber.children;
     const n = children.length;
 
