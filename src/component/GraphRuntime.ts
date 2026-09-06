@@ -183,8 +183,9 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
   hasPendingOnUpdate?: boolean;
   /**
    * Exclusive Command/Query slots for this fiber were already freed by a pre-PLACE
-   * release under a deferred UPDATE preview (#182). A later orphan/victim pass must
-   * not release again in a way that could interact with a same-batch PLACE owner.
+   * release under an UPDATE child-diff preview (#182 full-diff / stable fast-path).
+   * A later orphan/victim pass must not release again in a way that could interact
+   * with a same-batch PLACE owner.
    */
   exclusiveRuntimeBusHandlersReleased?: boolean;
 }
@@ -513,14 +514,16 @@ export class GraphRuntime {
   }
 
   /**
-   * Before PLACE in a full-diff sibling batch, release exclusive Command/Query slots that
-   * deferred UPDATEs will free only later (pass 2). A surviving keyed wrapper can keep a
-   * nested `@OnCommand`/`@OnQuery` live across pass-1 PLACE of a sibling that registers
-   * the same type — fail-stop (#182). Temporarily apply next props, compose next children,
-   * release unpaired / REPLACE-victim exclusive subtrees, recurse into nested UPDATEs.
-   * EventBus stays intact (#158).
+   * Before nested PLACE under an earlier sibling UPDATE, release exclusive Command/Query
+   * slots that a later sibling UPDATE will free only when it runs. Used by:
+   * - full-diff pass-1 (#182): deferred UPDATEs keep nested handlers across PLACE peers
+   * - stable fast-path: left-to-right UPDATE fully reconciles (nested PLACE) before the
+   *   next sibling UPDATE — same clash without ever entering full-diff preview
    *
-   * @param {RuntimeFiber<unknown>} fiber - deferred UPDATE fiber
+   * Temporarily apply next props, compose next children, release unpaired / REPLACE-victim
+   * exclusive subtrees, recurse into nested UPDATEs. EventBus stays intact (#158).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - UPDATE fiber whose next child diff is previewed
    * @param {VirtualServiceNode<unknown>} nextVnode - next vnode for that fiber
    * @param {NonNullable<GraphRuntime['effectableRuntimeBuses']>} buses - runtime buses
    * @returns {void}
@@ -3447,6 +3450,25 @@ export class GraphRuntime {
     if (this.isStableChildren(currentChildren, nextVnodes)) {
       const n = nextVnodes.length;
       const stableResult: RuntimeFiber<unknown>[] = [];
+
+      // Stable path walks siblings left-to-right with full nested reconcile (including
+      // PLACE) before the next sibling UPDATE. Preview each UPDATE's child diff and
+      // free exclusive Command/Query slots that a later sibling still holds — same
+      // contract as full-diff #182, which never runs on this fast-path.
+      if (this.effectableRuntimeBuses !== null) {
+        const buses = this.effectableRuntimeBuses;
+        for (let i = 0; i < n; i += 1) {
+          try {
+            this.releaseExclusiveUnderDeferredUpdate(
+              currentChildren[i] as RuntimeFiber<unknown>,
+              nextVnodes[i] as VirtualServiceNode<unknown>,
+              buses,
+            );
+          } catch {
+            // Best-effort — real UPDATE still runs in the sibling walk.
+          }
+        }
+      }
 
       for (let i = 0; i < n; i++) {
         const reconciled = this.reconcileFiber(
