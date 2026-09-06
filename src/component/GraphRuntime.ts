@@ -2699,6 +2699,9 @@ export class GraphRuntime {
    * the replacement's deferred lifecycle. Sibling REPLACE defers victim destroy via
    * {@link reconcileFiber} `deferLifecycle=true` + {@link flushPendingReplaceVictims}.
    *
+   * On flush failure the replacement is destroyed here: it is not yet `currentRoot`, so
+   * failStop would only re-tear the victim and leak exclusive bus registrations.
+   *
    * @param {RuntimeFiber<P>} current - victim root fiber
    * @param {VirtualServiceNode<P>} nextVnode - replacement vnode
    * @param {RuntimeFiber | null} parentFiber - parent fiber (null at root)
@@ -2732,11 +2735,33 @@ export class GraphRuntime {
     ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
       const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
       const afterDestroy = (): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
-        const flushRes = this.flushDeferredLifecycleTree(nextFiber as RuntimeFiber<unknown>);
-        if (isThenable(flushRes)) {
-          return Promise.resolve(flushRes).then(() => nextFiber);
+        // Replacement is not yet published as currentRoot. If deferred lifecycle flush
+        // fails (e.g. descendant onMount throw), failStop only destroys currentRoot
+        // (the already-torn-down victim) and would leak the replacement's exclusive
+        // @OnCommand/@OnQuery registrations on shared buses. Sibling PLACE flush
+        // failures are reclaimed by HOLE 3; root REPLACE must destroy nextFiber here.
+        const destroyReplacementAndRethrow = (err: unknown): never | Promise<never> => {
+          const cleanupRes = this.destroyFiber(nextFiber as RuntimeFiber<unknown>, []);
+          if (isThenable(cleanupRes)) {
+            return Promise.resolve(cleanupRes).then(() => {
+              throw err;
+            });
+          }
+          throw err;
+        };
+
+        try {
+          const flushRes = this.flushDeferredLifecycleTree(nextFiber as RuntimeFiber<unknown>);
+          if (isThenable(flushRes)) {
+            return Promise.resolve(flushRes).then(
+              () => nextFiber,
+              (err: unknown) => destroyReplacementAndRethrow(err),
+            );
+          }
+          return nextFiber;
+        } catch (err: unknown) {
+          return destroyReplacementAndRethrow(err);
         }
-        return nextFiber;
       };
       if (isThenable(destroyRes)) {
         return destroyRes.then(afterDestroy);
