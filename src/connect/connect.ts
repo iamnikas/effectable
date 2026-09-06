@@ -21,7 +21,7 @@
  *   (sync reentry alone is cleared when the Promise is returned; an async generation gate
  *   prevents infinite subscribe / double dispose). Remount after `onUnmount` still works.
  * - `mapStateToProps` subscribe failures fail the mount; mapDispatch-only hosts still get the
- *   post-mount kick-off after a successful mount.
+ *   post-mount kick-off after a successful mount. Mounting either mode on a destroyed store fails.
  * - Nested HOC wrap `connect(...)(connect(...)(Ctor))` is rejected: inheritance shares one
  *   instance and collides connect fields, which previously stack-overflowed in `onMount`.
  *   Nest stores via parent/child context (`connect(store)(Parent)` + `connect(mapState)(Child)`).
@@ -733,6 +733,11 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this.applyMappedStateProps(
             mapStateToProps(store.getState(), this.__connectOwnProps as unknown as P)
           );
+        } else {
+          // mapState path already probes liveness via getState() above. mapDispatch-only
+          // (and mapper-less) connect must reject a destroyed store before first compose —
+          // otherwise GraphRuntime mounts ACTIVE with dead dispatch props.
+          store.getState();
         }
       }
 
@@ -992,6 +997,11 @@ function buildConnectHoc<S, P, R, A extends Action> (
         const hasSuperOnMount = typeof superOnMount === 'function';
 
         if (mapStateToProps == null) {
+          // Parity with mapState destroyed-store mount (#87): without a select subscription
+          // there is no complete-without-next signal, so probe getState() here as well
+          // (covers mounts that skipped applyToScope sync).
+          store.getState();
+
           /**
            * Completes the mapState-null mount path and, when dispatch props exist, schedules
            * the same post-mount compose rebuild as the mapState path.
