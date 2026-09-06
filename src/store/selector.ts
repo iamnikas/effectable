@@ -310,9 +310,17 @@ export function createStructuredSelector<S, T extends Record<string, any>> (
   const selectors = keys.map((key) => selectorsObj[key]);
 
   return createSelector(selectors, (...values: any[]) => {
+    // Use defineProperty — `result[key] =` invokes the `__proto__` setter on a
+    // normal object and would turn a selector named `__proto__` into the result's
+    // [[Prototype]] (lost key + inherited phantom fields).
     const result = {} as T;
     keys.forEach((key, index) => {
-      result[key] = values[index];
+      Object.defineProperty(result, key as string | symbol, {
+        value: values[index],
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     });
     return result;
   });

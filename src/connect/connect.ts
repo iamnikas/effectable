@@ -278,7 +278,10 @@ function resolveMapDispatchProps<S, P, A extends Action> (
   }
 
   const creators = mapDispatch as ActionCreatorsMap<A>;
-  const bound: Record<string, unknown> = {};
+  // Null-prototype bag so a creator named `__proto__` becomes an own property
+  // instead of invoking the Object.prototype `__proto__` setter (which would
+  // drop the bound action and pollute `bound`'s [[Prototype]]).
+  const bound: Record<string, unknown> = Object.create(null);
   for (const key of Object.keys(creators)) {
     const ac = creators[key];
     if (typeof ac !== 'function') {

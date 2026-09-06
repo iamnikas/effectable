@@ -54,6 +54,7 @@ import {
   IS_CONTEXT_PROVIDER,
 } from './context';
 import type { ContextScope } from './context';
+import { getImperativeHandleMethods } from './refs';
 import type {
   RuntimeCommand,
   RuntimeEvent,
@@ -292,6 +293,16 @@ export class GraphRuntime {
   private pendingTeardown: Promise<void> | null = null;
 
   /**
+   * Imperative ref values bound for owners that expose `@UseImperativeHandle` methods.
+   * `commitRef` assigns a limited handle (not the Component instance) into `ref.current`;
+   * identity-safe clear must still recognize that handle as owned by the instance.
+   */
+  private readonly imperativeRefByOwner: WeakMap<
+    Component<unknown, unknown>,
+    object
+  > = new WeakMap();
+
+  /**
    * Instances are created only via {@link GraphRuntime.mount}; direct `new GraphRuntime()` is unavailable externally.
    */
   private constructor () {}
@@ -393,18 +404,59 @@ export class GraphRuntime {
   }
 
   /**
-   * Identity-safe ref clearing: clears ref.current only if it still points to the expected owner.
+   * Builds the value assigned to `ref.current` for a mounted instance.
+   *
+   * When the constructor declares `@UseImperativeHandle` methods, only those methods
+   * are exposed (bound to the instance) — matching the refs.ts / CONCEPT contract.
+   * Without an allowlist, the full instance is assigned (legacy escape hatch).
+   *
+   * @param {Component<unknown, unknown>} instance - mounted component instance
+   * @returns {unknown} instance or limited imperative handle object
+   */
+  private resolveRefCurrentValue (instance: Component<unknown, unknown>): unknown {
+    const methods = getImperativeHandleMethods(
+      instance.constructor as unknown as Parameters<typeof getImperativeHandleMethods>[0],
+    );
+
+    if (methods.length === 0) {
+      this.imperativeRefByOwner.delete(instance);
+      return instance;
+    }
+
+    const handle: Record<string | symbol, unknown> = Object.create(null) as Record<
+      string | symbol,
+      unknown
+    >;
+
+    for (const { methodKey } of methods) {
+      const fn = (instance as unknown as Record<string | symbol, unknown>)[methodKey];
+      if (typeof fn !== 'function') {
+        throw new Error(
+          `[Effectable.GraphRuntime] @UseImperativeHandle method is not a function: ${String(methodKey)}`,
+        );
+      }
+      handle[methodKey] = (fn as (...args: unknown[]) => unknown).bind(instance);
+    }
+
+    this.imperativeRefByOwner.set(instance, handle);
+    return handle;
+  }
+
+  /**
+   * Identity-safe ref clearing: clears ref.current only if it still points to the expected owner
+   * (full instance) or the limited imperative handle previously bound for that owner.
    * Prevents an old rollback from clearing a ref that a newer materialization already reused.
-   * No cast required (Component | null → unknown | null is assignable).
    *
    * @param {RefObject<unknown>} ref - ref object
    * @param {Component<unknown, unknown>} expectedOwner - expected current owner
    * @returns {void}
    */
   private clearRefSafe (ref: RefObject<unknown>, expectedOwner: Component<unknown, unknown>): void {
-    if (ref.current === expectedOwner) {
+    const boundHandle = this.imperativeRefByOwner.get(expectedOwner);
+    if (ref.current === expectedOwner || (boundHandle !== undefined && ref.current === boundHandle)) {
       ref.current = null;
     }
+    this.imperativeRefByOwner.delete(expectedOwner);
   }
 
   /**
@@ -413,11 +465,9 @@ export class GraphRuntime {
    * 
    * Rules:
    * - Clear previousRef only if it still points to expectedPreviousOwner (identity-safe).
-   * - Bind nextRef to instance if nextRef is provided.
+   * - Bind nextRef to the instance, or to a limited `@UseImperativeHandle` surface when declared.
    * - previousRef and nextRef can be the same object (ref reuse) or different (ref swap).
    * - Do not let an old disposer clear a newer owner.
-   * 
-   * No casts: Component | null → unknown | null is assignable (widening).
    * 
    * @param {RefObject<unknown> | undefined} previousRef - ref to clear (can be undefined if no previous ref)
    * @param {Component<unknown, unknown> | null} expectedPreviousOwner - expected owner of previousRef (null if unknown)
@@ -435,16 +485,15 @@ export class GraphRuntime {
     if (previousRef !== undefined && previousRef !== nextRef && expectedPreviousOwner !== null) {
       this.clearRefSafe(previousRef, expectedPreviousOwner);
     }
-
-    // Bind next ref to instance (Component | null → unknown | null, no cast).
+    // Bind next ref: limited handle when @UseImperativeHandle is present, else full instance.
     // Custom setters may assign `current` then throw. Without a catch, UPDATE ref-swap
-    // leaves the new ref holding the instance while `fiber.vnode.ref` still points at the
-    // previous ref object — fail-stop finalize clears only the old ref (zombie nextRef).
-    // Materialize assign-then-throw is covered by journal.refBound (#96); this path covers
+    // leaves the new ref holding the instance/handle while `fiber.vnode.ref` still points at
+    // the previous ref object — fail-stop finalize clears only the old ref (zombie nextRef).
+    // Materialize assign-then-throw is covered by journal.refBound (#96/#98); this path covers
     // the UPDATE swap hole and is a safe no-op when the setter never assigned.
     if (nextRef !== undefined) {
       try {
-        nextRef.current = instance;
+        nextRef.current = instance === null ? null : this.resolveRefCurrentValue(instance);
       } catch (error: unknown) {
         if (instance !== null) {
           try {
@@ -504,7 +553,7 @@ export class GraphRuntime {
    * Transactional rollback for failed fiber materialization.
    * Releases acquired resources in reverse acquisition order:
    * 1. disable scheduler hook
-   * 2. destroy mounted children in reverse order
+   * 2. destroy mounted children in compose order (same as {@link destroyFiber})
    * 3. run failed-startup cleanup (parent onUnmount when startup ran)
    * 4. dispose runtime bus registrations
    * 5. clear bound ref (identity-safe)
@@ -546,16 +595,18 @@ export class GraphRuntime {
       }
     }
 
-    // 2. Destroy mounted children in reverse order BEFORE parent onUnmount / bus / ref.
-    // Documented teardown contract is children → parent; onUnmount was already after
-    // children, but bus dispose + ref clear still ran ahead of child destroy — child
-    // onUnmount could observe a nulled parent ref / dead parent bus subscriptions.
+    // 2. Destroy mounted children in compose order BEFORE parent onUnmount / bus / ref.
+    // Documented teardown contract is children → parent with siblings in compose
+    // order (matches destroyFiber / README shutdown). Reverse sibling order made
+    // failure-path onUnmount observe a different live-sibling set than clean unmount.
+    // Children must also run before bus dispose + ref clear so child onUnmount still
+    // sees a live parent ref / parent @On* subscriptions.
     // Pass cleanupErrors so nested destroy is best-effort: a throwing
     // ref-clear/disposer on one grandchild must not skip remaining siblings.
     // Those nodes were never attached to currentRoot, so failStop cannot reclaim them.
     const destroyChildrenThenParentCleanup = (): void | Promise<void> => {
       const children = journal.mountedChildren;
-      for (let i = children.length - 1; i >= 0; i -= 1) {
+      for (let i = 0; i < children.length; i += 1) {
         try {
           const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, cleanupErrors);
           if (isThenable(destroyRes)) {
@@ -584,7 +635,7 @@ export class GraphRuntime {
    * Async continuation of rollback child destruction after one child's destroy returned a Promise.
    *
    * @param {RuntimeFiber<unknown>[]} children - mounted children
-   * @param {number} lastIdx - index of the last processed child
+   * @param {number} pendingIdx - index of the child whose destroy is pending
    * @param {Promise<void>} pending - Promise from destroying the previous child
    * @param {Error} primaryError - original materialization error
    * @param {Error[]} cleanupErrors - accumulated cleanup errors
@@ -594,7 +645,7 @@ export class GraphRuntime {
    */
   private async continueRollbackDestroyAsync (
     children: RuntimeFiber<unknown>[],
-    lastIdx: number,
+    pendingIdx: number,
     pending: Promise<void>,
     primaryError: Error,
     cleanupErrors: Error[],
@@ -607,7 +658,8 @@ export class GraphRuntime {
       cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
     }
 
-    for (let i = lastIdx - 1; i >= 0; i -= 1) {
+    // Remaining siblings in compose order (pendingIdx+1 … n-1), matching destroyFiber.
+    for (let i = pendingIdx + 1; i < children.length; i += 1) {
       try {
         const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, cleanupErrors);
         if (isThenable(destroyRes)) {
@@ -2383,13 +2435,14 @@ export class GraphRuntime {
       attachCleanupErrors();
     };
 
-    for (let i = children.length - 1; i >= 0; i -= 1) {
+    // Siblings in compose order — same contract as destroyFiber / clean unmount.
+    for (let i = 0; i < children.length; i += 1) {
       try {
         const destroyRes = this.destroyFiber(children[i] as RuntimeFiber<unknown>, cleanupErrors);
         if (isThenable(destroyRes)) {
           return destroyRes.then(
             async () => {
-              for (let j = i - 1; j >= 0; j -= 1) {
+              for (let j = i + 1; j < children.length; j += 1) {
                 try {
                   const r = this.destroyFiber(children[j] as RuntimeFiber<unknown>, cleanupErrors);
                   if (isThenable(r)) {
@@ -2403,7 +2456,7 @@ export class GraphRuntime {
             },
             async (err: unknown) => {
               cleanupErrors.push(err instanceof Error ? err : new Error(String(err)));
-              for (let j = i - 1; j >= 0; j -= 1) {
+              for (let j = i + 1; j < children.length; j += 1) {
                 try {
                   const r = this.destroyFiber(children[j] as RuntimeFiber<unknown>, cleanupErrors);
                   if (isThenable(r)) {

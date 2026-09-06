@@ -187,4 +187,109 @@ describe('GraphRuntime failed-cleanup order', () => {
     ]);
     expect(parentRef.current).toBeNull();
   });
+
+  it('parent onMount fail: sibling onUnmount order matches clean unmount (compose order)', async () => {
+    const calls: string[] = [];
+    let shared: { alive: boolean } | null = { alive: true };
+
+    class B extends Component {
+      public override onMount (): void {
+        calls.push('B:onMount');
+      }
+
+      public override onUnmount (): void {
+        calls.push('B:onUnmount');
+        shared = null;
+      }
+    }
+
+    class A extends Component {
+      public override onMount (): void {
+        calls.push('A:onMount');
+      }
+
+      public override onUnmount (): void {
+        calls.push('A:onUnmount');
+        // Compose-order teardown: A runs while B's resource is still alive.
+        calls.push(shared === null || !shared.alive ? 'A:UAF' : 'A:ok');
+      }
+    }
+
+    class ParentOk extends Component {
+      public override compose () {
+        return [h(A, {}), h(B, {})];
+      }
+    }
+
+    class ParentBoom extends Component {
+      public override onMount (): void {
+        throw new Error('parent boom');
+      }
+
+      public override compose () {
+        return [h(A, {}), h(B, {})];
+      }
+    }
+
+    const rt = await GraphRuntime.mount(h(ParentOk, {}));
+    await rt.unmount();
+    const clean = calls.slice();
+    expect(clean).toEqual([
+      'A:onMount',
+      'B:onMount',
+      'A:onUnmount',
+      'A:ok',
+      'B:onUnmount',
+    ]);
+
+    calls.length = 0;
+    shared = { alive: true };
+    await expect(GraphRuntime.mount(h(ParentBoom, {}))).rejects.toThrow('parent boom');
+    expect(calls).toEqual([
+      'A:onMount',
+      'B:onMount',
+      'A:onUnmount',
+      'A:ok',
+      'B:onUnmount',
+    ]);
+  });
+
+  it('onUpdate throw: sibling onUnmount order matches compose order', async () => {
+    const calls: string[] = [];
+    let shared: { alive: boolean } | null = { alive: true };
+
+    class B extends Component {
+      public override onUnmount (): void {
+        calls.push('B:onUnmount');
+        shared = null;
+      }
+    }
+
+    class A extends Component {
+      public override onUnmount (): void {
+        calls.push('A:onUnmount');
+        calls.push(shared === null || !shared.alive ? 'A:UAF' : 'A:ok');
+      }
+    }
+
+    class Parent extends Component<object, { boom: boolean }> {
+      public override onUpdate (): void {
+        if (this.props.boom) {
+          throw new Error('update boom');
+        }
+      }
+
+      public override compose () {
+        return [h(A, {}), h(B, {})];
+      }
+    }
+
+    const rt = await GraphRuntime.mount(h(Parent, { boom: false }));
+    calls.length = 0;
+    shared = { alive: true };
+
+    await expect(rt.reconcile(h(Parent, { boom: true }))).rejects.toThrow('update boom');
+    expect(calls).toEqual(['A:onUnmount', 'A:ok', 'B:onUnmount']);
+  });
+
 });

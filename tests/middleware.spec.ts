@@ -198,6 +198,65 @@ describe('Effectable store middleware', () => {
     store.dispatch({ type: 'AFTER_READY' });
     expect(store.getState().events).toEqual(['AFTER_READY']);
   });
+
+  it('D07d: destructured dispatch captured during construction still works after setup (enhancer + wrap)', () => {
+    // Redux middleware often does `({ dispatch }) => next => action => { dispatch(...) }`.
+    // applyMiddleware must expose a stable late-bound forwarder so that capture does not
+    // keep the construction-time thrower forever after the chain is built.
+
+    const enhancerSeen: string[] = [];
+    const destructuringMiddleware: Middleware<unknown, TestState> = ({ dispatch }) => {
+      expect(() => {
+        dispatch({ type: 'DURING_CONSTRUCT' });
+      }).toThrow(/Dispatching while constructing your middleware is not allowed/);
+
+      return (next) => (action: unknown) => {
+        if (typeof action !== 'object' || action === null || !('type' in action)) {
+          throw new Error('Expected action with type');
+        }
+        const current = action as AnyAction;
+        enhancerSeen.push(current.type);
+        if (current.type === 'GO') {
+          dispatch({ type: 'FROM_CAPTURED_DISPATCH' });
+        }
+        return next(current);
+      };
+    };
+
+    const enhancerStore = createStore(
+      testReducer,
+      { events: [] },
+      applyMiddleware(destructuringMiddleware)
+    );
+    enhancerStore.dispatch({ type: 'GO' });
+    expect(enhancerSeen).toEqual(['GO', 'FROM_CAPTURED_DISPATCH']);
+    expect(enhancerStore.getState().events).toEqual(['FROM_CAPTURED_DISPATCH', 'GO']);
+
+    const wrapStore = createStore(testReducer, { events: [] });
+    const rawDispatch = wrapStore.dispatch.bind(wrapStore);
+    const wrapApi = {
+      getState: wrapStore.getState,
+      dispatch: rawDispatch as typeof wrapStore.dispatch,
+    };
+    const wrapSeen: string[] = [];
+    const wrapMiddleware: Middleware<unknown, TestState> = ({ dispatch }) => (next) => (action: unknown) => {
+      if (typeof action !== 'object' || action === null || !('type' in action)) {
+        throw new Error('Expected action with type');
+      }
+      const current = action as AnyAction;
+      wrapSeen.push(current.type);
+      if (current.type === 'GO') {
+        dispatch({ type: 'FROM_WRAP_CAPTURED' });
+      }
+      return next(current);
+    };
+    const wrapDispatch = applyMiddleware(wrapApi, rawDispatch, wrapMiddleware);
+    wrapApi.dispatch = wrapDispatch;
+    wrapStore.dispatch = wrapDispatch;
+    wrapStore.dispatch({ type: 'GO' });
+    expect(wrapSeen).toEqual(['GO', 'FROM_WRAP_CAPTURED']);
+    expect(wrapStore.getState().events).toEqual(['FROM_WRAP_CAPTURED', 'GO']);
+  });
 });
 
 describe('D03–D04 compose', () => {

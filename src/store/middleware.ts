@@ -52,11 +52,39 @@ function coerceMiddleware<S, D extends DispatchFn> (middleware: unknown): Middle
   );
 }
 
+function dispatchWhileConstructing (_action: unknown): unknown {
+  throw new Error(
+    'Dispatching while constructing your middleware is not allowed. ' +
+    'Other middleware would not be applied to this dispatch.'
+  );
+}
+
+/**
+ * Builds the middleware chain and wires `api.dispatch`.
+ *
+ * Redux contract: `api.dispatch` must be a **stable late-bound forwarder** while
+ * middleware factories run. Factories often capture `dispatch` by destructuring
+ * (`({ dispatch }) => ...`). If `api.dispatch` were the construction thrower
+ * (or later replaced by the chain under a new function identity), that capture
+ * would keep throwing forever after setup. The forwarder always calls through a
+ * mutable slot: thrower during construction, finished chain afterwards.
+ *
+ * @param {MiddlewareAPI<DispatchFn, S>} api - middleware API object (mutated)
+ * @param {DispatchFn} rawDispatch - store dispatch at the bottom of the chain
+ * @param {Array<unknown>} middlewares - middleware factories / module namespaces
+ * @returns {DispatchFn} composed dispatch chain (also reachable via `api.dispatch`)
+ */
 function wrapDispatch<S> (
   api: MiddlewareAPI<DispatchFn, S>,
   rawDispatch: DispatchFn,
   middlewares: Array<unknown>
 ): DispatchFn {
+  // Slot starts as the construction thrower; swapped for `chain` after factories run.
+  let activeDispatch: DispatchFn = dispatchWhileConstructing;
+  // Stable identity captured by middleware factories that destructure `dispatch`.
+  const forwardDispatch: DispatchFn = (action: unknown) => activeDispatch(action);
+  api.dispatch = forwardDispatch;
+
   const chain = middlewares.reduceRight<DispatchFn>(
     (next, middleware) => {
       const coerced = coerceMiddleware<S, DispatchFn>(middleware);
@@ -65,15 +93,10 @@ function wrapDispatch<S> (
     rawDispatch
   );
 
-  api.dispatch = chain;
+  activeDispatch = chain;
+  // Keep the forwarder on `api` so destructured captures and `api.dispatch` stay valid.
+  api.dispatch = forwardDispatch;
   return chain;
-}
-
-function dispatchWhileConstructing (_action: unknown): unknown {
-  throw new Error(
-    'Dispatching while constructing your middleware is not allowed. ' +
-    'Other middleware would not be applied to this dispatch.'
-  );
 }
 
 /**
@@ -101,10 +124,11 @@ export function applyMiddleware<S = unknown, A extends Action = Action> (
 export function applyMiddleware (...args: unknown[]): unknown {
   if (isWrapModeArgs(args)) {
     const [api, rawDispatch, ...middlewares] = args;
-    // Same construction invariant as enhancer mode (PR #55): while middleware
-    // factories run, api.dispatch must not reach rawDispatch / a half-built chain.
+    // Same construction invariant as enhancer mode (PR #55 / Redux): while
+    // middleware factories run, the late-bound `api.dispatch` forwarder must not
+    // reach rawDispatch / a half-built chain. `wrapDispatch` installs that
+    // forwarder; restore the caller's previous `api.dispatch` if setup throws.
     const previousDispatch = api.dispatch;
-    api.dispatch = dispatchWhileConstructing;
     try {
       return wrapDispatch(api, rawDispatch, middlewares);
     } catch (error) {
@@ -116,6 +140,8 @@ export function applyMiddleware (...args: unknown[]): unknown {
   return (createStore: StoreCreator<unknown, Action>) =>
     (reducer: Reducer<unknown, Action>, initialState: unknown) => {
       const store = createStore(reducer, initialState);
+      // Placeholder; `wrapDispatch` immediately replaces this with a late-bound
+      // forwarder before any middleware factory runs.
       const api: MiddlewareAPI<DispatchFn, unknown> = {
         getState: store.getState,
         dispatch: dispatchWhileConstructing,
