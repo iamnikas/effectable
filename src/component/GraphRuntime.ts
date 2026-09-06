@@ -4403,6 +4403,10 @@ export class GraphRuntime {
    */
   private destroyFiber (fiber: RuntimeFiber<unknown>, collectErrors: Error[] | null = null): void | Promise<void> {
     // Orphans stashed for a deferred nested full-diff are not in `fiber.children`.
+    // Clear the stash up front, but if one orphan's destroy is async the remaining
+    // entries in the local list must still be drained — otherwise fail-stop after
+    // Early stashes multiple orphans and the first has async onUnmount leaves later
+    // orphans' EventBus subscribed after the runtime is FAILED.
     const deferredOrphans = fiber.pendingDeferredOrphans;
     if (deferredOrphans !== undefined && deferredOrphans.length > 0) {
       fiber.pendingDeferredOrphans = undefined;
@@ -4413,7 +4417,13 @@ export class GraphRuntime {
             collectErrors,
           );
           if (isThenable(orphanRes)) {
-            return orphanRes.then(() => this.destroyFiber(fiber, collectErrors));
+            return this.continueDestroyDeferredOrphansAsync(
+              fiber,
+              deferredOrphans,
+              i,
+              orphanRes,
+              collectErrors,
+            );
           }
         } catch (err: unknown) {
           if (collectErrors !== null) {
@@ -4468,6 +4478,57 @@ export class GraphRuntime {
     // Always finalize the fiber even if shutdown failed (best-effort cleanup)
     // finalizeFiberDestroy uses commitRef for identity-safe ref clearing
     this.finalizeFiberDestroy(fiber, collectErrors);
+  }
+
+  /**
+   * Async continuation after a stashed {@link RuntimeFiber.pendingDeferredOrphans}
+   * entry returns a Promise. Drains the remaining local orphan list (the journal
+   * slot was already cleared), then resumes {@link destroyFiber} for `fiber`
+   * itself (live children + shutdown).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - fiber that owned the stash
+   * @param {RuntimeFiber<unknown>[]} orphans - cleared stash snapshot
+   * @param {number} pendingIdx - index whose destroy is in flight
+   * @param {PromiseLike<void>} pending - in-flight orphan destroy
+   * @param {Error[] | null} collectErrors - array to collect cleanup errors
+   * @returns {Promise<void>}
+   */
+  private async continueDestroyDeferredOrphansAsync (
+    fiber: RuntimeFiber<unknown>,
+    orphans: RuntimeFiber<unknown>[],
+    pendingIdx: number,
+    pending: PromiseLike<void>,
+    collectErrors: Error[] | null = null,
+  ): Promise<void> {
+    try {
+      await pending;
+    } catch (err: unknown) {
+      if (collectErrors !== null) {
+        collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+      } else {
+        throw err;
+      }
+    }
+
+    for (let i = pendingIdx + 1; i < orphans.length; i++) {
+      try {
+        const r = this.destroyFiber(orphans[i] as RuntimeFiber<unknown>, collectErrors);
+        if (isThenable(r)) {
+          await r;
+        }
+      } catch (err: unknown) {
+        if (collectErrors !== null) {
+          collectErrors.push(err instanceof Error ? err : new Error(String(err)));
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    const rest = this.destroyFiber(fiber, collectErrors);
+    if (isThenable(rest)) {
+      await rest;
+    }
   }
 
   /**
