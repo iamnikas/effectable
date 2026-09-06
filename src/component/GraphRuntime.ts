@@ -2147,7 +2147,8 @@ export class GraphRuntime {
    * @param {ContextScope} parentScope - parent scope
    * @param {boolean} [deferLifecycle=false] - when true, REPLACE materialize wires buses but
    *   defers onMount until the sibling batch flush in {@link reconcileChildren} (same contract
-   *   as PLACE). Root reconcile must leave this false — nothing else flushes the root.
+   *   as PLACE). Root reconcile leaves this false; root REPLACE still wires the replacement
+   *   before destroying the victim, then flushes deferred lifecycle itself.
    * @returns {Promise<RuntimeFiber<P>>}
    */
   private reconcileFiber<P>(
@@ -2164,19 +2165,68 @@ export class GraphRuntime {
       return this.updateFiber(current, nextVnode, parentFiber, parentScope);
     }
 
-    // Type or key changed — destroy the old node, create a new one.
-    // Sync fast-path if both destroy and materialize completed synchronously.
+    // Type or key changed — REPLACE.
     // Collect cleanup errors (ref clear / disposer) so a throwing finalize cannot
     // abort REPLACE and fail-stop the surviving tree — same best-effort contract as unmount.
     //
     // When deferLifecycle is set (child reconcile batch), REPLACE must not run onMount
     // before later sibling buses are wired — otherwise a replaced publisher's mount-time
     // publish is silently dropped by a not-yet-wired PLACE/REPLACE listener beside it.
-    const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
-    if (isThenable(destroyRes)) {
-      return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle));
+    // (Victim onUnmount-before-later-PLACE is tracked separately in sibling REPLACE PRs.)
+    if (deferLifecycle) {
+      const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
+      if (isThenable(destroyRes)) {
+        return destroyRes.then(() => this.materialize(nextVnode, parentFiber, parentScope, true));
+      }
+      return this.materialize(nextVnode, parentFiber, parentScope, true);
     }
-    return this.materialize(nextVnode, parentFiber, parentScope, deferLifecycle);
+
+    // Root REPLACE (deferLifecycle=false): nothing else flushes the root, but we still
+    // must wire the replacement's @On* handlers before destroying the victim — otherwise
+    // victim onUnmount publishes on the shared runtime buses are silently dropped.
+    return this.replaceRootWireBeforeDestroy(current, nextVnode, parentFiber, parentScope);
+  }
+
+  /**
+   * Root REPLACE handoff: materialize the replacement with buses wired and onMount
+   * deferred, destroy the victim (so onUnmount can reach new @On* handlers), then flush
+   * the replacement's deferred lifecycle. Sibling REPLACE keeps the eager-destroy path
+   * via {@link reconcileFiber} `deferLifecycle=true` (covered by open sibling PRs).
+   *
+   * @param {RuntimeFiber<P>} current - victim root fiber
+   * @param {VirtualServiceNode<P>} nextVnode - replacement vnode
+   * @param {RuntimeFiber | null} parentFiber - parent fiber (null at root)
+   * @param {ContextScope} parentScope - parent scope
+   * @returns {RuntimeFiber<P> | Promise<RuntimeFiber<P>>}
+   */
+  private replaceRootWireBeforeDestroy<P>(
+    current: RuntimeFiber<P>,
+    nextVnode: VirtualServiceNode<P>,
+    parentFiber: RuntimeFiber<unknown> | null,
+    parentScope: ContextScope,
+  ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
+    const afterMaterialize = (
+      nextFiber: RuntimeFiber<P>,
+    ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
+      const destroyRes = this.destroyFiber(current as RuntimeFiber<unknown>, []);
+      const afterDestroy = (): RuntimeFiber<P> | Promise<RuntimeFiber<P>> => {
+        const flushRes = this.flushDeferredLifecycleTree(nextFiber as RuntimeFiber<unknown>);
+        if (isThenable(flushRes)) {
+          return Promise.resolve(flushRes).then(() => nextFiber);
+        }
+        return nextFiber;
+      };
+      if (isThenable(destroyRes)) {
+        return destroyRes.then(afterDestroy);
+      }
+      return afterDestroy();
+    };
+
+    const materializeRes = this.materialize(nextVnode, parentFiber, parentScope, true);
+    if (isThenable(materializeRes)) {
+      return materializeRes.then(afterMaterialize);
+    }
+    return afterMaterialize(materializeRes);
   }
 
   /**
