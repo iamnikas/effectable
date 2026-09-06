@@ -128,4 +128,64 @@ describe('GraphRuntime REMOVE+PLACE exclusive bus handoff', () => {
     expect(rt.isActive()).toBe(true);
     await rt.unmount();
   });
+
+  it('nested @OnCommand under keyed orphan does not fail-stop on REMOVE+PLACE', async () => {
+    class Inner extends Component {
+      @OnCommand('DO')
+      public handle (): void { /* nested under orphan wrapper */ }
+    }
+    class Outer extends Component {
+      public override compose () {
+        return [h(Inner)];
+      }
+    }
+    class NewHandler extends Component {
+      @OnCommand('DO')
+      public handle (): void { /* */ }
+    }
+    class Parent extends Component<{ phase: 1 | 2 }, { phase: 1 | 2 }> {
+      public override compose () {
+        return this.props.phase === 1
+          ? [h(Outer, {}, 'old')]
+          : [h(NewHandler, {}, 'new')];
+      }
+    }
+
+    const b = buses();
+    const rt = await GraphRuntime.mount(h(Parent, { phase: 1 }), undefined, b as any);
+    await expect(rt.reconcile(h(Parent, { phase: 2 }))).resolves.toBeUndefined();
+    expect(rt.isActive()).toBe(true);
+    await expect(b.commandBus.execute({ type: 'DO', payload: { id: 'x' } })).resolves.toBeUndefined();
+    await rt.unmount();
+  });
+
+  it('nested @OnQuery under keyed orphan does not fail-stop on REMOVE+PLACE', async () => {
+    class Inner extends Component {
+      @OnQuery('GET')
+      public handle (): number { return 1; }
+    }
+    class Outer extends Component {
+      public override compose () {
+        return [h(Inner)];
+      }
+    }
+    class NewQ extends Component {
+      @OnQuery('GET')
+      public handle (): number { return 2; }
+    }
+    class Parent extends Component<{ phase: 1 | 2 }, { phase: 1 | 2 }> {
+      public override compose () {
+        return this.props.phase === 1
+          ? [h(Outer, {}, 'a')]
+          : [h(NewQ, {}, 'b')];
+      }
+    }
+
+    const b = buses();
+    const rt = await GraphRuntime.mount(h(Parent, { phase: 1 }), undefined, b as any);
+    await expect(rt.reconcile(h(Parent, { phase: 2 }))).resolves.toBeUndefined();
+    expect(rt.isActive()).toBe(true);
+    await expect(b.queryBus.execute({ type: 'GET', payload: {} })).resolves.toBe(2);
+    await rt.unmount();
+  });
 });

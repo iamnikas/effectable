@@ -408,6 +408,36 @@ export class GraphRuntime {
   }
 
   /**
+   * Releases exclusive Command/Query registrations for `fiber` and every mounted
+   * descendant. Root-only release is not enough when `@OnCommand` / `@OnQuery` live
+   * on nested children under a keyed wrapper that is about to leave the tree.
+   * EventBus subscriptions are left intact (see exclusive pre-PLACE release below).
+   *
+   * @param {RuntimeFiber<unknown>} fiber - subtree root (orphan or REPLACE victim)
+   * @param {RuntimeBusesBundle<RuntimeCommand, RuntimeQuery, RuntimeEvent>} buses - runtime buses
+   * @returns {void}
+   */
+  private releaseExclusiveRuntimeBusHandlersSubtree (
+    fiber: RuntimeFiber<unknown>,
+    buses: NonNullable<GraphRuntime['effectableRuntimeBuses']>,
+  ): void {
+    const children = fiber.children;
+    for (let i = 0; i < children.length; i += 1) {
+      const child = children[i];
+      if (child !== undefined) {
+        this.releaseExclusiveRuntimeBusHandlersSubtree(
+          child as RuntimeFiber<unknown>,
+          buses,
+        );
+      }
+    }
+    const instance = fiber.instance;
+    if (instance !== null) {
+      releaseExclusiveRuntimeBusHandlers(instance, buses);
+    }
+  }
+
+  /**
    * Fibers that will be unpaired after the next-child match (full-diff orphans).
    * Pure: mirrors keyed/unkeyed matching without materializing or destroying.
    *
@@ -463,6 +493,89 @@ export class GraphRuntime {
     }
 
     return orphans;
+  }
+
+  /**
+   * Fibers matched by key/position that will REPLACE (type or key mismatch) — not
+   * UPDATE. Pure: mirrors {@link reconcileChildrenFullDiff} matching.
+   *
+   * REPLACE victims are *not* orphans: they stay paired until pass-1 REPLACE runs.
+   * An earlier PLACE sibling in the same batch can still try to register exclusive
+   * Command/Query types the victim still holds.
+   *
+   * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
+   * @param {VirtualServiceNode[]} nextVnodes - next child vnodes
+   * @param {boolean} hasKeyedCurrent - whether any current child has a key
+   * @returns {RuntimeFiber<unknown>[]} fibers that will be REPLACE victims
+   */
+  private collectFullDiffReplaceVictims (
+    currentChildren: RuntimeFiber<unknown>[],
+    nextVnodes: VirtualServiceNode[],
+    hasKeyedCurrent: boolean,
+  ): RuntimeFiber<unknown>[] {
+    const victims: RuntimeFiber<unknown>[] = [];
+    const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
+    let unkeyedIdx = 0;
+
+    if (hasKeyedCurrent) {
+      const keyedCurrentMap = new Map<string | number, RuntimeFiber<unknown>>();
+      for (const child of currentChildren) {
+        const key = child.vnode.key;
+        if (key !== undefined) {
+          keyedCurrentMap.set(key, child);
+        } else {
+          unkeyedCurrent.push(child);
+        }
+      }
+
+      for (const nextVnode of nextVnodes) {
+        const nextKey = nextVnode.key;
+        if (nextKey !== undefined && keyedCurrentMap.has(nextKey)) {
+          const currentFiber = keyedCurrentMap.get(nextKey);
+          keyedCurrentMap.delete(nextKey);
+          if (
+            currentFiber !== undefined &&
+            currentFiber.vnode.type !== nextVnode.type
+          ) {
+            victims.push(currentFiber);
+          }
+        } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
+          const currentFiber = unkeyedCurrent[unkeyedIdx];
+          unkeyedIdx += 1;
+          if (
+            currentFiber !== undefined &&
+            (
+              currentFiber.vnode.type !== nextVnode.type ||
+              (currentFiber.vnode.key ?? null) !== (nextVnode.key ?? null)
+            )
+          ) {
+            victims.push(currentFiber);
+          }
+        }
+      }
+    } else {
+      for (const child of currentChildren) {
+        unkeyedCurrent.push(child);
+      }
+
+      const paired = Math.min(nextVnodes.length, unkeyedCurrent.length);
+      for (let i = 0; i < paired; i += 1) {
+        const currentFiber = unkeyedCurrent[i];
+        const nextVnode = nextVnodes[i];
+        if (
+          currentFiber !== undefined &&
+          nextVnode !== undefined &&
+          (
+            currentFiber.vnode.type !== nextVnode.type ||
+            (currentFiber.vnode.key ?? null) !== (nextVnode.key ?? null)
+          )
+        ) {
+          victims.push(currentFiber);
+        }
+      }
+    }
+
+    return victims;
   }
 
   /**
@@ -2967,23 +3080,26 @@ export class GraphRuntime {
     const nextChildren: RuntimeFiber<unknown>[] = [];
     let unkeyedIdx = 0;
 
-    // Release orphan exclusive Command/Query slots BEFORE any PLACE materialize.
+    // Release exclusive Command/Query slots BEFORE any PLACE materialize for:
+    // - orphans (REMOVE+PLACE; nested handlers under keyed wrappers too), and
+    // - REPLACE victims (matched key/position, type/key change) — PLACE siblings
+    //   earlier in compose order can run while the victim is still alive.
     // Those buses allow only one handler per type: PLACE `@OnCommand`/`@OnQuery` for a
-    // type still owned by a not-yet-destroyed orphan throws and fail-stops.
+    // type still owned by a not-yet-destroyed leaving fiber throws and fail-stops.
     // Keep `@OnEvent` subscriptions until destroy — deferred sibling UPDATE may still
-    // publish into the orphan before onUnmount (#158). EventBus is multi-subscriber, and
-    // orphan `onUnmount` publishes after PLACE wires without needing the orphan subscribed.
+    // publish into the orphan before onUnmount (#158), and REPLACE victim onUnmount
+    // still reaches earlier PLACE `@OnEvent` peers. EventBus is multi-subscriber.
     if (this.effectableRuntimeBuses !== null) {
       const buses = this.effectableRuntimeBuses;
-      for (const orphan of this.collectFullDiffOrphans(currentChildren, nextVnodes, hasKeyedCurrent)) {
-        const instance = orphan.instance;
-        if (instance === null) {
-          continue;
-        }
+      const leaving: RuntimeFiber<unknown>[] = [
+        ...this.collectFullDiffOrphans(currentChildren, nextVnodes, hasKeyedCurrent),
+        ...this.collectFullDiffReplaceVictims(currentChildren, nextVnodes, hasKeyedCurrent),
+      ];
+      for (const fiber of leaving) {
         try {
-          releaseExclusiveRuntimeBusHandlers(instance, buses);
+          this.releaseExclusiveRuntimeBusHandlersSubtree(fiber, buses);
         } catch {
-          // Best-effort: a throwing unregister must not skip remaining orphans or block PLACE.
+          // Best-effort: a throwing unregister must not skip remaining fibers or block PLACE.
           // destroyFiber still runs the full bus disposer later.
         }
       }
