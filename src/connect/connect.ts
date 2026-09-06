@@ -362,18 +362,26 @@ function buildConnectHoc<S, P, R, A extends Action> (
       /**
        * Publishes the resolved store into the connected component's subtree.
        *
-       * GraphRuntime calls this during materialization **before** the first `compose()`.
-       * Sync mapped props here so strict mode does not leak parent own-props into that
-       * compose (and so mapState/mapDispatch fields are visible without waiting for
-       * `onMount` + post-mount kick-off). Otherwise a gate that branches on own props
-       * can PLACE/onMount the wrong child subtree for one generation.
+       * GraphRuntime calls this during materialization **before** the first `compose()`,
+       * and again on update / dirty reconcile. Mapped props are synced only while mount
+       * has not completed yet — that closes the strict first-compose own-props leak
+       * without re-running `mapDispatch` on every dirty flush (a factory that dispatches
+       * as a side effect would otherwise loop: dispatch → select → setState → dirty
+       * reconcile → applyToScope → dispatch → … → fail-stop).
+       *
+       * After mount, props stay current via the store subscription and
+       * {@link RUNTIME_PROPS_RECEIVER}; post-mount `applyToScope` only republishes the store.
        *
        * @param {ContextScope} parentScope - parent scope
        * @returns {ContextScope} scope for child nodes
        */
       public applyToScope (parentScope: ContextScope): ContextScope {
         const store = this.resolveConnectStore();
-        this.syncConnectPropsBeforeCompose(store);
+        // Pre-mount only: first compose runs before onMount, so own-props must be
+        // stripped / mapped here. Never re-sync on dirty/update flushes after mount.
+        if (!this.__connectMountCompleted) {
+          this.syncConnectPropsBeforeCompose(store);
+        }
         return extendScope(parentScope, CONNECT_STORE_CONTEXT, store);
       }
 
