@@ -204,7 +204,9 @@ export function createStore<S, A extends Action> (
   const select = <T>(selectorFn: Selector<S, T>): Observable<T> => {
     return state$.pipe(
       map(selectorFn),
-      distinctUntilChanged()
+      // Object.is so stable NaN (and -0/+0) compare equal — default === re-emits
+      // NaN on every dispatch and can infinite-loop a subscriber that dispatches.
+      distinctUntilChanged(Object.is)
     );
   };
 
