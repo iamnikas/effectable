@@ -1498,9 +1498,18 @@ export function connect<S, P = unknown, R = unknown, A extends Action = Action> 
     }
   } else {
     mapStateToProps = storeOrMapStateToProps as MapStateToProps<S, P, R> | undefined;
-    // connect(mapState, options) — options without null mapDispatch
-    if (isConnectOptions(mapStateToPropsOrMapDispatchToProps) && mapDispatchToPropsOrOptions === undefined) {
+    // connect(mapState, options[, mapDispatch]) — options in the mapDispatch slot.
+    // Must still bind a following mapDispatch; requiring `arg3 === undefined` made
+    // `connect(mapState, { ownPropsModeMerge: true }, mapDispatch)` type-legal but
+    // swapped the bag into mapDispatch (booleans skipped → {}) and the function into
+    // options (merge never applied) — silent undefined callbacks + dropped own props.
+    if (isConnectOptions(mapStateToPropsOrMapDispatchToProps)) {
       options = mapStateToPropsOrMapDispatchToProps;
+      if (isConnectOptions(mapDispatchToPropsOrOptions)) {
+        options = mapDispatchToPropsOrOptions;
+      } else if (mapDispatchToPropsOrOptions !== undefined) {
+        mapDispatchToProps = mapDispatchToPropsOrOptions as MapDispatchToProps<S, P, A> | undefined;
+      }
     } else {
       mapDispatchToProps = mapStateToPropsOrMapDispatchToProps as MapDispatchToProps<S, P, A> | undefined;
       options = mapDispatchToPropsOrOptions as ConnectOptions | undefined;
