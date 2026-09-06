@@ -12,6 +12,9 @@
  * - Remount clears stale mapped state props and re-resolves the context store when needed.
  * - Class-field `onMount` / `onUnmount` (own instance properties) still go through connect wiring
  *   and do not shadow store subscribe / unsubscribe.
+ * - Class-field `applyToScope` (own instance property) still goes through connect wiring and
+ *   does not shadow `CONNECT_STORE_CONTEXT` publish — GraphRuntime calls `instance.applyToScope`,
+ *   so an own field would otherwise skip the HOC entirely (child-connected mounts fail).
  * - Subclass-of-Connected prototype `override onMount` / `onUnmount` still run after wiring
  *   (own Connected hooks shadow Ext.prototype for GraphRuntime entry; connect re-resolves them),
  *   including when the wrapped base used a class-field lifecycle hook (must not win over Ext).
@@ -411,6 +414,14 @@ function buildConnectHoc<S, P, R, A extends Action> (
       private __connectOwnOnMount: (() => void | Promise<void>) | null = null;
       private __connectOwnOnUnmount: (() => void | Promise<void>) | null = null;
       /**
+       * User `applyToScope` from a class field (own property) or the wrapped prototype.
+       * Own class fields shadow `Connected.prototype.applyToScope` for GraphRuntime's
+       * `instance.applyToScope(...)` call unless captured and reinstalled below.
+       */
+      private __connectUserApplyToScope:
+        | ((scope: ContextScope) => ContextScope)
+        | null = null;
+      /**
        * True when the corresponding `__connectOwnOn*` capture came from CONNECT_REBIND
        * (subclass-of-Connected class field), not from the Connected constructor (wrapped base).
        */
@@ -462,10 +473,11 @@ function buildConnectHoc<S, P, R, A extends Action> (
         this.__connectEntryOnMount = () => this.enterConnectOnMount();
         this.__connectEntryOnUnmount = () => this.enterConnectOnUnmount();
 
-        // Class-field lifecycle hooks are own properties and shadow Connected.prototype.
-        // Capture BaseCtor fields here, then reinstall Connected wiring. Subclass-of-Connected
-        // class fields initialize *after* this constructor and can overwrite the wiring again;
-        // GraphRuntime calls CONNECT_REBIND_LIFECYCLE post-construct to re-capture those.
+        // Class-field lifecycle / applyToScope hooks are own properties and shadow
+        // Connected.prototype. Capture BaseCtor fields here, then reinstall Connected
+        // wiring. Subclass-of-Connected class fields initialize *after* this constructor
+        // and can overwrite the wiring again; GraphRuntime calls CONNECT_REBIND_LIFECYCLE
+        // post-construct to re-capture those.
         this.installConnectLifecycleHooks(false);
         (this as unknown as Record<symbol, unknown>)[CONNECT_REBIND_LIFECYCLE] = () => {
           this.installConnectLifecycleHooks(true);
@@ -473,8 +485,9 @@ function buildConnectHoc<S, P, R, A extends Action> (
       }
 
       /**
-       * Captures any own `onMount` / `onUnmount` that is not Connected wiring, then
-       * reinstalls own-entry Connected hooks (not prototype methods — see mount reentry).
+       * Captures any own `onMount` / `onUnmount` / `applyToScope` that is not Connected
+       * wiring, then reinstalls own-entry Connected hooks (not prototype methods — see
+       * mount reentry) and `Connected.prototype.applyToScope` as an own property.
        *
        * Safe to call from the Connected constructor (BaseCtor class fields) and again
        * after full construction (subclass-of-Connected class fields).
@@ -487,9 +500,11 @@ function buildConnectHoc<S, P, R, A extends Action> (
         const self = this as {
           onMount?: unknown;
           onUnmount?: unknown;
+          applyToScope?: unknown;
         };
         const protoMount = Connected.prototype.onMount;
         const protoUnmount = Connected.prototype.onUnmount;
+        const protoApply = Connected.prototype.applyToScope;
         const entryMount = this.__connectEntryOnMount;
         const entryUnmount = this.__connectEntryOnUnmount;
         if (
@@ -510,8 +525,28 @@ function buildConnectHoc<S, P, R, A extends Action> (
           this.__connectOwnOnUnmount = self.onUnmount as () => void | Promise<void>;
           this.__connectOwnOnUnmountFromSubclass = fromSubclassRebind;
         }
+        if (
+          Object.prototype.hasOwnProperty.call(this, 'applyToScope') &&
+          typeof self.applyToScope === 'function' &&
+          self.applyToScope !== protoApply
+        ) {
+          this.__connectUserApplyToScope = self.applyToScope as (
+            scope: ContextScope
+          ) => ContextScope;
+        } else if (this.__connectUserApplyToScope === null) {
+          // No own field: keep wrapped prototype applyToScope (ContextProvider / custom).
+          const baseApply = (
+            Constructor.prototype as {
+              applyToScope?: (scope: ContextScope) => ContextScope;
+            }
+          ).applyToScope;
+          if (typeof baseApply === 'function' && baseApply !== protoApply) {
+            this.__connectUserApplyToScope = baseApply;
+          }
+        }
         self.onMount = entryMount;
         self.onUnmount = entryUnmount;
+        self.applyToScope = protoApply;
       }
 
       /**
@@ -712,16 +747,14 @@ function buildConnectHoc<S, P, R, A extends Action> (
           publishStore = resolved;
         }
 
-        // Preserve the wrapped class's applyToScope (ContextProvider or a custom
-        // context publisher). Skipping super silently drops user tokens from the
-        // child scope while CONNECT_STORE_CONTEXT still publishes — children see
-        // token defaults instead of the intended provider values.
-        const baseApply = (
-          Constructor.prototype as { applyToScope?: (scope: ContextScope) => ContextScope }
-        ).applyToScope;
+        // Wrapped ContextProvider / custom publisher (prototype or captured class field).
+        // Skipping this silently drops user tokens while CONNECT_STORE_CONTEXT still
+        // publishes — children see token defaults instead of intended provider values.
+        // Class-field applyToScope is captured in installConnectLifecycleHooks and the HOC
+        // method reinstalled as an own property so GraphRuntime still hits this path.
         const scopeForChildren =
-          typeof baseApply === 'function'
-            ? baseApply.call(this, parentScope)
+          this.__connectUserApplyToScope !== null
+            ? this.__connectUserApplyToScope.call(this, parentScope)
             : parentScope;
 
         return extendScope(scopeForChildren, CONNECT_STORE_CONTEXT, publishStore);
