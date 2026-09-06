@@ -240,6 +240,16 @@ function getMappedPropsRecord (mapped: unknown): Record<string, unknown> | null 
     return null;
   }
 
+  // Promises are objects. Spreading a thenable into props yields zero enumerable
+  // keys, so mapped fields vanish silently (common with accidental `async`
+  // mapState). Reject thenables instead of treating them as prop bags.
+  if (isPromiseLike(mapped)) {
+    throw new Error(
+      '[Effectable.connect] mapStateToProps/mapDispatchToProps must return a ' +
+      'plain object synchronously; Promises/thenables are not supported.',
+    );
+  }
+
   return mapped as Record<string, unknown>;
 }
 
