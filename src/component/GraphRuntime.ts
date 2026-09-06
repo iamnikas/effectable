@@ -2634,6 +2634,8 @@ export class GraphRuntime {
 
     const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
     const nextChildren: RuntimeFiber<unknown>[] = [];
+    /** Unmatched current children to destroy; iteration uses compose order below. */
+    const orphanSet = new Set<RuntimeFiber<unknown>>();
     let unkeyedIdx = 0;
 
     // Pass-1 defers same-type UPDATE until after PLACE/REPLACE siblings are wired.
@@ -2728,14 +2730,12 @@ export class GraphRuntime {
             }
           }
 
-          // Destroy remaining unpaired current children (keyed).
-          // Best-effort: collect finalize errors so one throwing ref clear cannot
-          // skip remaining orphans and fail-stop the whole runtime.
+          // Collect remaining unpaired keyed orphans; destroy later in compose order
+          // together with unkeyed orphans (see below). Keyed-first teardown inverted
+          // compose order when an unkeyed sibling preceded a keyed one, so an earlier
+          // unkeyed onUnmount publish could miss a later keyed @On* listener.
           for (const [, orphan] of keyedCurrentMap) {
-            const d = this.destroyFiber(orphan, []);
-            if (isThenable(d)) {
-              await d;
-            }
+            orphanSet.add(orphan);
           }
         } finally {
           this.reconcileDepth--;
@@ -2764,15 +2764,24 @@ export class GraphRuntime {
         }
       }
 
-      // Destroy remaining unpaired unkeyed children (best-effort finalize errors).
+      // Remaining unpaired unkeyed children join the orphan set.
       for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
         const orphan = unkeyedCurrent[i];
-
         if (orphan !== undefined) {
-          const d = this.destroyFiber(orphan, []);
-          if (isThenable(d)) {
-            await d;
-          }
+          orphanSet.add(orphan);
+        }
+      }
+
+      // Destroy orphans in original compose order (not keyed-then-unkeyed).
+      // Best-effort: collect finalize errors so one throwing ref clear cannot
+      // skip remaining orphans and fail-stop the whole runtime.
+      for (const child of currentChildren) {
+        if (!orphanSet.has(child)) {
+          continue;
+        }
+        const d = this.destroyFiber(child, []);
+        if (isThenable(d)) {
+          await d;
         }
       }
 
