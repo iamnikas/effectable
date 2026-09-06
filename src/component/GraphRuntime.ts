@@ -397,6 +397,64 @@ export class GraphRuntime {
   }
 
   /**
+   * Fibers that will be unpaired after the next-child match (full-diff orphans).
+   * Pure: mirrors keyed/unkeyed matching without materializing or destroying.
+   *
+   * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
+   * @param {VirtualServiceNode[]} nextVnodes - next child vnodes
+   * @param {boolean} hasKeyedCurrent - whether any current child has a key
+   * @returns {RuntimeFiber<unknown>[]} fibers that will be destroyed as orphans
+   */
+  private collectFullDiffOrphans (
+    currentChildren: RuntimeFiber<unknown>[],
+    nextVnodes: VirtualServiceNode[],
+    hasKeyedCurrent: boolean,
+  ): RuntimeFiber<unknown>[] {
+    const orphans: RuntimeFiber<unknown>[] = [];
+    const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
+    let unkeyedIdx = 0;
+
+    if (hasKeyedCurrent) {
+      const keyedCurrentMap = new Map<string | number, RuntimeFiber<unknown>>();
+      for (const child of currentChildren) {
+        const key = child.vnode.key;
+        if (key !== undefined) {
+          keyedCurrentMap.set(key, child);
+        } else {
+          unkeyedCurrent.push(child);
+        }
+      }
+
+      for (const nextVnode of nextVnodes) {
+        const nextKey = nextVnode.key;
+        if (nextKey !== undefined && keyedCurrentMap.has(nextKey)) {
+          keyedCurrentMap.delete(nextKey);
+        } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
+          unkeyedIdx += 1;
+        }
+      }
+
+      for (const [, orphan] of keyedCurrentMap) {
+        orphans.push(orphan);
+      }
+    } else {
+      for (const child of currentChildren) {
+        unkeyedCurrent.push(child);
+      }
+      unkeyedIdx = Math.min(nextVnodes.length, unkeyedCurrent.length);
+    }
+
+    for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
+      const orphan = unkeyedCurrent[i];
+      if (orphan !== undefined) {
+        orphans.push(orphan);
+      }
+    }
+
+    return orphans;
+  }
+
+  /**
    * Builds the value assigned to `ref.current` for a mounted instance.
    *
    * When the constructor declares `@UseImperativeHandle` methods, only those methods
@@ -2635,6 +2693,20 @@ export class GraphRuntime {
     const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
     const nextChildren: RuntimeFiber<unknown>[] = [];
     let unkeyedIdx = 0;
+
+    // Unregister orphan buses BEFORE any PLACE materialize. CommandBus/QueryBus allow
+    // only one handler per type: PLACE `@OnCommand`/`@OnQuery` for a type still owned by
+    // a not-yet-destroyed orphan throws and fail-stops. EventBus is multi-subscriber, but
+    // disposing early is still safe — orphan `onUnmount` publishes after PLACE wires, so
+    // `@OnEvent` handoffs keep working (publisher need not stay subscribed).
+    for (const orphan of this.collectFullDiffOrphans(currentChildren, nextVnodes, hasKeyedCurrent)) {
+      try {
+        this.disposeEffectableRuntimeBusWiring(orphan);
+      } catch {
+        // Best-effort: a throwing disposer must not skip remaining orphans or block PLACE.
+        // destroyFiber will attempt dispose again (no-op once cleared).
+      }
+    }
 
     // Pass-1 defers same-type UPDATE until after PLACE/REPLACE siblings are wired.
     // Otherwise UPDATE `onUpdate` can publish before a later PLACE sibling's `@On*`
