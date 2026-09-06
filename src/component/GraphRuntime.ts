@@ -4194,29 +4194,12 @@ export class GraphRuntime {
         nextChildren[pending.slot] = isThenable(updatedRes) ? await updatedRes : updatedRes;
       }
 
-      // Flush stashed onUpdates *before* REPLACE-victim / orphan destroy: nested PLACE
-      // under later UPDATE siblings has finished wiring, and orphan @On* still receive
-      // handoff. Sibling PLACE/REPLACE from pass 1 are already wired; only
-      // covered sibling PLACE — nested PLACE under a later UPDATE still needed this.
-      // When this full-diff runs under a parent UPDATE that already deferred its batch
-      // flush, skip here so descendant onUpdates wait for the ancestor drain — otherwise
-      // a nested publisher under Early fires before Late's nested PLACE wires @On*.
-      if (!deferPendingBatchFlush) {
-        for (let i = 0; i < nextChildren.length; i++) {
-          const onUpdateFlush = this.flushPendingOnUpdateTree(
-            nextChildren[i] as RuntimeFiber<unknown>,
-          );
-          if (isThenable(onUpdateFlush)) {
-            await onUpdateFlush;
-          }
-        }
-      }
-
       // When this full-diff runs under a parent UPDATE that deferred its batch flush,
-      // hold REPLACE-victim destroy and orphan DELETE until the ancestor drains — a
-      // later sibling may still PLACE @On* that must observe onUnmount publishes.
-      // Free exclusive Command/Query on stashed orphans now so later PLACE can claim
-      // them; keep EventBus until destroy (same contract as deferred REPLACE victims).
+      // hold REPLACE-victim destroy, onUpdate, and orphan DELETE until the ancestor
+      // drains — a later sibling may still PLACE @On* that must observe onUnmount /
+      // onUpdate publishes. Free exclusive Command/Query on stashed orphans now so
+      // later PLACE can claim them; keep EventBus until destroy (same contract as
+      // deferred REPLACE victims).
       if (deferPendingBatchFlush) {
         const stashed: RuntimeFiber<unknown>[] = [];
         for (const child of currentChildren) {
@@ -4246,13 +4229,25 @@ export class GraphRuntime {
           }
         }
       } else {
-        // Destroy REPLACE victims BEFORE orphan DELETE. Otherwise an orphan onUnmount
-        // publish dual-delivers to both still-wired victim and replacement. PLACE peers
-        // are already materialized (buses wired) at this point; later flushSiblingBatchHooks
-        // remains idempotent when victims are already cleared.
+        // Order matches flushSiblingBatchHooks: REPLACE victims → onUpdate → orphans.
+        // Victims must die before onUpdate: after nested teardown deferral, nested
+        // REPLACE victims under Early survive until this ancestor drain — flushing
+        // onUpdate first dual-delivers EventBus publishes to victim + replacement.
+        // Orphans stay until after onUpdate so orphan @On* still receive handoff.
+        // Sibling PLACE/REPLACE from pass 1 and nested PLACE under later UPDATEs are
+        // already wired before this block.
         const victimsRes = this.flushPendingReplaceVictims(nextChildren);
         if (isThenable(victimsRes)) {
           await victimsRes;
+        }
+
+        for (let i = 0; i < nextChildren.length; i++) {
+          const onUpdateFlush = this.flushPendingOnUpdateTree(
+            nextChildren[i] as RuntimeFiber<unknown>,
+          );
+          if (isThenable(onUpdateFlush)) {
+            await onUpdateFlush;
+          }
         }
 
         // Destroy orphans after onUpdate flush in original compose order (not keyed-then-
