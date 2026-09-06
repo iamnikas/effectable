@@ -523,7 +523,7 @@ export class GraphRuntime {
     );
 
     if (methods.length === 0) {
-      this.imperativeRefByOwner.delete(instance);
+      // Full-instance path: caller updates tracking only after a successful assign.
       return instance;
     }
 
@@ -542,22 +542,33 @@ export class GraphRuntime {
       handle[methodKey] = (fn as (...args: unknown[]) => unknown).bind(instance);
     }
 
-    this.imperativeRefByOwner.set(instance, handle);
+    // Do not write imperativeRefByOwner here — a setter may throw before assigning
+    // `ref.current`. Tracking is committed only after a successful assign in commitRef.
     return handle;
   }
 
   /**
    * Identity-safe ref clearing: clears ref.current only if it still points to the expected owner
-   * (full instance) or the limited imperative handle previously bound for that owner.
+   * (full instance), the limited imperative handle previously bound for that owner, or
+   * `attemptedValue` (the value just assigned when a setter threw after write).
    * Prevents an old rollback from clearing a ref that a newer materialization already reused.
    *
    * @param {RefObject<unknown>} ref - ref object
    * @param {Component<unknown, unknown>} expectedOwner - expected current owner
+   * @param {unknown} [attemptedValue] - value commitRef tried to assign (assign-then-throw)
    * @returns {void}
    */
-  private clearRefSafe (ref: RefObject<unknown>, expectedOwner: Component<unknown, unknown>): void {
+  private clearRefSafe (
+    ref: RefObject<unknown>,
+    expectedOwner: Component<unknown, unknown>,
+    attemptedValue?: unknown,
+  ): void {
     const boundHandle = this.imperativeRefByOwner.get(expectedOwner);
-    if (ref.current === expectedOwner || (boundHandle !== undefined && ref.current === boundHandle)) {
+    if (
+      ref.current === expectedOwner
+      || (boundHandle !== undefined && ref.current === boundHandle)
+      || (attemptedValue !== undefined && attemptedValue !== null && ref.current === attemptedValue)
+    ) {
       ref.current = null;
     }
     this.imperativeRefByOwner.delete(expectedOwner);
@@ -596,12 +607,26 @@ export class GraphRuntime {
     // Materialize assign-then-throw is covered by journal.refBound (#96/#98); this path covers
     // the UPDATE swap hole and is a safe no-op when the setter never assigned.
     if (nextRef !== undefined) {
+      let attemptedValue: unknown;
       try {
-        nextRef.current = instance === null ? null : this.resolveRefCurrentValue(instance);
+        if (instance === null) {
+          nextRef.current = null;
+          return;
+        }
+        attemptedValue = this.resolveRefCurrentValue(instance);
+        nextRef.current = attemptedValue;
+        // Commit ownership tracking only after assign succeeds.
+        if (attemptedValue === instance) {
+          this.imperativeRefByOwner.delete(instance);
+        } else {
+          this.imperativeRefByOwner.set(instance, attemptedValue as object);
+        }
       } catch (error: unknown) {
         if (instance !== null) {
           try {
-            this.clearRefSafe(nextRef, instance);
+            // Pass attemptedValue so assign-then-throw still clears the new handle
+            // even though WeakMap still holds the previous handle (or nothing).
+            this.clearRefSafe(nextRef, instance, attemptedValue);
           } catch {
             // Best-effort: do not mask the original setter error.
           }
