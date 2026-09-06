@@ -3859,18 +3859,34 @@ export class GraphRuntime {
         }
       }
 
-      // Pass 2: run deferred UPDATEs. PLACE/REPLACE siblings are already wired, so
-      // onUpdate publishes reach new @On* handlers before deferred onMount flush.
-      // Orphans remain alive until after this pass so UPDATE↔DELETE handoff keeps
-      // pre-#119 order (onUpdate before sibling onUnmount).
+      // Pass 2: run deferred UPDATEs with onUpdate stashed. Sibling PLACE/REPLACE are
+      // already wired in pass 1, but a later UPDATE sibling may still PLACE *nested*
+      // children during this pass — immediate onUpdate here would publish before those
+      // nested @On* handlers exist (silent drop; #125 only covered sibling PLACE).
+      // Orphans stay alive until after the onUpdate flush so UPDATE↔DELETE handoff
+      // keeps pre-#119 order (onUpdate before sibling onUnmount / #158).
       for (const pending of pendingUpdates) {
         const updatedRes = this.updateFiber(
           pending.current,
           pending.nextVnode,
           parentFiber,
           childScope,
+          true,
         );
         nextChildren[pending.slot] = isThenable(updatedRes) ? await updatedRes : updatedRes;
+      }
+
+      // Flush stashed onUpdates *before* REPLACE-victim / orphan destroy: nested PLACE
+      // under later UPDATE siblings has finished wiring, and orphan @On* still receive
+      // handoff (#186). Sibling PLACE/REPLACE from pass 1 are already wired; #125 only
+      // covered sibling PLACE — nested PLACE under a later UPDATE still needed this.
+      for (let i = 0; i < nextChildren.length; i++) {
+        const onUpdateFlush = this.flushPendingOnUpdateTree(
+          nextChildren[i] as RuntimeFiber<unknown>,
+        );
+        if (isThenable(onUpdateFlush)) {
+          await onUpdateFlush;
+        }
       }
 
       // Destroy REPLACE victims BEFORE orphan DELETE. Otherwise an orphan onUnmount
@@ -3882,11 +3898,11 @@ export class GraphRuntime {
         await victimsRes;
       }
 
-      // Destroy orphans after UPDATEs in original compose order (not keyed-then-unkeyed).
-      // Keyed-first teardown inverted compose order when an unkeyed sibling preceded a
-      // keyed one, so an earlier unkeyed onUnmount publish could miss a later keyed @On*
-      // listener (#174). PLACE peers are already wired, so onUnmount publishes still reach
-      // same-batch PLACE @On*.
+      // Destroy orphans after onUpdate flush in original compose order (not keyed-then-
+      // unkeyed). Keyed-first teardown inverted compose order when an unkeyed sibling
+      // preceded a keyed one, so an earlier unkeyed onUnmount publish could miss a later
+      // keyed @On* listener (#174). PLACE peers are already wired, so onUnmount publishes
+      // still reach same-batch PLACE @On*.
       for (const child of currentChildren) {
         if (!pendingOrphanSet.has(child)) {
           continue;
@@ -3897,8 +3913,8 @@ export class GraphRuntime {
         }
       }
 
-      // Deferred onUpdates first (so UPDATE publishes see wired PLACE @On*), then
-      // PLACE/REPLACE startups in compose order after every new sibling is wired.
+      // onUpdates already flushed above; this pass runs deferred PLACE/REPLACE onMount
+      // in compose order after every new sibling (and nested PLACE) is wired.
       // REPLACE victims may already be cleared above (before orphan DELETE); idempotent.
       const batchFlush = this.flushSiblingBatchHooks(nextChildren);
       if (isThenable(batchFlush)) {
