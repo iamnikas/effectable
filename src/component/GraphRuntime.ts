@@ -31,6 +31,8 @@
  * @module Effectable/component/GraphRuntime
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 import type { Component } from './Component';
 import type {
   Fiber,
@@ -283,6 +285,14 @@ export class GraphRuntime {
    * Whether an operation is currently running.
    */
   private operationInProgress = false;
+
+  /**
+   * Async context bound for the currently executing queued graph operation.
+   * Distinguishes true reentrancy (onMount/onUpdate → reconcile/unmount on the same
+   * async chain) from concurrent external callers that must only enqueue.
+   * Awaiting a nested queue entry from inside the running op deadlocks the queue.
+   */
+  private readonly operationAsyncContext = new AsyncLocalStorage<true>();
 
   /**
    * Cached unmount promise for concurrent unmount callers.
@@ -985,6 +995,30 @@ export class GraphRuntime {
    * @returns {Promise<void>}
    */
   private async enqueueOperation (operation: () => Promise<void>): Promise<void> {
+    // True reentrancy: caller is on the async chain of the running queued operation
+    // (e.g. onMount → await reconcile/unmount). Concurrent external callers have no
+    // store and must enqueue. Reentrant awaits deadlock the single-threaded queue.
+    // For unmount, {@link unmount} still schedules teardown via {@link enqueueOperationUnchecked}.
+    if (this.operationAsyncContext.getStore() === true) {
+      return Promise.reject(
+        new Error(
+          '[Effectable] GraphRuntime: reconcile/unmount cannot be awaited from inside an in-flight ' +
+            'graph operation (e.g. onMount/onUpdate). That would deadlock the operation queue.',
+        ),
+      );
+    }
+
+    return this.enqueueOperationUnchecked(operation);
+  }
+
+  /**
+   * Enqueues an operation without the reentrancy guard.
+   * Used by {@link unmount} to schedule deferred teardown when called from inside a queued op.
+   *
+   * @param {() => Promise<void>} operation - operation to enqueue
+   * @returns {Promise<void>}
+   */
+  private async enqueueOperationUnchecked (operation: () => Promise<void>): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       this.operationQueue.push(async () => {
         try {
@@ -1024,7 +1058,10 @@ export class GraphRuntime {
         }
 
         try {
-          await operation();
+          // Bind async context so lifecycle hooks (onMount/onUpdate) that call
+          // reconcile/unmount are detected as reentrant; external concurrent
+          // callers remain outside this store and only enqueue.
+          await this.operationAsyncContext.run(true, operation);
         } catch {
           // Error is already propagated to the caller via the promise wrapper
           // Continue processing the queue (don't poison it forever)
@@ -1438,66 +1475,89 @@ export class GraphRuntime {
       this.state = RUNTIME_STATE.UNMOUNTING;
     }
 
+    // Reentrant unmount from onMount/onUpdate: schedule teardown on the queue (so the
+    // current op's while-loop runs it next) but reject the awaiter — awaiting the cached
+    // promise here would deadlock. External callers still join via cachedUnmountPromise.
+    if (this.operationAsyncContext.getStore() === true) {
+      this.cachedUnmountPromise = this.enqueueOperationUnchecked(async () => {
+        await this.runUnmountOperation(rejectOnCleanupError);
+      });
+      throw new Error(
+        '[Effectable] GraphRuntime: unmount cannot be awaited from inside an in-flight ' +
+          'graph operation (e.g. onMount/onUpdate); teardown was scheduled on the operation queue.',
+      );
+    }
+
     // Create and cache the unmount promise
     this.cachedUnmountPromise = this.enqueueOperation(async () => {
-      // Double-check unmounted state
-      if (this.state === RUNTIME_STATE.UNMOUNTED) {
-        return;
-      }
-
-      // Cancel any pending dirty flush
-      this.dirtyFibers.clear();
-      this.flushScheduled = false;
-
-      // Wait for in-flight dirty flush to complete
-      if (this.activeFlush !== null) {
-        try {
-          await this.activeFlush;
-        } catch {
-          // Ignore flush errors during unmount
-        }
-      }
-
-      // HOLE 1: stay UNMOUNTING during destroy (not UNMOUNTED)
-      // If already FAILED, keep FAILED state through destroy
-      // State transition to UNMOUNTED happens AFTER destroy completes
-
-      // If pendingTeardown is active (fail-stop in progress), await it first
-      if (this.pendingTeardown !== null) {
-        try {
-          await this.pendingTeardown;
-        } catch {
-          // Ignore errors — they are already attached to the fail-stop primary error
-        }
-      }
-
-      if (this.currentRoot !== null) {
-        // Collect cleanup errors during unmount
-        const cleanupErrors: Error[] = [];
-        const d = this.destroyFiber(this.currentRoot, cleanupErrors);
-        if (isThenable(d)) {
-          await d;
-        }
-        this.currentRoot = null;
-
-        // HOLE 1: set UNMOUNTED only after destroy finishes
-        // Transition even if FAILED — unmount is the terminal operation
-        this.state = RUNTIME_STATE.UNMOUNTED;
-
-        // Reject with cleanup errors when requested
-        if (rejectOnCleanupError && cleanupErrors.length > 0) {
-          if (cleanupErrors.length === 1) {
-            throw cleanupErrors[0];
-          }
-          throw new AggregateError(cleanupErrors, 'Cleanup errors during unmount');
-        }
-      } else {
-        // No root to destroy — transition to UNMOUNTED
-        this.state = RUNTIME_STATE.UNMOUNTED;
-      }
+      await this.runUnmountOperation(rejectOnCleanupError);
     });
 
     return this.cachedUnmountPromise;
+  }
+
+  /**
+   * Body of a queued unmount operation (shared by normal and deferred reentrant paths).
+   *
+   * @param {boolean} rejectOnCleanupError - whether cleanup errors should reject
+   * @returns {Promise<void>}
+   */
+  private async runUnmountOperation (rejectOnCleanupError: boolean): Promise<void> {
+    // Double-check unmounted state
+    if (this.state === RUNTIME_STATE.UNMOUNTED) {
+      return;
+    }
+
+    // Cancel any pending dirty flush
+    this.dirtyFibers.clear();
+    this.flushScheduled = false;
+
+    // Wait for in-flight dirty flush to complete
+    if (this.activeFlush !== null) {
+      try {
+        await this.activeFlush;
+      } catch {
+        // Ignore flush errors during unmount
+      }
+    }
+
+    // HOLE 1: stay UNMOUNTING during destroy (not UNMOUNTED)
+    // If already FAILED, keep FAILED state through destroy
+    // State transition to UNMOUNTED happens AFTER destroy completes
+
+    // If pendingTeardown is active (fail-stop in progress), await it first
+    if (this.pendingTeardown !== null) {
+      try {
+        await this.pendingTeardown;
+      } catch {
+        // Ignore errors — they are already attached to the fail-stop primary error
+      }
+    }
+
+    if (this.currentRoot !== null) {
+      // Collect cleanup errors during unmount
+      const cleanupErrors: Error[] = [];
+      const d = this.destroyFiber(this.currentRoot, cleanupErrors);
+      if (isThenable(d)) {
+        await d;
+      }
+      this.currentRoot = null;
+
+      // HOLE 1: set UNMOUNTED only after destroy finishes
+      // Transition even if FAILED — unmount is the terminal operation
+      this.state = RUNTIME_STATE.UNMOUNTED;
+
+      // Reject with cleanup errors when requested
+      if (rejectOnCleanupError && cleanupErrors.length > 0) {
+        if (cleanupErrors.length === 1) {
+          throw cleanupErrors[0];
+        }
+        throw new AggregateError(cleanupErrors, 'Cleanup errors during unmount');
+      }
+    } else {
+      // No root to destroy — transition to UNMOUNTED
+      this.state = RUNTIME_STATE.UNMOUNTED;
+    }
   }
 
   /**
