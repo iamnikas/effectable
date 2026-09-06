@@ -183,7 +183,7 @@ interface RuntimeFiber<P = unknown> extends Fiber<P> {
   hasPendingOnUpdate?: boolean;
   /**
    * Exclusive Command/Query slots for this fiber were already freed by a pre-PLACE
-   * release under an UPDATE child-diff preview (#182 full-diff / stable fast-path).
+   * release under an UPDATE child-diff preview (full-diff / stable fast-path).
    * A later orphan/victim pass must not release again in a way that could interact
    * with a same-batch PLACE owner.
    */
@@ -444,7 +444,7 @@ export class GraphRuntime {
    * @param {RuntimeFiber<unknown>} fiber - orphan root (or any subtree root)
    * @param {RuntimeBusesBundle<RuntimeCommand, RuntimeQuery, RuntimeEvent>} buses - runtime buses
    * @param {{ commandTypes?: ReadonlySet<string>; queryTypes?: ReadonlySet<string> }} [onlyTypes]
-   *   optional filter of types an incoming PLACE/REPLACE will claim (#178)
+   *   optional filter of types an incoming PLACE/REPLACE will claim
    * @returns {void}
    */
   private releaseExclusiveRuntimeBusHandlersSubtree (
@@ -479,15 +479,6 @@ export class GraphRuntime {
   }
 
   /**
-   * Fibers that will be unpaired after the next-child match (full-diff orphans).
-   * Pure: mirrors keyed/unkeyed matching without materializing or destroying.
-   *
-   * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
-   * @param {VirtualServiceNode[]} nextVnodes - next child vnodes
-   * @param {boolean} hasKeyedCurrent - whether any current child has a key
-   * @returns {RuntimeFiber<unknown>[]} fibers that will be destroyed as orphans
-   */
-  /**
    * Applies `props` the same way UPDATE does (props receiver or assign).
    *
    * @template P
@@ -516,22 +507,26 @@ export class GraphRuntime {
   /**
    * Before nested PLACE under an earlier sibling UPDATE, release exclusive Command/Query
    * slots that a later sibling UPDATE will free only when it runs. Used by:
-   * - full-diff pass-1 (#182): deferred UPDATEs keep nested handlers across PLACE peers
+   * - full-diff pass-1: deferred UPDATEs keep nested handlers across PLACE peers
    * - stable fast-path: left-to-right UPDATE fully reconciles (nested PLACE) before the
    *   next sibling UPDATE — same clash without ever entering full-diff preview
    *
-   * Temporarily apply next props, compose next children, release unpaired / REPLACE-victim
-   * exclusive subtrees, recurse into nested UPDATEs. EventBus stays intact (#158).
+   * Mirrors real {@link updateFiber} wiring for the preview: next props, `@UseContext`
+   * inject when `parentScope` identity changed, then {@link buildChildScope} for nested
+   * recursion. Without inject, compose that depends on injected fields can miss orphans
+   * that the real UPDATE will drop — exclusive PLACE then fail-stops. EventBus stays intact.
    *
    * @param {RuntimeFiber<unknown>} fiber - UPDATE fiber whose next child diff is previewed
    * @param {VirtualServiceNode<unknown>} nextVnode - next vnode for that fiber
    * @param {NonNullable<GraphRuntime['effectableRuntimeBuses']>} buses - runtime buses
+   * @param {ContextScope} parentScope - scope the real UPDATE will receive
    * @returns {void}
    */
   private releaseExclusiveUnderDeferredUpdate (
     fiber: RuntimeFiber<unknown>,
     nextVnode: VirtualServiceNode<unknown>,
     buses: NonNullable<GraphRuntime['effectableRuntimeBuses']>,
+    parentScope: ContextScope,
   ): void {
     const instance = fiber.instance;
     if (instance === null) {
@@ -539,9 +534,18 @@ export class GraphRuntime {
     }
 
     const prevProps = instance.props;
+    const scopeChanged = fiber.scope !== parentScope;
     this.applyInstanceProps(instance, nextVnode.props as never);
 
     try {
+      if (scopeChanged) {
+        injectContextFields(instance, parentScope);
+      }
+      const childScope = this.buildChildScope(
+        instance as Component<unknown, unknown>,
+        parentScope,
+      );
+
       const nextChildVnodes = this.getChildVnodes(
         instance as Component<unknown, unknown>,
         nextVnode.children as VirtualServiceNode[],
@@ -580,6 +584,7 @@ export class GraphRuntime {
                 currentChild,
                 nextChild as VirtualServiceNode<unknown>,
                 buses,
+                childScope,
               );
             }
           } else if (nextKey === undefined && unkeyedIdx < unkeyedCurrent.length) {
@@ -590,6 +595,7 @@ export class GraphRuntime {
                 currentChild,
                 nextChild as VirtualServiceNode<unknown>,
                 buses,
+                childScope,
               );
             }
           }
@@ -611,6 +617,7 @@ export class GraphRuntime {
                 currentChild,
                 nextChild as VirtualServiceNode<unknown>,
                 buses,
+                childScope,
               );
             }
           }
@@ -625,6 +632,13 @@ export class GraphRuntime {
       }
     } finally {
       this.applyInstanceProps(instance, prevProps as never);
+      if (scopeChanged) {
+        try {
+          injectContextFields(instance, fiber.scope);
+        } catch {
+          // Best-effort restore; real UPDATE will re-inject or fail-stop.
+        }
+      }
     }
   }
 
@@ -635,24 +649,40 @@ export class GraphRuntime {
    * @param {RuntimeFiber<unknown>} currentChild - matched current child
    * @param {VirtualServiceNode<unknown>} nextChild - next child vnode
    * @param {NonNullable<GraphRuntime['effectableRuntimeBuses']>} buses - runtime buses
+   * @param {ContextScope} parentScope - scope the matched child UPDATE will receive
    * @returns {void}
    */
   private releaseExclusiveForMatchedDeferredChild (
     currentChild: RuntimeFiber<unknown>,
     nextChild: VirtualServiceNode<unknown>,
     buses: NonNullable<GraphRuntime['effectableRuntimeBuses']>,
+    parentScope: ContextScope,
   ): void {
     const sameType = currentChild.vnode.type === nextChild.type;
     const sameKey = (currentChild.vnode.key ?? null) === (nextChild.key ?? null);
 
     if (sameType && sameKey) {
-      this.releaseExclusiveUnderDeferredUpdate(currentChild, nextChild, buses);
+      this.releaseExclusiveUnderDeferredUpdate(
+        currentChild,
+        nextChild,
+        buses,
+        parentScope,
+      );
       return;
     }
 
     this.releaseExclusiveRuntimeBusHandlersSubtree(currentChild, buses);
   }
 
+  /**
+   * Fibers that will be unpaired after the next-child match (full-diff orphans).
+   * Pure: mirrors keyed/unkeyed matching without materializing or destroying.
+   *
+   * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
+   * @param {VirtualServiceNode[]} nextVnodes - next child vnodes
+   * @param {boolean} hasKeyedCurrent - whether any current child has a key
+   * @returns {RuntimeFiber<unknown>[]} fibers that will be destroyed as orphans
+   */
   private collectFullDiffOrphans (
     currentChildren: RuntimeFiber<unknown>[],
     nextVnodes: VirtualServiceNode[],
@@ -708,7 +738,7 @@ export class GraphRuntime {
    *
    * REPLACE victims are *not* orphans: they stay paired until pass-1 REPLACE runs.
    * An earlier PLACE sibling in the same batch can still try to register exclusive
-   * Command/Query types the victim still holds (#177).
+   * Command/Query types the victim still holds.
    *
    * @param {RuntimeFiber<unknown>[]} currentChildren - current child fibers
    * @param {VirtualServiceNode[]} nextVnodes - next child vnodes
@@ -882,7 +912,7 @@ export class GraphRuntime {
     // Custom setters may assign `current` then throw. Without a catch, UPDATE ref-swap
     // leaves the new ref holding the instance/handle while `fiber.vnode.ref` still points at
     // the previous ref object — fail-stop finalize clears only the old ref (zombie nextRef).
-    // Materialize assign-then-throw is covered by journal.refBound (#96/#98); this path covers
+    // Materialize assign-then-throw is covered by journal.refBound; this path covers
     // the UPDATE swap hole and is a safe no-op when the setter never assigned.
     if (nextRef !== undefined) {
       let attemptedValue: unknown;
@@ -2561,7 +2591,7 @@ export class GraphRuntime {
 
     // Wire parent buses BEFORE children materialize/onMount. Children run onMount while
     // descending; if the parent is not subscribed yet, child publishes to @OnEvent /
-    // @OnCommand on the parent are silently dropped (mirror of #80 teardown order).
+    // @OnCommand on the parent are silently dropped (mirror of teardown order).
     try {
       this.attachEffectableRuntimeBusWiring(instance, fiber);
       if (fiber.effectableRuntimeBusDisposer !== undefined) {
@@ -2816,7 +2846,7 @@ export class GraphRuntime {
     // When deferLifecycle is set (child reconcile batch):
     // 1) REPLACE must not run onMount before later sibling buses are wired — otherwise a
     //    replaced publisher's mount-time publish is silently dropped by a not-yet-wired
-    //    PLACE/REPLACE listener beside it (#108).
+    // PLACE/REPLACE listener beside it.
     // 2) REPLACE must also defer destroy/onUnmount of the victim until after later sibling
     //    PLACE/REPLACE buses wire — otherwise a victim onUnmount publish is silently dropped
     //    by a not-yet-wired PLACE listener in the same batch. Stash the victim on the
@@ -2895,7 +2925,7 @@ export class GraphRuntime {
     parentScope: ContextScope,
   ): RuntimeFiber<P> | Promise<RuntimeFiber<P>> {
     // Free exclusive Command/Query slots on the victim subtree before the replacement
-    // wires the same types (#173). Sibling REPLACE already does this when deferLifecycle
+    // wires the same types. Sibling REPLACE already does this when deferLifecycle
     // is set; root REPLACE must match. Keep @OnEvent until destroy — victim onUnmount
     // publishes after the replacement is wired (publisher need not stay subscribed).
     if (this.effectableRuntimeBuses !== null) {
@@ -3454,7 +3484,7 @@ export class GraphRuntime {
       // Stable path walks siblings left-to-right with full nested reconcile (including
       // PLACE) before the next sibling UPDATE. Preview each UPDATE's child diff and
       // free exclusive Command/Query slots that a later sibling still holds — same
-      // contract as full-diff #182, which never runs on this fast-path.
+      // contract as full-diff deferred-UPDATE preview, which never runs on this fast-path.
       if (this.effectableRuntimeBuses !== null) {
         const buses = this.effectableRuntimeBuses;
         for (let i = 0; i < n; i += 1) {
@@ -3463,6 +3493,7 @@ export class GraphRuntime {
               currentChildren[i] as RuntimeFiber<unknown>,
               nextVnodes[i] as VirtualServiceNode<unknown>,
               buses,
+              childScope,
             );
           } catch {
             // Best-effort — real UPDATE still runs in the sibling walk.
@@ -3635,11 +3666,11 @@ export class GraphRuntime {
 
     // Leaving fibers that can still hold exclusive slots during pass-1:
     // - orphans (unpaired) — type-scoped release so UPDATE→orphan execute/query survives
-    //   when no PLACE claims the type (#158/#178);
+    // when no PLACE claims the type;
     // - REPLACE victims (matched key/position, type/key change) — PLACE siblings earlier
-    //   in compose order can run while the victim is still alive (#177).
-    // Walk subtrees (#170 nested exclusive under wrappers). `@OnEvent` stays until destroy
-    // either way (multi-subscriber; #158). Generation-safe exclusive release must not wipe
+    // in compose order can run while the victim is still alive.
+    // Walk subtrees (nested exclusive under wrappers). `@OnEvent` stays until destroy
+    // either way (multi-subscriber). Generation-safe exclusive release must not wipe
     // a PLACE that already claimed the same type when REPLACE later re-releases the victim.
     const fullDiffOrphans = this.collectFullDiffOrphans(
       currentChildren,
@@ -3652,37 +3683,85 @@ export class GraphRuntime {
       hasKeyedCurrent,
     );
 
-    /**
-     * Free leaving exclusive slots that `nextVnode` will register, right before
-     * PLACE/REPLACE materialize. Covers orphans (#178) and REPLACE victims (#177).
-     * No-op when the incoming type declares no exclusive handlers.
-     *
-     * @param {VirtualServiceNode<unknown>} nextVnode - incoming sibling vnode
-     * @returns {void}
-     */
-    const releaseOrphanExclusiveForIncoming = (
-      nextVnode: VirtualServiceNode<unknown>,
-    ): void => {
-      if (this.effectableRuntimeBuses === null) {
-        return;
-      }
-      const onlyTypes = collectExclusiveHandlerTypesFromType(nextVnode.type);
-      if (onlyTypes.commandTypes.size === 0 && onlyTypes.queryTypes.size === 0) {
-        return;
-      }
-      const buses = this.effectableRuntimeBuses;
-      for (const leaving of [...fullDiffOrphans, ...fullDiffReplaceVictims]) {
-        try {
-          this.releaseExclusiveRuntimeBusHandlersSubtree(leaving, buses, onlyTypes);
-        } catch {
-          // Best-effort: a throwing unregister must not skip remaining fibers or block PLACE.
-          // destroyFiber still runs the full bus disposer later.
+    // Complexity invariant: O(N + L) over next siblings N and leaving fibers L
+    // (orphans + REPLACE victims) — not O(P×L) per PLACE/REPLACE. Union exclusive
+    // types claimed by incoming PLACE/REPLACE once, then one type-scoped subtree
+    // release over leaving fibers before pass-1 materialize.
+    if (this.effectableRuntimeBuses !== null) {
+      const claimedCommandTypes = new Set<string>();
+      const claimedQueryTypes = new Set<string>();
+      const unkeyedForClaim: RuntimeFiber<unknown>[] = [];
+      let unkeyedClaimIdx = 0;
+      const keyedForClaim = hasKeyedCurrent
+        ? new Map<string | number, RuntimeFiber<unknown>>()
+        : null;
+
+      if (keyedForClaim !== null) {
+        for (const child of currentChildren) {
+          const key = child.vnode.key;
+          if (key !== undefined) {
+            keyedForClaim.set(key, child);
+          } else {
+            unkeyedForClaim.push(child);
+          }
+        }
+      } else {
+        for (const child of currentChildren) {
+          unkeyedForClaim.push(child);
         }
       }
-    };
+
+      const addClaimedTypes = (vnode: VirtualServiceNode<unknown>): void => {
+        const types = collectExclusiveHandlerTypesFromType(vnode.type);
+        for (const commandType of types.commandTypes) {
+          claimedCommandTypes.add(commandType);
+        }
+        for (const queryType of types.queryTypes) {
+          claimedQueryTypes.add(queryType);
+        }
+      };
+
+      for (const nextVnode of nextVnodes) {
+        const nextKey = nextVnode.key;
+        let currentFiber: RuntimeFiber<unknown> | undefined;
+        if (keyedForClaim !== null && nextKey !== undefined && keyedForClaim.has(nextKey)) {
+          currentFiber = keyedForClaim.get(nextKey);
+          keyedForClaim.delete(nextKey);
+        } else if (nextKey === undefined && unkeyedClaimIdx < unkeyedForClaim.length) {
+          currentFiber = unkeyedForClaim[unkeyedClaimIdx];
+          unkeyedClaimIdx += 1;
+        }
+
+        const isUpdateMatch = (
+          currentFiber !== undefined &&
+          currentFiber.vnode.type === nextVnode.type &&
+          (currentFiber.vnode.key ?? null) === (nextVnode.key ?? null)
+        );
+        if (!isUpdateMatch) {
+          addClaimedTypes(nextVnode as VirtualServiceNode<unknown>);
+        }
+      }
+
+      if (claimedCommandTypes.size > 0 || claimedQueryTypes.size > 0) {
+        const buses = this.effectableRuntimeBuses;
+        const onlyTypes = {
+          commandTypes: claimedCommandTypes,
+          queryTypes: claimedQueryTypes,
+        };
+        for (const leaving of [...fullDiffOrphans, ...fullDiffReplaceVictims]) {
+          try {
+            this.releaseExclusiveRuntimeBusHandlersSubtree(leaving, buses, onlyTypes);
+          } catch {
+            // Best-effort: a throwing unregister must not skip remaining fibers or block PLACE.
+            // destroyFiber still runs the full bus disposer later.
+          }
+        }
+      }
+    }
+
 
     // Preview deferred UPDATEs and free exclusive slots their child diffs will drop
-    // before any PLACE in this batch (#182). Orphan/victim type-scoped release above
+    // before any PLACE in this batch. Orphan/victim type-scoped release above
     // does not cover nested handlers under a *surviving* UPDATE wrapper.
     if (this.effectableRuntimeBuses !== null) {
       const buses = this.effectableRuntimeBuses;
@@ -3727,6 +3806,7 @@ export class GraphRuntime {
               currentFiber,
               nextVnode as VirtualServiceNode<unknown>,
               buses,
+              childScope,
             );
           } catch {
             // Best-effort — real UPDATE still runs in pass 2.
@@ -3737,14 +3817,14 @@ export class GraphRuntime {
 
     // Pass-1 defers same-type UPDATE until after PLACE/REPLACE siblings are wired.
     // Otherwise UPDATE `onUpdate` can publish before a later PLACE sibling's `@On*`
-    // handlers exist — silent event loss (same class as #108 onMount/PLACE ordering).
+    // handlers exist — silent event loss (same class as onMount/PLACE ordering).
     const pendingUpdates: Array<{
       slot: number;
       current: RuntimeFiber<unknown>;
       nextVnode: VirtualServiceNode<unknown>;
     }> = [];
 
-    // Orphan DELETE must run *after* deferred UPDATEs (pass 2). #119 moved orphan
+    // Orphan DELETE must run *after* deferred UPDATEs (pass 2). moved orphan
     // destroy before pass 2 so PLACE could wire first, but that also ran sibling
     // onUnmount before UPDATE onUpdate — silent handoff loss / stale props on the
     // surviving listener. Collect orphans here; release the keyed Map before pass 2.
@@ -3777,8 +3857,7 @@ export class GraphRuntime {
       }
 
       // REPLACE materializes a new instance that may need exclusive slots still held
-      // by a same-batch orphan (victim destroy frees only the victim's own types).
-      releaseOrphanExclusiveForIncoming(nextVnode);
+      // by a same-batch orphan (pre-pass above already freed claimed exclusive types).
       const reconciledRes = this.reconcileFiber(
         currentFiber,
         nextVnode,
@@ -3831,9 +3910,7 @@ export class GraphRuntime {
                 nextVnode as VirtualServiceNode<unknown>,
               );
             } else {
-              // New node — PLACE: free conflicting orphan exclusive slots, then materialize
-              // with deferred startup so later sibling buses wire first.
-              releaseOrphanExclusiveForIncoming(nextVnode as VirtualServiceNode<unknown>);
+              // New node — PLACE: materialize with deferred startup so later sibling buses wire first.
               const newRes = this.materialize(nextVnode, parentFiber, childScope, true);
               nextChildren.push(isThenable(newRes) ? await newRes : newRes);
             }
@@ -3863,9 +3940,7 @@ export class GraphRuntime {
               nextVnode as VirtualServiceNode<unknown>,
             );
           } else {
-            // New node — PLACE: free conflicting orphan exclusive slots, then materialize
-            // with deferred startup so later sibling buses wire first.
-            releaseOrphanExclusiveForIncoming(nextVnode as VirtualServiceNode<unknown>);
+            // New node — PLACE: materialize with deferred startup so later sibling buses wire first.
             const newRes = this.materialize(nextVnode, parentFiber, childScope, true);
             nextChildren.push(isThenable(newRes) ? await newRes : newRes);
           }
@@ -3884,9 +3959,9 @@ export class GraphRuntime {
       // Pass 2: run deferred UPDATEs with onUpdate stashed. Sibling PLACE/REPLACE are
       // already wired in pass 1, but a later UPDATE sibling may still PLACE *nested*
       // children during this pass — immediate onUpdate here would publish before those
-      // nested @On* handlers exist (silent drop; #125 only covered sibling PLACE).
+      // nested @On* handlers exist (silent drop; only covered sibling PLACE).
       // Orphans stay alive until after the onUpdate flush so UPDATE↔DELETE handoff
-      // keeps pre-#119 order (onUpdate before sibling onUnmount / #158).
+      // keeps order (onUpdate before sibling onUnmount).
       for (const pending of pendingUpdates) {
         const updatedRes = this.updateFiber(
           pending.current,
@@ -3900,7 +3975,7 @@ export class GraphRuntime {
 
       // Flush stashed onUpdates *before* REPLACE-victim / orphan destroy: nested PLACE
       // under later UPDATE siblings has finished wiring, and orphan @On* still receive
-      // handoff (#186). Sibling PLACE/REPLACE from pass 1 are already wired; #125 only
+      // handoff. Sibling PLACE/REPLACE from pass 1 are already wired; only
       // covered sibling PLACE — nested PLACE under a later UPDATE still needed this.
       for (let i = 0; i < nextChildren.length; i++) {
         const onUpdateFlush = this.flushPendingOnUpdateTree(
@@ -3923,7 +3998,7 @@ export class GraphRuntime {
       // Destroy orphans after onUpdate flush in original compose order (not keyed-then-
       // unkeyed). Keyed-first teardown inverted compose order when an unkeyed sibling
       // preceded a keyed one, so an earlier unkeyed onUnmount publish could miss a later
-      // keyed @On* listener (#174). PLACE peers are already wired, so onUnmount publishes
+      // keyed @On* listener. PLACE peers are already wired, so onUnmount publishes
       // still reach same-batch PLACE @On*.
       for (const child of currentChildren) {
         if (!pendingOrphanSet.has(child)) {
