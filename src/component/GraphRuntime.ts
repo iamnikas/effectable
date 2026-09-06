@@ -2898,6 +2898,7 @@ export class GraphRuntime {
 
     const unkeyedCurrent: RuntimeFiber<unknown>[] = [];
     const nextChildren: RuntimeFiber<unknown>[] = [];
+    const deferredKeyedOrphans: RuntimeFiber<unknown>[] = [];
     let unkeyedIdx = 0;
 
     try {
@@ -2957,14 +2958,11 @@ export class GraphRuntime {
             }
           }
 
-          // Destroy remaining unpaired current children (keyed).
-          // Best-effort: collect finalize errors so one throwing ref clear cannot
-          // skip remaining orphans and fail-stop the whole runtime.
+          // Defer keyed-orphan destroy until after pending REPLACE victims flush —
+          // otherwise orphan onUnmount publishes while the victim is still bus-wired
+          // alongside the replacement (dual subscribe / double handling).
           for (const [, orphan] of keyedCurrentMap) {
-            const d = this.destroyFiber(orphan, []);
-            if (isThenable(d)) {
-              await d;
-            }
+            deferredKeyedOrphans.push(orphan);
           }
         } finally {
           this.reconcileDepth--;
@@ -2997,6 +2995,21 @@ export class GraphRuntime {
         }
       }
 
+      // Flush REPLACE victims before orphan DELETE so orphan onUnmount does not
+      // fan-out to both the deferred victim and the already-wired replacement.
+      const victimsFlush = this.flushPendingReplaceVictims(nextChildren);
+      if (isThenable(victimsFlush)) {
+        await victimsFlush;
+      }
+
+      // Destroy deferred keyed orphans (collected during the keyed pass).
+      for (const orphan of deferredKeyedOrphans) {
+        const d = this.destroyFiber(orphan, []);
+        if (isThenable(d)) {
+          await d;
+        }
+      }
+
       // Destroy remaining unpaired unkeyed children (best-effort finalize errors).
       for (let i = unkeyedIdx; i < unkeyedCurrent.length; i += 1) {
         const orphan = unkeyedCurrent[i];
@@ -3010,6 +3023,7 @@ export class GraphRuntime {
       }
 
       // Flush deferred UPDATE onUpdate + PLACE/REPLACE startups after every sibling is wired.
+      // REPLACE victims already flushed above — flushPendingReplaceVictims is a no-op here.
       const siblingFlush = this.flushSiblingDeferredWork(nextChildren);
       if (isThenable(siblingFlush)) {
         await siblingFlush;
@@ -3031,6 +3045,18 @@ export class GraphRuntime {
         // New fiber (PLACE or REPLACE result) — destroy it (+ deferred REPLACE victim)
         try {
           const d = this.destroyPlacedFiberWithReplaceVictim(child, rollbackErrors);
+          if (isThenable(d)) {
+            await d;
+          }
+        } catch (err: unknown) {
+          rollbackErrors.push(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+
+      // Keyed orphans collected but not yet destroyed when a later step threw.
+      for (const orphan of deferredKeyedOrphans) {
+        try {
+          const d = this.destroyFiber(orphan, rollbackErrors);
           if (isThenable(d)) {
             await d;
           }
