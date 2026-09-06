@@ -1,6 +1,11 @@
 /**
  * Lightweight event bus implementation.
  *
+ * Delivery contract: each `publish` snapshots typed and any-handlers before invoke so a
+ * subscriber that unsubscribes mid-delivery cannot silently skip a not-yet-called handler
+ * for the current event. Combined with `wireRuntimeBuses` EventBus fan-out (every distinct
+ * `@OnEvent` method for a type receives the event), this is the public delivery guarantee.
+ *
  * @module Effectable/runtime/EventBus
  */
 
@@ -8,6 +13,8 @@ import type { EventHandler, RuntimeEvent } from './types';
 
 /**
  * Event bus with per-type and global subscriptions.
+ *
+ * {@link EventBus.publish} uses handler snapshots; see the module overview for the delivery contract.
  */
 export class EventBus<TEvent extends RuntimeEvent = RuntimeEvent> {
   private readonly handlersByType = new Map<string, Set<EventHandler<TEvent>>>();
@@ -16,18 +23,32 @@ export class EventBus<TEvent extends RuntimeEvent = RuntimeEvent> {
   /**
    * Publishes an event to all matching subscribers.
    *
+   * Snapshots both the typed-handler set and the any-handler set before invoke. Mid-publish
+   * unsubscribe cannot drop a not-yet-called handler for this event; any-handlers are
+   * snapshotted before typed handlers run so a typed handler cannot remove an any-handler
+   * from the current delivery.
+   *
    * @param {TEvent} event - runtime event
    * @returns {void}
    */
   public publish (event: TEvent): void {
+    // Snapshot both sets before invoke so unsubscribe of a not-yet-called handler
+    // during this publish cannot silently skip that handler for the current event.
+    // Any-handlers must be snapshotted before typed handlers run: a typed handler
+    // that unsubscribes an any-handler would otherwise drop it for this event.
     const typedHandlers = this.handlersByType.get(event.type);
-    if (typeof typedHandlers !== 'undefined') {
-      for (const handler of typedHandlers) {
+    const typedSnapshot = typeof typedHandlers === 'undefined'
+      ? null
+      : [...typedHandlers];
+    const anySnapshot = [...this.anyHandlers];
+
+    if (typedSnapshot !== null) {
+      for (const handler of typedSnapshot) {
         handler(event);
       }
     }
 
-    for (const handler of this.anyHandlers) {
+    for (const handler of anySnapshot) {
       handler(event);
     }
   }

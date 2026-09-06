@@ -227,7 +227,59 @@ describe('BusDecorators', () => {
     expect(target.hits).toBe(1);
   });
 
-  it('N08: instanceUsesRuntimeBusDecorators walks the prototype chain', () => {
+  it('DEC-14: two @OnEvent handlers for the same type both receive publish', () => {
+    type Ping = RuntimeEvent<'PING', { n: number }>;
+
+    class DualEventTarget {
+      public hits: string[] = [];
+
+      @OnEvent('PING')
+      public onPingA (_event: Ping): void {
+        this.hits.push('A');
+      }
+
+      @OnEvent('PING')
+      public onPingB (_event: Ping): void {
+        this.hits.push('B');
+      }
+    }
+
+    const buses = createRuntimeBuses<TC, TQ, Ping>();
+    const target = new DualEventTarget();
+    const dispose = wireRuntimeBuses(target, buses);
+    buses.eventBus.publish({ type: 'PING', payload: { n: 1 } });
+    expect(target.hits).toEqual(['A', 'B']);
+    dispose();
+  });
+
+  it('DEC-15: base + leaf @OnEvent distinct methods for same type both receive publish', () => {
+    type Ping = RuntimeEvent<'PING', { n: number }>;
+
+    class BaseEvt {
+      public hits: string[] = [];
+
+      @OnEvent('PING')
+      public onPingBase (_event: Ping): void {
+        this.hits.push('base');
+      }
+    }
+
+    class LeafEvt extends BaseEvt {
+      @OnEvent('PING')
+      public onPingLeaf (_event: Ping): void {
+        this.hits.push('leaf');
+      }
+    }
+
+    const buses = createRuntimeBuses<TC, TQ, Ping>();
+    const target = new LeafEvt();
+    const dispose = wireRuntimeBuses(target, buses);
+    buses.eventBus.publish({ type: 'PING', payload: { n: 1 } });
+    expect(target.hits).toEqual(['base', 'leaf']);
+    dispose();
+  });
+
+    it('N08: instanceUsesRuntimeBusDecorators walks the prototype chain', () => {
     class BaseDecorated {
       @OnCommand('X')
       public async handleX (_command: TC): Promise<string> {

@@ -400,6 +400,48 @@ describe('createStore', () => {
       sub.unsubscribe();
       store.destroy();
     });
+
+    it('nested dispatch from an earlier subscriber must not leave later observers on a stale emission', () => {
+      const store = createStore<CounterState, CounterAction>(
+        counterReducer,
+        initialCounterState,
+      );
+
+      const seenA: number[] = [];
+      const seenB: number[] = [];
+      const seenSelect: number[] = [];
+
+      const subA = store.state$.subscribe((state) => {
+        seenA.push(state.count);
+        if (state.count === 1) {
+          store.dispatch({ type: 'SET', payload: 99 });
+        }
+      });
+      const subB = store.state$.subscribe((state) => {
+        seenB.push(state.count);
+      });
+      const subSelect = store.select((state) => state.count).subscribe((count) => {
+        seenSelect.push(count);
+      });
+
+      store.dispatch({ type: 'INC' });
+
+      expect(store.getState().count).toBe(99);
+      expect(seenB[seenB.length - 1]).toBe(99);
+      expect(seenSelect[seenSelect.length - 1]).toBe(99);
+
+      const last99B = seenB.lastIndexOf(99);
+      const last99Select = seenSelect.lastIndexOf(99);
+      expect(last99B).toBeGreaterThanOrEqual(0);
+      expect(last99Select).toBeGreaterThanOrEqual(0);
+      expect(seenB.slice(last99B + 1).includes(1)).toBe(false);
+      expect(seenSelect.slice(last99Select + 1).includes(1)).toBe(false);
+
+      subA.unsubscribe();
+      subB.unsubscribe();
+      subSelect.unsubscribe();
+      store.destroy();
+    });
   });
 
   describe('enhancer (B07)', () => {

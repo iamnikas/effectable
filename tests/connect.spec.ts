@@ -769,6 +769,95 @@ describe('Effectable.connect (class-based HOC)', () => {
     });
   });
 
+
+  describe('mapStateToProps subscribe errors / async unmount race', () => {
+    test('mapState throw on first select emission rejects GraphRuntime.mount', async () => {
+      const store = createStore<TestStoreState, TestAction>(reducer, {
+        status: 'idle',
+        version: 0,
+      });
+
+      class View extends Component<object, TestProps> {
+        public mounted = false;
+
+        constructor (props: TestProps) {
+          super(props);
+          this.state = {};
+        }
+
+        public override onMount (): void {
+          this.mounted = true;
+        }
+
+        public override compose (): null {
+          return null;
+        }
+      }
+
+      const boom = new Error('map boom first');
+      const Connected = connect<TestStoreState, TestProps, Pick<TestProps, 'status'>>(
+        store,
+        (): Pick<TestProps, 'status'> => {
+          throw boom;
+        }
+      )(View);
+
+      await expect(GraphRuntime.mount(h(Connected, { id: 'map-boom-first' }))).rejects.toBe(boom);
+    });
+
+    test('async onMount + unmount must not deliver onUpdate after teardown', async () => {
+      const store = createStore<TestStoreState, TestAction>(reducer, {
+        status: 'idle',
+        version: 0,
+      });
+
+      let resolveMount!: () => void;
+      const mountGate = new Promise<void>((resolve) => {
+        resolveMount = resolve;
+      });
+
+      class View extends Component<object, TestProps> {
+        public updates = 0;
+
+        constructor (props: TestProps) {
+          super(props);
+          this.state = {};
+        }
+
+        public override async onMount (): Promise<void> {
+          await mountGate;
+        }
+
+        public override onUpdate (): void {
+          this.updates += 1;
+        }
+      }
+
+      const Connected = connect<TestStoreState, TestProps, Pick<TestProps, 'status'>>(
+        store,
+        (state: TestStoreState): Pick<TestProps, 'status'> => ({
+          status: state.status,
+        })
+      )(View);
+
+      const instance = new Connected({ id: 'async-unmount-race' }) as View & {
+        onMount: () => void | Promise<void>;
+        onUnmount: () => void | Promise<void>;
+      };
+
+      const mountPromise = Promise.resolve(instance.onMount());
+      store.dispatch({ type: 'SET_STATUS', payload: 'live' });
+      instance.onUnmount();
+      resolveMount();
+      await mountPromise;
+      await new Promise<void>((resolve) => {
+        queueMicrotask(() => resolve());
+      });
+
+      expect(instance.updates).toBe(0);
+    });
+  });
+
   describe('async failure / cleanup semantics', () => {
     test('GraphRuntime.mount rejects on failed async mount of a connected component', async () => {
       const store = createStore<TestStoreState, TestAction>(reducer, {

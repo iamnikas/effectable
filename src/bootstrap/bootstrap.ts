@@ -239,10 +239,12 @@ export async function bootstrap<
     runtime,
     identity: rootIdentity,
     isRunning (): boolean {
-      return running;
+      // Include GraphRuntime liveness: fail-stop tears the tree down without
+      // going through shutdown(), so `running` alone would lie about health.
+      return running && activeGraphRuntime.isActive();
     },
     async reconcile (): Promise<void> {
-      if (!running) {
+      if (!running || !activeGraphRuntime.isActive()) {
         return;
       }
 
@@ -253,6 +255,8 @@ export async function bootstrap<
         return cachedShutdownPromise;
       }
 
+      // Use the latch (`running`), not isRunning(): after fail-stop the runtime
+      // is inactive but owned buses/registry still need clearing.
       if (!running) {
         return;
       }

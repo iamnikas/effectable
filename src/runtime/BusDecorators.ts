@@ -282,6 +282,9 @@ function unwindDisposers (disposers: Array<() => void>): { primaryError?: Error;
  * are unwound in reverse order and the wiring error is rethrown. The returned disposer is idempotent
  * and continues cleanup even if an individual disposer throws.
  *
+ * EventBus fan-out: every distinct `@OnEvent` method for the same type is subscribed (unlike
+ * Command/Query last-write-wins). Delivery itself uses {@link EventBus.publish} handler snapshots.
+ *
  * @template TCommand
  * @template TQuery
  * @template TEvent
@@ -312,7 +315,8 @@ export function wireRuntimeBuses<
 
     const mergedCommand = new Map<string, string>();
     const mergedQuery = new Map<string, string>();
-    const mergedEvent = new Map<string, string>();
+    // EventBus is fan-out: keep every distinct method for a type (unlike Command/Query).
+    const mergedEvent = new Map<string, string[]>();
 
     for (let i = ctorChain.length - 1; i >= 0; i -= 1) {
       const ctor = ctorChain[i] as Function;
@@ -323,7 +327,12 @@ export function wireRuntimeBuses<
         mergedQuery.set(type, method);
       }
       for (const { type, method } of getHandlerEntries(ctor, ON_EVENT_ENTRIES)) {
-        mergedEvent.set(type, method);
+        const existing = mergedEvent.get(type);
+        if (typeof existing === 'undefined') {
+          mergedEvent.set(type, [method]);
+        } else if (!existing.includes(method)) {
+          existing.push(method);
+        }
       }
     }
 
@@ -351,15 +360,17 @@ export function wireRuntimeBuses<
       disposers.push(buses.queryBus.register(type as TQuery['type'], handler));
     }
 
-    for (const [type, method] of mergedEvent) {
-      const raw = record[method];
-      if (typeof raw !== 'function') {
-        throw new Error(`wireRuntimeBuses: OnEvent handler is not a function: ${method}`);
+    for (const [type, methods] of mergedEvent) {
+      for (const method of methods) {
+        const raw = record[method];
+        if (typeof raw !== 'function') {
+          throw new Error(`wireRuntimeBuses: OnEvent handler is not a function: ${method}`);
+        }
+        const handler: EventHandler<TEvent> = (event) => {
+          raw.call(instance, event);
+        };
+        disposers.push(buses.eventBus.subscribe(type as TEvent['type'], handler));
       }
-      const handler: EventHandler<TEvent> = (event) => {
-        raw.call(instance, event);
-      };
-      disposers.push(buses.eventBus.subscribe(type as TEvent['type'], handler));
     }
   } catch (wiringError) {
     const { cleanupErrors } = unwindDisposers(disposers);

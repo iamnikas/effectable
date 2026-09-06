@@ -4,8 +4,9 @@
  * Effectable contracts:
  * - GraphRuntime: setState in onMount is buffered and schedules reconcile after startup.
  * - connect: sync-path super.onMount replays a pending store update deferred during mount.
- * - Post-mount kick-off (connect + mapStateToProps): one deferred onUpdate via
- *   queueMicrotask after mount (cold start without setState in consumer onMount).
+ * - Post-mount kick-off (connect + mapStateToProps and/or mapDispatchToProps): one deferred onUpdate via
+ *   queueMicrotask after mount (cold start without setState in consumer onMount; also rebuilds compose
+ *   so children receive dispatch props injected in onMount).
  * - setState still calls onUpdate synchronously (including during onMount).
  */
 
@@ -167,6 +168,71 @@ describe('GraphRuntime: setState inside onMount', () => {
     // SCHEDULE_UPDATE_HOOK buffers setState in onMount;
     // after startup GraphRuntime schedules reconcile — the child is mounted.
     expect(mountedChildren).toEqual(['kick-child']);
+
+    await runtime.unmount();
+  });
+
+  test('ancestor setState from child onMount rebuilds compose after mount', async () => {
+    const mountedChildren: string[] = [];
+
+    interface AncestorHostState {
+      showExtra: boolean;
+    }
+
+    class NotifyingChild extends Component<object, { onReady: () => void }> {
+      public override onMount (): void {
+        // Parent is still mid-materialize (children before parent startup).
+        this.props.onReady();
+      }
+    }
+
+    class ExtraChild extends Component<object, { tag: string; onChildMount: (tag: string) => void }> {
+      public override onMount (): void {
+        this.props.onChildMount(this.props.tag);
+      }
+    }
+
+    class AncestorHost extends Component<AncestorHostState, { onChildMount: (tag: string) => void }> {
+      constructor (props: { onChildMount: (tag: string) => void }) {
+        super(props, { showExtra: false });
+      }
+
+      public override compose (): VirtualServiceNode[] {
+        const nodes: VirtualServiceNode[] = [
+          h(NotifyingChild, {
+            onReady: (): void => {
+              this.setState({ showExtra: true });
+            },
+          }, 'notifier'),
+        ];
+
+        if (this.state.showExtra) {
+          nodes.push(
+            h(ExtraChild, {
+              tag: 'extra',
+              onChildMount: this.props.onChildMount,
+            }, 'extra'),
+          );
+        }
+
+        return nodes;
+      }
+    }
+
+    const runtime = await GraphRuntime.mount(
+      h(AncestorHost, {
+        onChildMount: (tag: string): void => {
+          mountedChildren.push(tag);
+        },
+      })
+    );
+    await flushRuntimeTasks();
+
+    const host = runtime.getRootInstance() as AncestorHost | null;
+    expect(host).not.toBeNull();
+    expect(host!.state.showExtra).toBe(true);
+    expect(mountedChildren).toEqual(['extra']);
+    expect(runtime.inspectRootFiber()?.childCount).toBe(2);
 
     await runtime.unmount();
   });
@@ -534,5 +600,101 @@ describe('setState inside onUpdate: next pass without the setTimeout hack (hack 
     expect(instance.passes).toHaveLength(3);
 
     instance.onUnmount?.();
+  });
+});
+
+describe('connect mapDispatch-only + GraphRuntime: post-mount compose rebuild', () => {
+  interface CounterState {
+    value: number;
+  }
+
+  type CounterAction = { type: 'INC' };
+
+  /**
+   * Minimal counter reducer for dispatch-only kick-off scenarios.
+   *
+   * @param {CounterState} state - current counter state
+   * @param {CounterAction} action - counter action
+   * @returns {CounterState} next state
+   */
+  function counterReducer (state: CounterState, action: CounterAction): CounterState {
+    if (action.type === 'INC') {
+      return { value: state.value + 1 };
+    }
+
+    return state;
+  }
+
+  interface ChildIncProps {
+    onInc?: () => void;
+  }
+
+  /**
+   * Leaf that records the onInc prop observed across lifecycle.
+   */
+  class IncChild extends Component<object, ChildIncProps> {
+    public onIncLatest: unknown = 'unset';
+
+    public override onMount (): void {
+      this.onIncLatest = this.props.onInc;
+    }
+
+    public override onUpdate (): void {
+      this.onIncLatest = this.props.onInc;
+    }
+  }
+
+  interface DispatchHostProps {
+    increment?: () => void;
+  }
+
+  test('mapDispatch-only: post-mount kick-off rebuilds compose so children receive action props', async () => {
+    const childRef: { current: IncChild | null } = { current: null };
+
+    /**
+     * Connected host that forwards mapDispatch props into compose() children.
+     */
+    class DispatchHost extends Component<object, DispatchHostProps> {
+      public updatePasses = 0;
+
+      public override onUpdate (): void {
+        this.updatePasses += 1;
+      }
+
+      public override compose (): VirtualServiceNode {
+        return h(IncChild, { onInc: this.props.increment }, childRef);
+      }
+    }
+
+    const store = createStore<CounterState, CounterAction>(counterReducer, { value: 0 });
+
+    const ConnectedHost = connect(
+      store,
+      null,
+      (dispatch: DispatchMethod<CounterAction>): Pick<DispatchHostProps, 'increment'> => ({
+        increment: (): void => {
+          dispatch({ type: 'INC' });
+        },
+      })
+    )(DispatchHost);
+
+    const hostRef: { current: DispatchHost | null } = { current: null };
+    const runtime = await GraphRuntime.mount(h(ConnectedHost, {}, hostRef));
+    await flushRuntimeTasks();
+
+    const host = hostRef.current;
+    const child = childRef.current;
+    if (host === null || child === null) {
+      throw new Error('Refs were not attached after mapDispatch kick-off');
+    }
+
+    expect(typeof host.props.increment).toBe('function');
+    expect(host.updatePasses).toBe(1);
+    expect(typeof child.onIncLatest).toBe('function');
+
+    (child.onIncLatest as () => void)();
+    expect(store.getState().value).toBe(1);
+
+    await runtime.unmount();
   });
 });

@@ -88,6 +88,16 @@ Rules:
 - Data-plane components use direct refs and pre-resolved handles for the fast path.
 - `GraphRuntime` manages lifecycle; it is not meant to run on every high-frequency tick.
 
+## Fail-safe & correctness contracts
+
+Capabilities already enforced by the runtime (documented here as the product contract):
+
+- **GraphRuntime fail-safe** — unrecoverable reconcile / dirty-flush errors fail-stop the runtime (`FAILED`); later `reconcile` rejects; teardown is children→parent. A throwing `onAutoReconcileError` observer cannot skip fail-stop. Dirty flush waits for `ACTIVE` + idle queue; `setState` during materialization is buffered.
+- **connect remount / class fields** — same-instance remount re-runs store wiring (flags, mount generation, stale mapped props, context store re-resolve). Class-field `onMount` / `onUnmount` do not shadow connect subscribe/unsubscribe. Stale async `onMount` after remount is ignored.
+- **Middleware construction** — `applyMiddleware` (wrap and enhancer) throws if `dispatch` runs while middleware factories are still constructing (Redux-compatible invariant).
+- **EventBus delivery** — `publish` snapshots typed and any-handlers before invoke; `@OnEvent` fan-out registers every distinct method for a type.
+- **Bootstrap liveness** — `handle.isRunning()` is `false` after GraphRuntime fail-stop; `reconcile` is a no-op when inactive.
+
 ## Store
 
 See [src/store/README.md](src/store/README.md): creating a store, selectors, middleware, `state$`, `select()`.

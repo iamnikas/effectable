@@ -29,6 +29,7 @@ Import from `effectable` or from subpaths: `effectable/bootstrap`, `effectable/s
 - `Component` — long-lived node with `state` / `setState`, `onMount` / `onUpdate` / `onUnmount`, optional `compose()`.
 - `h(...)` — declarative virtual node factory for the runtime graph.
 - `GraphRuntime` — materialize, reconcile (keyed/unkeyed), lifecycle orchestration, dirty-fiber auto-flush after `setState`.
+- Fail-safe: unrecoverable reconcile / dirty-flush → `FAILED`, children→parent teardown; throwing `onAutoReconcileError` cannot skip fail-stop.
 - Context — `createContext`, providers, `@UseContext`.
 - Refs — `@UseRef` / `@UseImperativeHandle` for GraphRuntime trees (separate from HandleRegistry aliases).
 
@@ -41,14 +42,14 @@ Class-based HOC:
 - **Root:** `connect(store, mapState?, mapDispatch?, options?)(Ctor)` — publishes store into subtree context.
 - **Child:** `connect(mapState?, mapDispatch?, options?)(Ctor)` — reads store from nearest connected ancestor.
 
-Default props mode is **strict** (parent props do not leak; use pass-through mappers). After mount with `mapStateToProps`, one deferred `onUpdate` kick-off is scheduled via microtask.
+Default props mode is **strict** (parent props do not leak; use pass-through mappers). After mount with `mapStateToProps`, one deferred `onUpdate` kick-off is scheduled via microtask. Same-instance remount re-wires the store; class-field lifecycle hooks do not shadow connect subscribe/unsubscribe.
 
 ## Store
 
 Redux-style store with RxJS:
 
 - `createStore`, `dispatch`, `getState`, `state$`, `select`
-- `applyMiddleware` / `compose`
+- `applyMiddleware` / `compose` — `dispatch` during middleware construction throws (wrap + enhancer)
 - `createSelector` / `createStructuredSelector`
 - optional semantic state tree helpers for inspection
 
@@ -58,6 +59,7 @@ Thin substrate (not a general DI container):
 
 - `EventBus`, `CommandBus`, `QueryBus`
 - `HandleRegistry` + decorator wiring (`@OnCommand`, `@UseCommandBus`, …)
+- `EventBus.publish` snapshots handlers; `@OnEvent` fan-out keeps every distinct method per type
 - Prefer reusing buses from `bootstrap(...).runtime` rather than creating a second set
 
 ## Control plane vs data plane

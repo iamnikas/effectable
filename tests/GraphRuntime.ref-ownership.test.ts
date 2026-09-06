@@ -275,4 +275,45 @@ describe('GraphRuntime ref ownership (issue #17)', () => {
       await runtime.unmount();
     });
   });
+
+  describe('REF-SWAP-COMPOSE-FAIL: ref swap then compose throw', () => {
+    it('REF-SWAP-COMPOSE-FAIL: newRef must not retain destroyed instance', async () => {
+      class BoomChild extends Component<Record<string, never>, { boom: boolean }> {
+        public override compose (): null {
+          if (this.props.boom) {
+            throw new Error('compose boom after ref swap');
+          }
+          return null;
+        }
+      }
+
+      class Parent extends Component<Record<string, never>, { boom: boolean; useRef1: boolean }> {
+        public ref1: RefObject<BoomChild> = { current: null };
+        public ref2: RefObject<BoomChild> = { current: null };
+
+        public override compose (): VirtualServiceNode[] {
+          const ref = this.props.useRef1 ? this.ref1 : this.ref2;
+          return [h(BoomChild, { boom: this.props.boom }, ref, 'boom-key')];
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(h(Parent, { boom: false, useRef1: true }));
+      const parent = runtime.getRootInstance() as Parent;
+      expect(parent.ref1.current).toBeInstanceOf(BoomChild);
+      expect(parent.ref2.current).toBeNull();
+
+      let caught: Error | null = null;
+      try {
+        await runtime.reconcile(h(Parent, { boom: true, useRef1: false }));
+      } catch (err) {
+        caught = err as Error;
+      }
+
+      expect(caught?.message).toBe('compose boom after ref swap');
+      expect(runtime.isActive()).toBe(false);
+      // Both refs must be cleared — newRef must not hold the destroyed instance
+      expect(parent.ref1.current).toBeNull();
+      expect(parent.ref2.current).toBeNull();
+    });
+  });
 });

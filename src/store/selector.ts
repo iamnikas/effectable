@@ -45,10 +45,14 @@ function defaultMemoize<F extends (arg: any) => any> (func: F): MemoizationResul
   let recomputationCount = 0;
 
   const memoized = (arg: any) => {
-    // If never called or the argument changed — recompute
+    // If never called or the argument changed — recompute.
+    // Only commit cache slots after `func` succeeds: if `func` throws after
+    // `lastArg` was already updated, a later call with the same arg would
+    // shallow-equal-hit and return a stale `lastResult` (silent wrong value).
     if (!called || !shallowEqual(arg, lastArg)) {
+      const nextResult = func(arg);
       lastArg = arg;
-      lastResult = func(arg);
+      lastResult = nextResult;
       called = true;
       recomputationCount++;
     }
@@ -306,9 +310,17 @@ export function createStructuredSelector<S, T extends Record<string, any>> (
   const selectors = keys.map((key) => selectorsObj[key]);
 
   return createSelector(selectors, (...values: any[]) => {
+    // Use defineProperty — `result[key] =` invokes the `__proto__` setter on a
+    // normal object and would turn a selector named `__proto__` into the result's
+    // [[Prototype]] (lost key + inherited phantom fields).
     const result = {} as T;
     keys.forEach((key, index) => {
-      result[key] = values[index];
+      Object.defineProperty(result, key as string | symbol, {
+        value: values[index],
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     });
     return result;
   });

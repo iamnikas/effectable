@@ -1882,6 +1882,48 @@ describe('GraphRuntime', () => {
       await runtime.unmount();
     });
 
+    it('throwing onAutoReconcileError still fail-stops (runtime not left ACTIVE)', async () => {
+      class BoomComposeRoot extends Component<{ boom: boolean }, Record<string, never>> {
+        constructor () {
+          super({});
+          this.state = { boom: false };
+        }
+
+        public override compose (): null {
+          if (this.state.boom) {
+            throw new Error('auto-flush compose boom');
+          }
+          return null;
+        }
+      }
+
+      const runtime = await GraphRuntime.mount(
+        h(BoomComposeRoot, {}),
+        EMPTY_CONTEXT_SCOPE,
+        undefined,
+        () => {
+          throw new Error('observer boom');
+        },
+      );
+
+      const root = runtime.getRootInstance() as BoomComposeRoot | null;
+      expect(root).not.toBeNull();
+      if (root === null) {
+        throw new Error('expected BoomComposeRoot');
+      }
+
+      expect(runtime.isActive()).toBe(true);
+      root.setState({ boom: true });
+      await drainMicrotasks();
+
+      // Observer throw must not skip fail-stop / leave a half-cleaned ACTIVE tree.
+      expect(runtime.isActive()).toBe(false);
+      expect(runtime.getState()).toBe('failed');
+      expect(runtime.getRootInstance()).toBeNull();
+
+      await runtime.unmount();
+    });
+
     it('unkeyed shrink — excess tail receives onUnmount (orphan DELETE)', async () => {
       const unmountLog: string[] = [];
 
@@ -2796,6 +2838,68 @@ describe('GraphRuntime', () => {
 
       expect(root.state.n).toBe(2);
       expect(root.composePasses).toBeGreaterThanOrEqual(2);
+
+      await runtime.unmount();
+    });
+
+    it('setState during async PLACE onMount is not dropped by a re-entrant flushing guard', async () => {
+      const composedNotes: number[] = [];
+      let bumpNote: (() => void) | null = null;
+
+      class AsyncPlacedChild extends Component<Record<string, never>, { id: string }> {
+        public static mountCount = 0;
+
+        public override async onMount (): Promise<void> {
+          AsyncPlacedChild.mountCount += 1;
+          // Sync preamble while the outer dirty flush still has flushing=true.
+          // Schedules a second flush microtask that must not clear dirtyFibers.
+          bumpNote?.();
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 30);
+          });
+        }
+      }
+
+      class DirtySpawnHost extends Component<{ note: number; spawn: boolean }, Record<string, never>> {
+        constructor () {
+          super({});
+          this.state = { note: 0, spawn: false };
+        }
+
+        public override compose (): VirtualServiceNode[] {
+          composedNotes.push(this.state.note);
+          const children: VirtualServiceNode[] = [];
+          if (this.state.spawn) {
+            children.push(h(AsyncPlacedChild, { id: 'async' }, 'async'));
+          }
+          if (this.state.note > 0) {
+            children.push(h(AsyncPlacedChild, { id: 'from-note' }, 'from-note'));
+          }
+          return children;
+        }
+      }
+
+      AsyncPlacedChild.mountCount = 0;
+      const runtime = await GraphRuntime.mount(h(DirtySpawnHost));
+      const host = runtime.getRootInstance() as DirtySpawnHost | null;
+      expect(host).not.toBeNull();
+      if (host === null) {
+        throw new Error('expected DirtySpawnHost');
+      }
+      bumpNote = (): void => {
+        host.setState({ note: 1 });
+      };
+
+      host.setState({ spawn: true, note: 0 });
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 80);
+      });
+      await drainMicrotasks();
+
+      // note=1 was set during AsyncPlacedChild onMount; compose must see it and PLACE from-note.
+      expect(host.state.note).toBe(1);
+      expect(composedNotes).toContain(1);
+      expect(AsyncPlacedChild.mountCount).toBe(2);
 
       await runtime.unmount();
     });

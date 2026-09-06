@@ -130,11 +130,17 @@ describe('connect resilience (L24/L25)', () => {
     const ConnectedLink = connect<
       BenchState,
       ChainProps,
-      Pick<ChainProps, 'version'>,
+      Pick<ChainProps, 'version' | 'depth'>,
       BenchAction
     >(
       store,
-      (state: BenchState) => ({ version: state.version }),
+      // Strict mode: pass depth through explicitly. Relying on constructor own-props
+      // surviving until the first compose() is incorrect once connect syncs mapped
+      // props in applyToScope (before compose).
+      (state: BenchState, props: ChainProps) => ({
+        version: state.version,
+        depth: props.depth,
+      }),
     )(DeepLink);
 
     const runtime = await GraphRuntime.mount(

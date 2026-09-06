@@ -114,14 +114,16 @@ export interface BootstrapHandle<
   /** Observability identity of the root runtime. */
   identity: BootstrapRuntimeNodeIdentity;
   /**
-   * Checks whether the handle is still active (before shutdown).
+   * Checks whether the handle is still live: shutdown has not been called and
+   * the underlying GraphRuntime has not fail-stopped.
    *
-   * @returns {boolean} true if the handle has not been shut down yet
+   * @returns {boolean} true while the root runtime can still reconcile
    */
   isRunning(): boolean;
   /**
    * Rebuilds the root runtime tree with the original props.
    * Needed by external reactive sources because `Component.setState()` does not reconcile the subtree.
+   * No-op after shutdown or GraphRuntime fail-stop.
    *
    * @returns {Promise<void>} completion of the reconcile pass
    */
