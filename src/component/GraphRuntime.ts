@@ -1447,6 +1447,27 @@ export class GraphRuntime {
       throw error;
     }
 
+    // Register parent @OnEvent / @OnCommand / @OnQuery BEFORE children materialize.
+    // Children run onMount during their materialize; publishes on the shared EventBus
+    // must reach parent handlers (mirror of child→parent delivery on unmount).
+    try {
+      this.attachEffectableRuntimeBusWiring(instance, fiber);
+      if (fiber.effectableRuntimeBusDisposer !== undefined) {
+        fiber.constructionJournal!.busWiringAttached = true;
+      }
+    } catch (err) {
+      const rollbackRes = this.rollbackFailedMaterialization(
+        fiber,
+        err instanceof Error ? err : new Error(String(err)),
+      );
+      if (isThenable(rollbackRes)) {
+        return rollbackRes.then(() => {
+          throw err;
+        }) as Promise<RuntimeFiber<P>>;
+      }
+      throw err;
+    }
+
     for (let i = 0; i < childVnodes.length; i++) {
       const childVnode = childVnodes[i] as VirtualServiceNode;
       let childRes: RuntimeFiber<unknown> | Promise<RuntimeFiber<unknown>>;
@@ -1499,24 +1520,6 @@ export class GraphRuntime {
         }
         throw error;
       }
-    }
-
-    try {
-      this.attachEffectableRuntimeBusWiring(instance, fiber);
-      if (fiber.effectableRuntimeBusDisposer !== undefined) {
-        fiber.constructionJournal!.busWiringAttached = true;
-      }
-    } catch (err) {
-      const rollbackRes = this.rollbackFailedMaterialization(
-        fiber,
-        err instanceof Error ? err : new Error(String(err)),
-      );
-      if (isThenable(rollbackRes)) {
-        return rollbackRes.then(() => {
-          throw err;
-        }) as Promise<RuntimeFiber<P>>;
-      }
-      throw err;
     }
 
     // Run lifecycle after all children are materialized.
@@ -1617,22 +1620,7 @@ export class GraphRuntime {
       }
     }
 
-    try {
-      this.attachEffectableRuntimeBusWiring(instance, fiber);
-      if (fiber.effectableRuntimeBusDisposer !== undefined) {
-        journal.busWiringAttached = true;
-      }
-    } catch (err) {
-      const rollbackRes = this.rollbackFailedMaterialization(
-        fiber,
-        err instanceof Error ? err : new Error(String(err)),
-      );
-      if (isThenable(rollbackRes)) {
-        await rollbackRes;
-      }
-      throw err;
-    }
-
+    // Parent bus wiring was attached before children in materialize(); do not re-attach.
     // Pre-mount hook already injected at the start of materialize (before children).
     const startupRes = engine.runStartup(instance, { deferFailedCleanup: true });
     const resolved = isThenable(startupRes) ? await startupRes : startupRes;
