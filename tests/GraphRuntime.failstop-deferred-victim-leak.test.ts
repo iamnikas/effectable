@@ -17,7 +17,7 @@ import { QueryBus } from '../src/runtime/QueryBus';
 import { OnEvent, OnCommand } from '../src/runtime/BusDecorators';
 
 type Ev = { type: 'PING'; payload: { id: string } };
-type Cmd = { type: 'DO'; payload?: undefined };
+type Cmd = { type: 'DO'; payload: undefined };
 type Empty = Record<string, never>;
 
 function buses () {
@@ -163,7 +163,7 @@ describe('GraphRuntime fail-stop reclaim of deferred REPLACE victims', () => {
     expect(rt.isActive()).toBe(false);
     // Replacement torn down by fail-stop; victim exclusive was released at REPLACE
     // materialize and must not handle execute after FAILED.
-    await expect(b.commandBus.execute({ type: 'DO' })).rejects.toThrow();
+    await expect(b.commandBus.execute({ type: 'DO', payload: undefined })).rejects.toThrow();
     expect(seen).not.toContain('victim-cmd');
     expect(seen).not.toContain('repl-cmd');
 
