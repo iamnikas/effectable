@@ -32,8 +32,9 @@ class ExternalPropsRoot extends Component<MirrorState, ExternalProps> {
   ): void {
     if (typeof next === 'object' && next !== null && 'n' in next) {
       this.updateFromPropsCount += 1;
-      // Direct write — setState would re-enter this dual-purpose onUpdate.
-      this.state = { mirrored: next.n };
+      // Dual-purpose onUpdate: props bags carry `n`, setState commits carry
+      // `mirrored` only — so this branch does not re-enter on the state pass.
+      this.setState({ mirrored: (next as ExternalProps).n });
     }
   }
 
