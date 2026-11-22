@@ -63,6 +63,24 @@ const CONNECT_STORE_CONTEXT_FIELD = '__connectStoreFromContext';
 export const CONNECT_HOC_BRAND = Symbol('effectable.connect.hocBrand');
 
 /**
+ * Public error when connect cannot obtain a store (no explicit store and no ancestor context).
+ *
+ * Shared by `resolveConnectStore` and the missing-store branch of `applyToScope`
+ * so both paths stay one message. The former `applyToScope` else tail (v1.2.1 lines
+ * 744–747) called `resolveConnectStore()` and then synced/published the result; that
+ * result never existed — `tryResolveConnectStore()` already returned null without a
+ * cached destroyed store, so `resolveConnectStore()` always threw before the sync.
+ *
+ * @returns {Error} `Store is not available` error
+ */
+function createConnectStoreUnavailableError (): Error {
+  return new Error(
+    '[Effectable.connect] Store is not available. ' +
+    'Use connect(store, ...) for the root connected component or mount this component under a connected parent.'
+  );
+}
+
+/**
  * Default props filtering mode for `connect` when not set explicitly via {@link ConnectOptions}.
  *
  * Target `Effectable` contract: `'strict'` — parent props do not leak into public `this.props`;
@@ -717,6 +735,11 @@ function buildConnectHoc<S, P, R, A extends Action> (
        * would fail-stop the entire GraphRuntime on the next parent `setState`. Keep last
        * mapped props and still publish the cached store reference for context identity.
        *
+       * When the store was never resolved (no explicit store, no context store, not a
+       * cached destroyed store), throws `Store is not available`. There is no successful
+       * resolve+sync on that path: `tryResolveConnectStore()` returning null without a
+       * cached destroyed store already means `resolveConnectStore()` cannot return a store.
+       *
        * @param {ContextScope} parentScope - parent scope
        * @returns {ContextScope} scope for child nodes
        */
@@ -739,12 +762,10 @@ function buildConnectHoc<S, P, R, A extends Action> (
           // Destroyed store: do not call getState(); keep last mapped props.
           publishStore = this.__connectStore;
         } else {
-          // Missing store (never resolved) — same public error as before.
-          const resolved = this.resolveConnectStore();
-          if (!this.__connectMountCompleted) {
-            this.syncConnectPropsBeforeCompose(resolved);
-          }
-          publishStore = resolved;
+          // Missing store, hard cutover: do not call resolveConnectStore()+sync.
+          // Coverage at v1.2.1 left lines 744–747 (sync + publishStore = resolved)
+          // uncovered because resolveConnectStore() always threw first.
+          throw createConnectStoreUnavailableError();
         }
 
         // Wrapped ContextProvider / custom publisher (prototype or captured class field).
@@ -796,10 +817,7 @@ function buildConnectHoc<S, P, R, A extends Action> (
           return this.__connectStore;
         }
 
-        throw new Error(
-          '[Effectable.connect] Store is not available. ' +
-          'Use connect(store, ...) for the root connected component or mount this component under a connected parent.'
-        );
+        throw createConnectStoreUnavailableError();
       }
 
       /**
