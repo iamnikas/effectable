@@ -318,7 +318,7 @@ export function getContextFields (
  *
  * @param {object} instance - already created component instance
  * @param {ContextScope} scope - scope computed for this node (including ancestor providers)
- * @returns {boolean} `true` if any field identity changed (`!==`), `false` if no fields or no changes
+ * @returns {boolean} `true` if any field identity changed ({@link Object.is}), `false` if no fields or no changes
  * @throws {Error} see {@link readFromScope} — required token missing from scope
  */
 export function injectContextFields (
@@ -365,9 +365,22 @@ export function injectContextFields (
       );
     }
 
-    if (prevValue !== nextValue) {
+    // Object.is: stable NaN must not report as changed. ContextProvider.applyToScope
+    // builds a fresh Map every pass, so GraphRuntime always re-injects under providers;
+    // `!==` would treat NaN as always-changed and spuriously call onUpdate (and can
+    // unbounded-cascade if onUpdate setStates an ancestor).
+    if (!Object.is(prevValue, nextValue)) {
       anyChanged = true;
-      target[meta.propertyKey] = nextValue;
+      // defineProperty — `target[key] =` invokes the Object.prototype `__proto__`
+      // setter when a @UseContext field is named `__proto__`, replacing the
+      // instance [[Prototype]] with the injected value and dropping Component methods
+      // (same class as store/connect and mutableState/BusDecorators).
+      Object.defineProperty(target, meta.propertyKey, {
+        value: nextValue,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
   }
 

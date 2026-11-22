@@ -121,8 +121,10 @@ export interface BootstrapHandle<
    */
   isRunning(): boolean;
   /**
-   * Rebuilds the root runtime tree with the original props.
-   * Needed by external reactive sources because `Component.setState()` does not reconcile the subtree.
+   * Rebuilds the root runtime tree from a shallow snapshot of {@link BootstrapHandle.props}.
+   * Needed by external reactive sources that mutate the props bag in place because
+   * `Component.setState()` does not reconcile the subtree. Each call allocates a new
+   * props object so GraphRuntime's referential propsChanged gate can deliver `onUpdate`.
    * No-op after shutdown or GraphRuntime fail-stop.
    *
    * @returns {Promise<void>} completion of the reconcile pass

@@ -11,13 +11,22 @@ import type { CommandHandler, RuntimeCommand } from './types';
  */
 export class CommandBus<TCommand extends RuntimeCommand = RuntimeCommand> {
   private readonly handlers = new Map<string, CommandHandler<TCommand, unknown>>();
+  /**
+   * Monotonic registration id per command type. Disposers capture the id from their
+   * `register` call and only delete when it still matches — so re-registering the
+   * *same handler function* after unregister/clear cannot be torn down by a stale
+   * disposer from the previous registration generation (same contract as HandleRegistry).
+   */
+  private readonly registrationIds = new Map<string, number>();
+  private nextRegistrationId = 1;
 
   /**
    * Registers a command handler.
    *
    * @param {TCommand['type']} commandType - command type
    * @param {CommandHandler<TCommand, TResult>} handler - command handler
-   * @returns {() => void} unregister function; no-op if a different handler is now registered for the type
+   * @returns {() => void} unregister function; no-op if this registration was superseded
+   *   (including re-register of the same function reference after unregister/clear)
    * @throws {Error} if a handler is already registered
    */
   public register<TResult> (
@@ -29,10 +38,14 @@ export class CommandBus<TCommand extends RuntimeCommand = RuntimeCommand> {
     }
 
     const registered = handler as CommandHandler<TCommand, unknown>;
+    const registrationId = this.nextRegistrationId;
+    this.nextRegistrationId += 1;
     this.handlers.set(commandType, registered);
+    this.registrationIds.set(commandType, registrationId);
     return () => {
-      if (this.handlers.get(commandType) === registered) {
+      if (this.registrationIds.get(commandType) === registrationId) {
         this.handlers.delete(commandType);
+        this.registrationIds.delete(commandType);
       }
     };
   }
@@ -62,6 +75,7 @@ export class CommandBus<TCommand extends RuntimeCommand = RuntimeCommand> {
    */
   public unregister (commandType: TCommand['type']): void {
     this.handlers.delete(commandType);
+    this.registrationIds.delete(commandType);
   }
 
   /**
@@ -71,5 +85,6 @@ export class CommandBus<TCommand extends RuntimeCommand = RuntimeCommand> {
    */
   public clear (): void {
     this.handlers.clear();
+    this.registrationIds.clear();
   }
 }

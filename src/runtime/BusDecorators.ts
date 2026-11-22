@@ -30,6 +30,16 @@ const ON_COMMAND_ENTRIES = 'effectable:runtime:OnCommand:entries';
 const ON_QUERY_ENTRIES = 'effectable:runtime:OnQuery:entries';
 const ON_EVENT_ENTRIES = 'effectable:runtime:OnEvent:entries';
 
+/**
+ * Per-instance exclusive Command/Query registration disposers keyed by
+ * `command:<type>` / `query:<type>`. Generation-safe: calling the disposer only
+ * clears the bus slot if this registration still owns it (see CommandBus/QueryBus
+ * register return values). Blind `unregister(type)` would wipe a later PLACE that
+ * already claimed the same exclusive type.
+ */
+const exclusiveHandlerDisposers = new WeakMap<object, Map<string, () => void>>();
+
+
 function appendPropKey (ctor: Function, metaKey: string, propertyKey: string | symbol): void {
   const key = String(propertyKey);
   const current = Reflect.getOwnMetadata(metaKey, ctor) as string[] | undefined;
@@ -220,15 +230,125 @@ export function instanceUsesRuntimeBusDecorators (instance: object): boolean {
 }
 
 /**
- * Calls {@link wireRuntimeBuses} only if the constructor chain has relevant decorators.
+ * Collects exclusive `@OnCommand` / `@OnQuery` type strings declared on a
+ * component constructor chain (used to free only slots a PLACE/REPLACE needs).
+ *
+ * @param {unknown} componentType - vnode `type` (component constructor or other)
+ * @returns {{ commandTypes: Set<string>; queryTypes: Set<string> }} declared exclusive types
+ */
+export function collectExclusiveHandlerTypesFromType (componentType: unknown): {
+  commandTypes: Set<string>;
+  queryTypes: Set<string>;
+} {
+  const commandTypes = new Set<string>();
+  const queryTypes = new Set<string>();
+
+  if (typeof componentType !== 'function') {
+    return { commandTypes, queryTypes };
+  }
+
+  for (const ctor of getConstructorChainLeafFirst(componentType)) {
+    for (const { type } of getHandlerEntries(ctor, ON_COMMAND_ENTRIES)) {
+      commandTypes.add(type);
+    }
+    for (const { type } of getHandlerEntries(ctor, ON_QUERY_ENTRIES)) {
+      queryTypes.add(type);
+    }
+  }
+
+  return { commandTypes, queryTypes };
+}
+
+/**
+ * Unregisters exclusive `@OnCommand` / `@OnQuery` handlers for an instance.
+ *
+ * Used when an orphan must release exclusive bus slots before a same-batch
+ * PLACE/REPLACE registers the same types, while leaving `@OnEvent` subscriptions
+ * intact so a deferred sibling UPDATE can still publish into the orphan before destroy.
+ *
+ * When `onlyTypes` is provided, only those command/query types are unregistered.
+ * Callers should pass the incoming vnode's declared exclusive types so orphans that
+ * are not conflicting with a PLACE keep their handlers through deferred UPDATEs
+ * (UPDATE `execute`/`query` handoff before orphan destroy).
+ *
+ * Uses generation-safe registration disposers from {@link wireRuntimeBuses} so a
+ * later PLACE that already claimed the same exclusive type is not wiped.
+ * The instance's full wire disposer remains valid (idempotent once cleared).
  *
  * @template TCommand
  * @template TQuery
  * @template TEvent
- * @param {object} instance - instance
- * @param {RuntimeBusesBundle<TCommand, TQuery, TEvent>} buses - buses
- * @returns {(() => void) | null} disposer or null if wiring is not needed
+ * @param {object} instance - wired component instance
+ * @param {RuntimeBusesBundle<TCommand, TQuery, TEvent>} buses - runtime bus bundle
+ * @param {{ commandTypes?: ReadonlySet<string>; queryTypes?: ReadonlySet<string> }} [onlyTypes]
+ *   optional filter; omit to release every exclusive type declared on the instance
+ * @returns {void}
  */
+export function releaseExclusiveRuntimeBusHandlers<
+  TCommand extends RuntimeCommand,
+  TQuery extends RuntimeQuery,
+  TEvent extends RuntimeEvent,
+> (
+  instance: object,
+  _buses: RuntimeBusesBundle<TCommand, TQuery, TEvent>,
+  onlyTypes?: {
+    commandTypes?: ReadonlySet<string>;
+    queryTypes?: ReadonlySet<string>;
+  },
+): void {
+  const exclusiveMap = exclusiveHandlerDisposers.get(instance);
+  if (exclusiveMap === undefined) {
+    return;
+  }
+
+  const leafCtor = instance.constructor as Function;
+  const commandTypes = new Set<string>();
+  const queryTypes = new Set<string>();
+
+  for (const ctor of getConstructorChainLeafFirst(leafCtor)) {
+    for (const { type } of getHandlerEntries(ctor, ON_COMMAND_ENTRIES)) {
+      if (
+        onlyTypes?.commandTypes === undefined ||
+        onlyTypes.commandTypes.has(type)
+      ) {
+        commandTypes.add(type);
+      }
+    }
+    for (const { type } of getHandlerEntries(ctor, ON_QUERY_ENTRIES)) {
+      if (
+        onlyTypes?.queryTypes === undefined ||
+        onlyTypes.queryTypes.has(type)
+      ) {
+        queryTypes.add(type);
+      }
+    }
+  }
+
+  // Prefer generation-safe registration disposers over blind bus.unregister(type),
+  // which would wipe a later PLACE that already claimed the same exclusive slot.
+  for (const type of commandTypes) {
+    const key = `command:${type}`;
+    const disposer = exclusiveMap.get(key);
+    if (disposer !== undefined) {
+      exclusiveMap.delete(key);
+      disposer();
+    }
+  }
+  for (const type of queryTypes) {
+    const key = `query:${type}`;
+    const disposer = exclusiveMap.get(key);
+    if (disposer !== undefined) {
+      exclusiveMap.delete(key);
+      disposer();
+    }
+  }
+
+  if (exclusiveMap.size === 0) {
+    exclusiveHandlerDisposers.delete(instance);
+  }
+}
+
+
 export function wireRuntimeBusesIfDecorated<
   TCommand extends RuntimeCommand,
   TQuery extends RuntimeQuery,
@@ -253,7 +373,15 @@ function assignBusProps (
   const keys = getStringPropKeys(ctor, metaKey);
   const record = instance as Record<string, unknown>;
   for (const key of keys) {
-    record[key] = value;
+    // defineProperty — `record[key] =` invokes the Object.prototype `__proto__`
+    // setter when a decorated field is named `__proto__`, replacing the
+    // instance [[Prototype]] with the bus and dropping Component methods.
+    Object.defineProperty(record, key, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
 }
 
@@ -346,7 +474,14 @@ export function wireRuntimeBuses<
       const handler: CommandHandler<TCommand, unknown> = (command) => {
         return raw.call(instance, command) as ReturnType<CommandHandler<TCommand, unknown>>;
       };
-      disposers.push(buses.commandBus.register(type as TCommand['type'], handler));
+      const commandDisposer = buses.commandBus.register(type as TCommand['type'], handler);
+      disposers.push(commandDisposer);
+      let exclusiveMap = exclusiveHandlerDisposers.get(instance);
+      if (exclusiveMap === undefined) {
+        exclusiveMap = new Map<string, () => void>();
+        exclusiveHandlerDisposers.set(instance, exclusiveMap);
+      }
+      exclusiveMap.set(`command:${type}`, commandDisposer);
     }
 
     for (const [type, method] of mergedQuery) {
@@ -357,7 +492,14 @@ export function wireRuntimeBuses<
       const handler: QueryHandler<TQuery, unknown> = (query) => {
         return raw.call(instance, query) as ReturnType<QueryHandler<TQuery, unknown>>;
       };
-      disposers.push(buses.queryBus.register(type as TQuery['type'], handler));
+      const queryDisposer = buses.queryBus.register(type as TQuery['type'], handler);
+      disposers.push(queryDisposer);
+      let exclusiveMap = exclusiveHandlerDisposers.get(instance);
+      if (exclusiveMap === undefined) {
+        exclusiveMap = new Map<string, () => void>();
+        exclusiveHandlerDisposers.set(instance, exclusiveMap);
+      }
+      exclusiveMap.set(`query:${type}`, queryDisposer);
     }
 
     for (const [type, methods] of mergedEvent) {
@@ -387,6 +529,7 @@ export function wireRuntimeBuses<
       return;
     }
     disposed = true;
+    exclusiveHandlerDisposers.delete(instance);
 
     const { cleanupErrors } = unwindDisposers(disposers);
     if (cleanupErrors.length > 0) {

@@ -248,7 +248,12 @@ export async function bootstrap<
         return;
       }
 
-      await activeGraphRuntime.reconcile(h(type, props));
+      // Snapshot into a fresh object. External reactive sources mutate the
+      // closed-over `props` bag in place, then call reconcile(); GraphRuntime
+      // gates onUpdate with `prevProps !== instance.props`, so reusing the same
+      // reference would silently skip props-driven onUpdate / state sync.
+      const nextProps = { ...props };
+      await activeGraphRuntime.reconcile(h(type, nextProps));
     },
     async shutdown (options?: { rejectOnCleanupError?: boolean }): Promise<void> {
       if (cachedShutdownPromise !== null) {

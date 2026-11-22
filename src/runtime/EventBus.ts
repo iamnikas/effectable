@@ -19,6 +19,14 @@ import type { EventHandler, RuntimeEvent } from './types';
 export class EventBus<TEvent extends RuntimeEvent = RuntimeEvent> {
   private readonly handlersByType = new Map<string, Set<EventHandler<TEvent>>>();
   private readonly anyHandlers = new Set<EventHandler<TEvent>>();
+  /**
+   * Monotonic subscription ids. Disposers from `subscribe` / `subscribeAll` only remove
+   * the handler when the id still matches — so unsubscribe/clear + re-subscribe of the
+   * *same function* is not torn down by a stale disposer (HandleRegistry contract).
+   */
+  private readonly typedSubscriptionIds = new Map<string, Map<EventHandler<TEvent>, number>>();
+  private readonly anySubscriptionIds = new Map<EventHandler<TEvent>, number>();
+  private nextSubscriptionId = 1;
 
   /**
    * Publishes an event to all matching subscribers.
@@ -58,7 +66,7 @@ export class EventBus<TEvent extends RuntimeEvent = RuntimeEvent> {
    *
    * @param {TEvent['type']} eventType - event type
    * @param {EventHandler<TEvent>} handler - event handler
-   * @returns {() => void} unsubscribe function
+   * @returns {() => void} unsubscribe function; no-op if this subscription was superseded
    */
   public subscribe (
     eventType: TEvent['type'],
@@ -72,8 +80,19 @@ export class EventBus<TEvent extends RuntimeEvent = RuntimeEvent> {
     handlers.add(handler);
     this.handlersByType.set(eventType, handlers);
 
+    const subscriptionId = this.nextSubscriptionId;
+    this.nextSubscriptionId += 1;
+    let idsForType = this.typedSubscriptionIds.get(eventType);
+    if (typeof idsForType === 'undefined') {
+      idsForType = new Map<EventHandler<TEvent>, number>();
+      this.typedSubscriptionIds.set(eventType, idsForType);
+    }
+    idsForType.set(handler, subscriptionId);
+
     return () => {
-      this.unsubscribe(eventType, handler);
+      if (this.typedSubscriptionIds.get(eventType)?.get(handler) === subscriptionId) {
+        this.unsubscribe(eventType, handler);
+      }
     };
   }
 
@@ -81,12 +100,20 @@ export class EventBus<TEvent extends RuntimeEvent = RuntimeEvent> {
    * Subscribes a handler to all events on the bus.
    *
    * @param {EventHandler<TEvent>} handler - event handler
-   * @returns {() => void} unsubscribe function
+   * @returns {() => void} unsubscribe function; no-op if this subscription was superseded
    */
   public subscribeAll (handler: EventHandler<TEvent>): () => void {
     this.anyHandlers.add(handler);
+
+    const subscriptionId = this.nextSubscriptionId;
+    this.nextSubscriptionId += 1;
+    this.anySubscriptionIds.set(handler, subscriptionId);
+
     return () => {
-      this.anyHandlers.delete(handler);
+      if (this.anySubscriptionIds.get(handler) === subscriptionId) {
+        this.anyHandlers.delete(handler);
+        this.anySubscriptionIds.delete(handler);
+      }
     };
   }
 
@@ -107,6 +134,13 @@ export class EventBus<TEvent extends RuntimeEvent = RuntimeEvent> {
     }
 
     handlers.delete(handler);
+    const idsForType = this.typedSubscriptionIds.get(eventType);
+    if (typeof idsForType !== 'undefined') {
+      idsForType.delete(handler);
+      if (idsForType.size === 0) {
+        this.typedSubscriptionIds.delete(eventType);
+      }
+    }
     if (handlers.size === 0) {
       this.handlersByType.delete(eventType);
     }
@@ -120,5 +154,7 @@ export class EventBus<TEvent extends RuntimeEvent = RuntimeEvent> {
   public clear (): void {
     this.handlersByType.clear();
     this.anyHandlers.clear();
+    this.typedSubscriptionIds.clear();
+    this.anySubscriptionIds.clear();
   }
 }

@@ -77,17 +77,22 @@ function defaultMemoize<F extends (arg: any) => any> (func: F): MemoizationResul
  * Shallow equality for primitives and objects
  *
  * Compares two values:
- * - For primitives uses ===
+ * - For primitives / references uses {@link Object.is} (so stable `NaN` compares equal)
  * - For objects compares all top-level fields
  * - For arrays compares length and elements
+ *
+ * `===` treats `NaN` as unequal to itself, so `defaultMemoize` would miss the cache
+ * whenever an input selector returned `NaN`. Combiners that allocate (`(score) => ({ score })`)
+ * then yield a new reference on every call; `store.select` subscribers that dispatch on notify
+ * livelock / OOM even though the selected score never changed.
  *
  * @param a - First value
  * @param b - Second value
  * @returns true if values are equal (shallow)
  */
 function shallowEqual (a: any, b: any): boolean {
-  // Strict equality (for primitives and references)
-  if (a === b) {
+  // Object.is: same as === except NaN===NaN and +0 !== -0 (Reselect-compatible).
+  if (Object.is(a, b)) {
     return true;
   }
 
@@ -105,7 +110,7 @@ function shallowEqual (a: any, b: any): boolean {
       return false;
     }
     for (let i = 0; i < a.length; i++) {
-      if (a[i] !== b[i]) {
+      if (!Object.is(a[i], b[i])) {
         return false;
       }
     }
@@ -121,7 +126,7 @@ function shallowEqual (a: any, b: any): boolean {
   }
 
   for (const key of keysA) {
-    if (a[key] !== b[key]) {
+    if (!Object.is(a[key], b[key])) {
       return false;
     }
   }
